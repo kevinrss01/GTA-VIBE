@@ -59,10 +59,25 @@ export function nearestLane(network: RoadNetwork, x: number, z: number): LanePos
  * A lane whose midpoint is as close as possible to a wanted distance from a
  * point, used to place a newly dispatched unit out of sight but on a road.
  *
- * `preferBehind` biases the choice away from the direction the player is
- * facing, so a car does not materialise in the middle of the view. It is a
- * bias and not a filter: on a street where every candidate is ahead, a unit
- * still arrives.
+ * The direction bias steers the choice away from the way the player is facing,
+ * so a car does not materialise in the middle of the view. It is a bias and
+ * not a filter: on a street where every candidate is ahead, a unit still
+ * arrives.
+ *
+ * IT MUST BE SOMEWHERE A CAR CAN DRIVE OUT OF. `reachable` is the pursuit
+ * field's own "can this lane get to the player" test, and passing it is not
+ * optional decoration. Meridian Bay's one-way pairs and shoreline termini mean
+ * a lane can be a hundred and forty metres away and have no legal route back:
+ * measured, a three-star response placed every unit on exactly such a lane,
+ * watched each one fail to make progress, wrote it off after the lost-patience
+ * timeout and dispatched an identical replacement to the identical lane - 21
+ * cars in 150 seconds, not one of which ever arrived. The pick is
+ * deterministic, so a bad lane is bad forever.
+ *
+ * When nothing reachable exists at all - the field has not been built yet, or
+ * the player is somewhere the graph cannot see - it falls back to the best
+ * unreachable lane rather than declining to dispatch. A unit that has to find
+ * its own way is still better than a city that never responds.
  */
 export function dispatchLane(
   network: RoadNetwork,
@@ -71,9 +86,12 @@ export function dispatchLane(
   forwardX: number,
   forwardZ: number,
   wantedDistance: number,
+  reachable?: (laneId: string) => boolean,
 ): LanePosition | null {
   let best: LanePosition | null = null;
   let bestScore = Infinity;
+  let fallback: LanePosition | null = null;
+  let fallbackScore = Infinity;
   for (const lane of network.lanes) {
     if (lane.length < 20) continue;
     const mid = lanePoint(lane, lane.length * 0.5);
@@ -85,12 +103,17 @@ export function dispatchLane(
     // lies the way the camera is pointing.
     const dot = (dx * forwardX + dz * forwardZ) / distance;
     const score = Math.abs(distance - wantedDistance) + Math.max(0, dot) * 45;
+    if (score < fallbackScore) {
+      fallbackScore = score;
+      fallback = { lane, along: lane.length * 0.5, offset: 0 };
+    }
+    if (reachable && !reachable(lane.id)) continue;
     if (score < bestScore) {
       bestScore = score;
       best = { lane, along: lane.length * 0.5, offset: 0 };
     }
   }
-  return best;
+  return best ?? fallback;
 }
 
 /**

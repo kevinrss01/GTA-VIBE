@@ -25,11 +25,29 @@ where the viewer is metres away and the real size is what reads correctly.
 | `smg` (Compact SMG) | `public/models/weapons/smg.glb` | `b7265287-1b10-4ce7-b1a4-bea88844a538` | 1381 | 0.40 m | 40 |
 | `shotgun` (Dock Sweeper) | `public/models/weapons/shotgun.glb` | `6c72b866-b3ee-4795-91b2-b509eca06123` | 1307 | 0.60 m | 40 |
 
-Credits spent by the combat workstream: **80** (two text-to-model generations,
-no conversion, no rigging). No retry loops were needed; both first candidates
-were accepted after inspecting `preview.png`. The balance read 220 before and
-140 after; it was later exhausted by another workstream and has since been
-topped up.
+Credits spent by the combat workstream on the four weapons: **80** (two
+text-to-model generations, no conversion, no rigging). No retry loops were
+needed; both first candidates were accepted after inspecting `preview.png`.
+
+Credits spent on the hands: **150**, reconciled against `tripo usage`:
+
+| Task | Credits |
+| --- | --- |
+| `hand-right` text-to-model (rejected: finger-gun pose) | 30 |
+| `hand-left` text-to-model (rejected: a rifle fused into the forearm) | 30 |
+| two FBX conversions the `game-pc` scenario chains on automatically | 10 |
+| `fist-a` text-to-model | 30 |
+| `fist-b` text-to-model (accepted) | 30 |
+| two more chained FBX conversions | 10 |
+| decimation convert, `face_limit=6000`, `texture_size=1024` | 10 |
+
+The accepted fist is candidate B; candidate A
+(`3fa9ede7-a0a1-400c-a25f-51eac26126bf`) is a usable grey canvas glove with a
+longer sleeve and is kept as a fallback under `tripo-out/fists/a/`.
+
+The account balance moved 2 930 -> 2 715 over the same window, but 65 of that
+belongs to another workstream's rigging work on the shared account; only the
+150 above are this change's.
 
 ## A known generation artefact
 
@@ -59,11 +77,114 @@ Parameters for both: `model_version=P1-20260311`, `face_limit=1400`,
 `texture_alignment=geometry`, PBR and texture on. Source artifacts, previews
 and `task.json` are under `tripo-out/weapons/`.
 
+## Hands
+
+The held weapon is drawn in a pair of gloved fists. It is the only part of the
+player that exists anywhere in the product - there is no avatar, no legs and no
+shadow - which is why it is a generated asset and not four boxes.
+
+| Asset | Runtime path | Task id | Triangles | Length | Credits |
+| --- | --- | --- | --- | --- | --- |
+| gloved fist | `public/models/weapons/fist.glb` | gen `21e1c2d1-b6ca-4b3a-854a-0d4020f71932`, decimate `0c10a0bf-f728-43bf-824a-393f15508e8f` | 6 000 | 0.156 m | 30 + 5 |
+
+ONE FIST, USED TWICE. The left hand is the same object mirrored through X,
+which is not a shortcut but the anatomy: a mirrored right hand is a left hand.
+The geometry and materials are shared and drawn double-sided, because mirroring
+reverses triangle winding.
+
+The raw generation is 1 441 558 triangles in a 43 MB GLB - unusable in a
+viewmodel - so it goes through a `convert` task at `face_limit=6000` and
+`texture_size=1024`, which is the 790 KB file that ships. That is comparable to
+the four weapons (546-684 KB each) and, drawn twice, adds two draw calls.
+
+### Prompts, and the two that failed
+
+Naming a weapon in the prompt gets you a weapon. The first two attempts asked
+for a hand "gripping an unseen pistol grip" and "gripping an unseen horizontal
+rifle handguard"; the first came back with the fingers extended in a
+finger-gun, and the second came back with an actual rifle fused into the
+forearm. Both were discarded (60 credits + 10 for the FBX conversions the
+`game-pc` scenario chains on).
+
+The accepted prompt names no weapon at all and describes only the shape:
+
+- `fist` - "black leather motorcycle glove clenched into a tight fist, every
+  finger fully curled down into the palm, thumb laid across the middle fingers,
+  buckled wrist strap, joined to a forearm in a rolled dark canvas sleeve
+  ending flat at the elbow, one arm alone, worn realistic PBR materials,
+  game-ready"
+
+Parameters: `--for game-pc`, i.e. `model_version=v3.1-20260211`,
+`texture_quality=detailed`, PBR and texture on. Source artifacts and previews
+are under `tripo-out/fists/` and `tripo-out/fist-lp/`; the two rejected
+generations are under `tripo-out/hands/`.
+
+### Pose
+
+The asset arrives with its forearm along +Y and no convention at all about
+which way the knuckles face, so `defaultHands()` carries the three numbers that
+turn it into a right hand closed on a grip in front of the eye. They were
+measured against the pistol in the running game, not derived. The rotation is
+applied in XYZ order so the spin about the forearm (`yaw`) happens before the
+forearm is laid forward (`pitch`); those are the two questions the asset
+actually poses, and an order that mixed them would make one unturnable without
+breaking the other.
+
+Per-weapon, `grip` and `support` say where each fist closes and `handRoll`
+cants both inboard. A pistol puts them within 2 cm of each other; a carbine
+puts them 30 cm apart.
+
 ## Orientation
 
-Three of the four are modelled nose-along-Z and the carbine nose-along-X. The
-per-weapon `yaw` in `defaultViewmodels()` is what reconciles them; the assets
-themselves were not re-exported.
+Three of the four are modelled nose-along-Z and the carbine nose-along-X, and
+the two that already face -Z need no yaw at all. The per-weapon `yaw` in
+`defaultViewmodels()` is what reconciles them; the assets themselves were not
+re-exported.
+
+CORRECTED. The SMG and the shotgun previously carried the pistol's `Math.PI`
+and were therefore drawn BACK TO FRONT - the muzzle flash and the tracer left
+the butt plate. It is close to invisible on a weapon with nothing holding it,
+and obvious the moment a pair of hands gives the model a right way up. Both now
+carry `yaw: 0`.
+
+Each of the four was checked against the mesh rather than guessed: the barrel
+end is the thin end, so comparing the cross-sectional area of the last 12% of
+the long axis at each end says which way the weapon points. Result: `smg` and
+`shotgun` have their barrel at min-Z, `pistol` at max-Z, `rifle` at min-X.
+
+## Holstering, and the view sync
+
+`H` puts the weapon away and brings it back. The key is free: WASD and the
+arrows move, Shift runs, E interacts, R reloads, M is the map, Space is the
+handbrake, backquote and F3 are diagnostics, Escape pauses, and 0-4 are the
+weapon slots. Holstered, `CombatSystem.pullTrigger` refuses outright, the HUD
+reads "Stowed" beside the weapon's own name, and the assembly is not drawn at
+all once it is more than 96% away. Reaching for a weapon with a number key
+takes it back out, because making the player press two keys to draw the one
+they just asked for would be a puzzle rather than a control.
+
+The viewmodel follows the camera exactly and then lags it on purpose. The
+camera's angular rate is differentiated frame to frame and the whole assembly
+swings against it, damped, so a fast turn throws the weapon wide and it settles
+a moment later. The walk cycle is advanced by DISTANCE (`speed * dt`), not by a
+clock, so it locks to the stride instead of swaying while the player stands
+still; standing still leaves a slow breath in it instead. Every one of those is
+integrated from `dt` and never from `performance.now()`, so a fixed-step
+harness driving frames by hand sees exactly what a player sees.
+
+## What is still wrong
+
+- The barrel can still enter a wall. The clearance probe cuts a carbine's reach
+  from 0.79 m to about 0.46 m and stands the barrel up 26 degrees, which turns
+  most of a barrel through a wall into a tenth of a metre at a steep angle, but
+  it is not zero. The real fix is a second render pass for the viewmodel with
+  its own near plane, and that belongs in the render loop.
+- The Dock Sweeper's stock reads orange rather than walnut. The `tint` that
+  removes the generator's cobalt cast from the receiver also pushes the wood
+  warm. Regenerating it with no colour words in the prompt is the proper fix.
+- `CONTROL_HINTS` in `src/ui/PauseMenu.ts` does not list `H`. It does not list
+  `R`, `Space` or the weapon slots either, so this is a gap in that list rather
+  than a new one.
 
 ## Validation
 

@@ -58,10 +58,18 @@ import {
 import { CombatFx, type ImpactKind } from './CombatFx';
 import { rayCylinder, rayGround, rayOrientedBox, WorldRayIndex } from './rays';
 import { EMPTY_ACTORS, type ActorSource, type ActorTarget, type LawTargets } from './targets';
-import { WeaponViewmodel, type ViewmodelSpec } from './WeaponViewmodel';
+import { WeaponViewmodel, type ViewmodelSet } from './WeaponViewmodel';
 
 /** How close somebody has to be to notice a gunshot. */
 export const WITNESS_RADIUS = 34;
+
+/**
+ * How far ahead of the eye the viewmodel's clearance probe looks.
+ *
+ * Only long enough to cover the reach of the longest weapon plus a little
+ * slack; anything beyond that is not something the barrel can reach.
+ */
+const CLEARANCE_PROBE = 1.1;
 
 /** Weapons that keep firing while the trigger is held. */
 const AUTOMATIC: ReadonlySet<WeaponId> = new Set<WeaponId>(['smg', 'rifle']);
@@ -121,7 +129,7 @@ export interface CombatSystemOptions {
    * the game is playable and every shot registers identically without one.
    * `defaultViewmodels(import.meta.env.BASE_URL)` is the shipped set.
    */
-  readonly viewmodels?: Readonly<Record<WeaponId, ViewmodelSpec>> | undefined;
+  readonly viewmodels?: ViewmodelSet | undefined;
 }
 
 export interface CombatContext {
@@ -187,6 +195,14 @@ export class CombatSystem {
   private trigger = false;
   /** Cleared on mouse-up so a semi-automatic needs a fresh pull. */
   private triggerLatched = false;
+  /**
+   * The weapon is put away.
+   *
+   * Distinct from equipping nothing: the player still OWNS a weapon and is
+   * still carrying it, the HUD still names it, and one key brings it back.
+   * Nothing fires while this is true.
+   */
+  private stowed = false;
   private recoilPitch = 0;
   private recoilYaw = 0;
   private paused = false;
@@ -228,6 +244,7 @@ export class CombatSystem {
     this.group = this.fx.group;
     this.group.userData.combat = this;
     this.viewmodel = options.viewmodels ? new WeaponViewmodel(options.viewmodels) : null;
+
     if (this.viewmodel) this.group.add(this.viewmodel.group);
 
     // Guarded so the whole hit-registration path can be constructed and driven
@@ -263,10 +280,35 @@ export class CombatSystem {
     return this.armoury.startReload(this.options.player.equipped);
   }
 
+  /** True while the weapon is holstered. Nothing fires in this state. */
+  get holstered(): boolean {
+    return this.stowed;
+  }
+
+  /** Puts the weapon away, or takes it back out. Exposed for automated QA. */
+  setHolstered(holstered: boolean): void {
+    if (this.stowed === holstered) return;
+    this.stowed = holstered;
+    // A holstered weapon cannot be mid-pull; letting the trigger stay held
+    // would fire the instant it came back out.
+    if (holstered) {
+      this.trigger = false;
+      this.triggerLatched = false;
+    }
+  }
+
+  toggleHolster(): boolean {
+    this.setHolstered(!this.stowed);
+    return this.stowed;
+  }
+
   equipSlot(slot: number): boolean {
     const id = SLOT_ORDER[slot];
     if (!id) return false;
     if (!this.options.player.owns(id)) return false;
+    // Reaching for a weapon is taking it out. Making the player press two keys
+    // to draw the one they just asked for would be a puzzle, not a control.
+    this.setHolstered(false);
     return this.options.player.equip(id);
   }
 
@@ -315,6 +357,7 @@ export class CombatSystem {
     this.fx.clear();
     this.trigger = false;
     this.triggerLatched = false;
+    this.stowed = false;
     this.recoilPitch = 0;
     this.recoilYaw = 0;
   }
@@ -352,11 +395,17 @@ export class CombatSystem {
     }
 
     const camera = this.options.camera;
-    this.viewmodel?.update(dt, camera, this.options.player.equipped, {
-      reloading: this.armoury.reloading,
-      hidden: ctx.driving || !this.options.player.alive,
-      speed: ctx.playerSpeed,
-    });
+    // Guarded rather than optional-chained: `clearanceAhead` casts a ray, and a
+    // build with no view models must not pay for one every frame.
+    if (this.viewmodel) {
+      this.viewmodel.update(dt, camera, this.options.player.equipped, {
+        reloading: this.armoury.reloading,
+        holstered: this.stowed,
+        hidden: ctx.driving || !this.options.player.alive,
+        speed: ctx.playerSpeed,
+        clearance: this.clearanceAhead(),
+      });
+    }
     this.fx.update(dt, camera.position.x, camera.position.y, camera.position.z);
     this.writeHud(ctx);
   }
@@ -378,7 +427,7 @@ export class CombatSystem {
   private pullTrigger(): boolean {
     const player = this.options.player;
     const id = player.equipped;
-    if (!id || !player.alive) return false;
+    if (!id || !player.alive || this.stowed) return false;
     const outcome = this.armoury.fire(id);
     if (!outcome.fired) {
       if (outcome.reason === 'magazine') this.armoury.startReload(id);
@@ -655,6 +704,30 @@ export class CombatSystem {
     return hit;
   }
 
+  /**
+   * How much open space is straight ahead of the eye, in metres.
+   *
+   * The held weapon reaches most of a metre in front of the camera and the
+   * player's collision cylinder is only 0.34 m of radius, so standing at a
+   * wall used to put the barrel inside it. One ray a frame against the same
+   * index every shot already uses is enough to know, and the viewmodel pulls
+   * the weapon in and tips it up rather than letting that happen.
+   */
+  private clearanceAhead(): number {
+    const camera = this.options.camera;
+    camera.getWorldDirection(this.aim);
+    const world = this.options.world.cast(
+      camera.position.x,
+      camera.position.y,
+      camera.position.z,
+      this.aim.x,
+      this.aim.y,
+      this.aim.z,
+      CLEARANCE_PROBE,
+    );
+    return world ? world.t : Infinity;
+  }
+
   /** True when somebody is close enough for the shot to count as public. */
   private witnessed(): boolean {
     if (this.witnesses?.hasWitnessWithin(this.eye.x, this.eye.z, WITNESS_RADIUS)) return true;
@@ -674,7 +747,7 @@ export class CombatSystem {
     const spec = WEAPONS[id];
     const reserve = this.options.player.ammo(id);
     const magazine = this.armoury.magazine(id);
-    const state = ctx.driving
+    const state = ctx.driving || this.stowed
       ? 'stowed'
       : this.armoury.reloading
         ? 'reloading'
@@ -708,6 +781,13 @@ export class CombatSystem {
     if (this.paused || event.repeat) return;
     if (event.code === 'KeyR') {
       this.reload();
+      return;
+    }
+    // H for holster. Free: the movement keys are WASD and the arrows, Shift
+    // runs, E interacts, M is the map, R reloads, Space is the handbrake,
+    // backquote and F3 are diagnostics, and 0-4 are the weapon slots.
+    if (event.code === 'KeyH') {
+      this.toggleHolster();
       return;
     }
     if (event.code === 'Digit0') {

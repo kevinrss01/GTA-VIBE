@@ -39,8 +39,14 @@ export const CONTROL_HINTS: readonly ControlHint[] = [
   { keys: 'Arrow keys / WASD', action: 'Move' },
   { keys: 'Shift', action: 'Run' },
   { keys: 'Mouse', action: 'Look' },
-  { keys: 'E', action: 'Interact' },
+  { keys: 'E', action: 'Enter a car, a door or a shop' },
+  { keys: 'Left mouse', action: 'Fire' },
+  { keys: '1 - 4', action: 'Select a weapon' },
+  { keys: 'H', action: 'Holster or draw' },
+  { keys: 'R', action: 'Reload' },
+  { keys: 'Space', action: 'Handbrake (driving)' },
   { keys: 'M', action: 'Map' },
+  { keys: '`', action: 'Performance stats' },
   { keys: 'Esc', action: 'Pause' },
 ];
 

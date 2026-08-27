@@ -73,6 +73,12 @@ export const MINIMAP_PALETTE = {
   buildingEdge: '#12171b',
   /** Buildings the player can enter. The one warm colour on the map. */
   enterable: '#c8a06a',
+  /**
+   * The gun store. It gets its own colour and its own shape because the
+   * player has to be able to FIND it, and a ring identical to six other rings
+   * is not findable - it is only findable once you already know which one.
+   */
+  gunStore: '#d4574b',
   landmark: '#93aab8',
   player: '#eef2f4',
   playerEdge: '#0b0f12',
@@ -672,6 +678,10 @@ export class Minimap {
       (parcel.rect.minX + parcel.rect.maxX) * 0.5,
       (parcel.rect.minZ + parcel.rect.maxZ) * 0.5,
     );
+    if (parcel.interiorKind === 'gunStore') {
+      drawShopPin(ctx, centre.x, centre.y, 7.5);
+      return;
+    }
     ctx.beginPath();
     ctx.arc(centre.x, centre.y, 5.5, 0, TAU);
     ctx.strokeStyle = MINIMAP_PALETTE.enterable;
@@ -732,6 +742,7 @@ export class Minimap {
     this.drawLandmarkLabels(ctx, project, width, unit);
     this.drawDistrictLabels(ctx, project, unit);
     this.drawScaleBar(ctx, height, scale, unit);
+    this.drawLegend(ctx, width, height, unit);
   }
 
   private labelFont(size: number, weight: number, unit: number): string {
@@ -842,6 +853,83 @@ export class Minimap {
     ctx.textAlign = align;
   }
 
+  /**
+   * A key for the map's symbols.
+   *
+   * Without it a warm ring is just a warm ring: the player has no way to learn
+   * that it means "you can go inside this one", which is exactly the thing the
+   * markers exist to say.
+   */
+  private drawLegend(
+    ctx: CanvasRenderingContext2D,
+    width: number,
+    height: number,
+    unit: number,
+  ): void {
+    const rows: [string, (x: number, y: number) => void][] = [
+      [
+        'Gun store',
+        (x, y) => drawShopPin(ctx, x, y, 7 * unit),
+      ],
+      [
+        'Enter this building',
+        (x, y) => {
+          ctx.beginPath();
+          ctx.arc(x, y, 5.5 * unit, 0, TAU);
+          ctx.strokeStyle = MINIMAP_PALETTE.enterable;
+          ctx.lineWidth = 2.2 * unit;
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.arc(x, y, 2.2 * unit, 0, TAU);
+          ctx.fillStyle = MINIMAP_PALETTE.playerEdge;
+          ctx.fill();
+        },
+      ],
+      [
+        'Landmark',
+        (x, y) => {
+          const r = 6 * unit;
+          ctx.beginPath();
+          ctx.moveTo(x, y - r);
+          ctx.lineTo(x + r, y);
+          ctx.lineTo(x, y + r);
+          ctx.lineTo(x - r, y);
+          ctx.closePath();
+          ctx.fillStyle = MINIMAP_PALETTE.landmark;
+          ctx.fill();
+          ctx.strokeStyle = MINIMAP_PALETTE.playerEdge;
+          ctx.lineWidth = 1.4 * unit;
+          ctx.stroke();
+        },
+      ],
+    ];
+
+    const pad = 14 * unit;
+    const rowHeight = 20 * unit;
+    const boxW = 168 * unit;
+    const boxH = pad * 2 + rowHeight * rows.length;
+    const x0 = width - boxW - pad;
+    const y0 = height - boxH - pad;
+
+    ctx.fillStyle = 'rgba(9, 12, 15, 0.82)';
+    ctx.strokeStyle = 'rgba(200, 160, 106, 0.28)';
+    ctx.lineWidth = 1 * unit;
+    ctx.beginPath();
+    ctx.rect(x0, y0, boxW, boxH);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.font = this.labelFont(10, 500, unit);
+    rows.forEach(([label, glyph], i) => {
+      const cy = y0 + pad + rowHeight * (i + 0.5);
+      glyph(x0 + pad + 8 * unit, cy);
+      ctx.fillStyle = MINIMAP_PALETTE.label;
+      ctx.fillText(label, x0 + pad + 24 * unit, cy);
+    });
+  }
+
   private drawScaleBar(
     ctx: CanvasRenderingContext2D,
     height: number,
@@ -865,4 +953,32 @@ export class Minimap {
     ctx.textAlign = 'left';
     ctx.fillText(`${metres} m`, x + length + 6 * unit, y - 1 * unit);
   }
+}
+
+/**
+ * The gun-store pin: a filled teardrop with a crosshair, drawn larger than an
+ * ordinary door ring. Shape carries as much of the difference as colour does,
+ * because colour alone fails on a small dark minimap.
+ */
+function drawShopPin(ctx: CanvasRenderingContext2D, x: number, y: number, r: number): void {
+  ctx.beginPath();
+  ctx.moveTo(x, y + r);
+  ctx.bezierCurveTo(x - r * 0.95, y + r * 0.15, x - r * 0.85, y - r * 0.75, x, y - r * 0.8);
+  ctx.bezierCurveTo(x + r * 0.85, y - r * 0.75, x + r * 0.95, y + r * 0.15, x, y + r);
+  ctx.closePath();
+  ctx.fillStyle = MINIMAP_PALETTE.gunStore;
+  ctx.fill();
+  ctx.strokeStyle = MINIMAP_PALETTE.playerEdge;
+  ctx.lineWidth = 1.4;
+  ctx.stroke();
+  // Crosshair, so the pin still reads as "guns" at four pixels across.
+  ctx.beginPath();
+  ctx.arc(x, y - r * 0.12, r * 0.30, 0, TAU);
+  ctx.moveTo(x - r * 0.46, y - r * 0.12);
+  ctx.lineTo(x + r * 0.46, y - r * 0.12);
+  ctx.moveTo(x, y - r * 0.58);
+  ctx.lineTo(x, y + r * 0.34);
+  ctx.strokeStyle = MINIMAP_PALETTE.playerEdge;
+  ctx.lineWidth = 1.1;
+  ctx.stroke();
 }

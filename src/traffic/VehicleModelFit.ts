@@ -331,8 +331,36 @@ export interface WheelMount {
   readonly halfTrack: number;
 }
 
+/**
+ * One opening the cut left in the body.
+ *
+ * The cut is a disc about the wheel's own axle, so the hole it leaves is
+ * described by exactly these three numbers - and a hole nothing fills is a
+ * hole you can see the inside of the car through. `VehicleModels` builds the
+ * wheel well that closes it from this.
+ */
+export interface WheelArch {
+  /** Along the vehicle, in its own frame: nose at -Z. */
+  readonly z: number;
+  /** Height of the axle the arch was cut around. */
+  readonly centreY: number;
+  /**
+   * Radius of the opening in the bodywork.
+   *
+   * This is the radius the cut REACHED, not the radius it swept. A triangle is
+   * dropped when its centroid falls inside the wheel, so a triangle straddling
+   * the boundary goes with the rest and takes bodywork out past the circle -
+   * on these assets by up to a fifth of the wheel's radius. Sizing a wheel
+   * well to the swept circle therefore leaves a ring of the opening
+   * uncovered, and a viewer looking along the axle sees straight through it.
+   */
+  readonly radius: number;
+}
+
 export interface WheelDetection {
   readonly mount: WheelMount;
+  /** The openings the cut left, front first. Empty when nothing was cut. */
+  readonly arches: readonly WheelArch[];
   /** True when the model arrived with wheels and they were removed. */
   readonly cut: boolean;
   /** The index buffer with the wheel triangles dropped. */
@@ -473,6 +501,7 @@ export function detectAndCutWheels(
         rearZ: params.rearAxleZ,
         halfTrack: params.track * 0.5,
       },
+      arches: [],
       cut: false,
       index: Uint32Array.from(index as ArrayLike<number>),
       removed: 0,
@@ -502,10 +531,15 @@ export function detectAndCutWheels(
   const xCut = (trackCount > 20 ? trackSum / trackCount : params.track * 0.5) - params.wheelWidth * 1.15;
   const kept: number[] = [];
   let removed = 0;
+  // How far out from each axle the cut actually reached. A well sized to this
+  // covers the opening; one sized to the swept circle does not.
+  const opened = chosen.map(() => 0);
   for (let t = 0; t < triangles; t += 1) {
     let drop = false;
+    let hitCluster = -1;
     if (Math.abs(centroidX[t] as number) >= xCut) {
-      for (const cluster of chosen) {
+      for (let c = 0; c < chosen.length; c += 1) {
+        const cluster = chosen[c] as WheelCluster;
         const dy = (centroidY[t] as number) - cluster.radius;
         const dz = (centroidZ[t] as number) - cluster.z;
         const reach = cluster.radius * WHEEL_CUT_REACH;
@@ -516,12 +550,21 @@ export function detectAndCutWheels(
           (Math.abs(dz) < cluster.radius * 1.15 && (centroidY[t] as number) < cluster.radius * 0.55)
         ) {
           drop = true;
+          hitCluster = c;
           break;
         }
       }
     }
     if (drop) {
       removed += 1;
+      const cluster = chosen[hitCluster] as WheelCluster;
+      for (let k = 0; k < 3; k += 1) {
+        const v = index[t * 3 + k] ?? 0;
+        const dy = (positions[v * 3 + 1] ?? 0) - cluster.radius;
+        const dz = (positions[v * 3 + 2] ?? 0) - cluster.z;
+        const r = Math.hypot(dy, dz);
+        if (r > (opened[hitCluster] as number)) opened[hitCluster] = r;
+      }
       continue;
     }
     kept.push(index[t * 3] ?? 0, index[t * 3 + 1] ?? 0, index[t * 3 + 2] ?? 0);
@@ -533,6 +576,13 @@ export function detectAndCutWheels(
       rearZ: rear ? rear.z : params.rearAxleZ,
       halfTrack: trackCount > 20 ? trackSum / trackCount : params.track * 0.5,
     },
+    // The opening each cut left, in the order the renderer mounts its wheels.
+    arches: chosen.map((cluster, i) => ({
+      z: cluster.z,
+      centreY: cluster.radius,
+      // What the cut reached, never less than what it swept.
+      radius: Math.max(opened[i] ?? 0, cluster.radius * WHEEL_CUT_REACH),
+    })),
     cut: true,
     index: Uint32Array.from(kept),
     removed,

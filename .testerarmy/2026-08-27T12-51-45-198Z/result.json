@@ -1,0 +1,15 @@
+{
+  "featureName": "localhost",
+  "result": "FAILED",
+  "description": "The application failed to load because the browser context does not support WebGL. The page displays the error: 'Meridian Bay needs WebGL, and this browser cannot provide it. This browser could not create a WebGL context.' Consequently, the 'Click to explore Meridian Bay' button never appeared, blocking all subsequent test steps.",
+  "issues": [],
+  "screenshots": [],
+  "steps": [
+    {
+      "stepIndex": 0,
+      "title": "",
+      "status": "failed",
+      "summary": "The application failed to load because the browser context does not support WebGL. The page displays the error: 'Meridian Bay needs WebGL, and this browser cannot provide it. This browser could not create a WebGL context.' Consequently, the 'Click to explore Meridian Bay' button never appeared, blocking all subsequent test steps."
+    }
+  ]
+}

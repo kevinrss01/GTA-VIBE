@@ -160,11 +160,47 @@ credits, and — unlike a static generated figure — the clerk actually breathe
 ### The counter interface
 
 `src/ui/GunShopUi.ts`. Opens on the interaction point at the customer side of
-the counter, shows cash and every weapon with damage, range, magazine, rate of
-fire, what is owned and how many rounds are carried, and offers two actions per
-row: buy the weapon, or buy a magazine for it. Arrow keys move, Enter buys,
-Escape leaves. It owns no state; it reads `PlayerState.snapshot()` and calls
-`buyWeapon` / `buyAmmo`.
+the counter, shows cash and every weapon, what is owned and how many rounds are
+carried, and offers two actions per row: buy the weapon, or buy a magazine for
+it. Arrow keys move, Enter buys, Escape leaves. It owns no state; it reads
+`PlayerState.snapshot()` and calls `buyWeapon` / `buyAmmo`.
+
+### The display case
+
+The counter used to be a price list: four rows of four numbers each, and a
+player expected to hold twelve of them in their head to compare the fifth.
+Above the list there is now a display case.
+
+`src/shop/WeaponPreview.ts` puts the SELECTED weapon's real GLB on a slow
+turntable in a 300x214 panel, and `src/shop/weaponStats.ts` puts five stats
+beside it as bars: damage per trigger pull, rate of fire, accuracy, range and
+magazine. Every fraction is the weapon's own value over the BEST value in the
+catalogue for that stat, so a full bar means nothing here beats it, and the
+real quantity is printed beside every bar in its real unit. Each of the four
+weapons wins exactly one row, which is a property of the armoury and is
+asserted as one in `tests/weapons.test.ts`.
+
+Selection follows FOCUS. The arrow keys that already moved between rows now
+also turn the weapon on the stand, and clicking anywhere on a row does the
+same; there is no second thing to learn. Because a browser suppresses focus
+events entirely while its own window is in the background - which is the state
+an automated harness drives the game in - the arrow-key handler selects
+explicitly rather than relying on `focusin` alone.
+
+The preview owns its OWN small `WebGLRenderer`. Borrowing the game's would mean
+a scissored second pass, a camera swap and a render-target copy into the DOM on
+every frame the counter is open; a second context on a 300-pixel canvas is one
+extra context out of the sixteen a browser allows. It carries NO POINT LIGHT:
+the metal reads because the scene has a pre-filtered environment baked once
+from a procedural two-softbox gradient painted into a 128x64 canvas, plus one
+directional light for the highlight down the barrel. It renders only while the
+counter is open, driven from `GunShop.update` - the game's own clock, not a
+private `requestAnimationFrame`, so it stops when the game stops and steps when
+an automated harness steps the game by hand.
+
+The Dock Sweeper's cobalt-blue generation artefact is corrected here with the
+same `tint` the held weapon uses, so the shop cannot sell a blue shotgun and
+then hand the player a grey one.
 
 ## Generated furnishings in the other interiors
 

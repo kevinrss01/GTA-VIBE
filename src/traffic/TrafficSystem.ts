@@ -64,24 +64,28 @@ export interface TrafficSystemOptions {
  * Density is expressed against the length of the lane graph rather than as a
  * car count, so the city stays evenly busy from one end to the other instead
  * of crowding wherever the fleet happened to be seeded. Meridian Bay has 8.87
- * km of lane, so `high` is about a hundred and forty cars spread across every
- * street - one per 63 m of lane.
+ * km of lane, so `high` is about a hundred and twenty cars spread across every
+ * street - one per 72 m of lane.
  *
- * That number is measured, not guessed. Meridian Bay's signals give each axis
- * 9 s of green in a 26 s cycle and its junctions are 45 m apart, which caps the
- * mean speed traffic can possibly hold at roughly 3.6 m/s, so the grid's
- * capacity is what sets the density here, not the frame budget.
+ * That number is measured, not guessed, and it was measured AFTER the two
+ * structural faults in `TrafficSim` were fixed, because before them no density
+ * was any good: route choice piled 2.6 times its fair share of traffic onto
+ * the outer ring road, and the junction-clearance rule let cars commit to a
+ * box that then filled up. Together those produced a city that slid into
+ * gridlock the longer it ran.
  *
- * Measured over eight minutes on three seeds, sampled every minute:
+ * Settled behaviour over minutes 12 to 15 of a fifteen-minute run, seven
+ * seeds, with the camera moving the way a player moves:
  *
- *   one per 76 m (117 cars)  mean 2.3-2.5 m/s, worst minute 1.4
- *   one per 63 m (140 cars)  mean 2.1-2.2 m/s, worst minute 1.4
- *   one per 54 m (165 cars)  mean 1.8-2.3 m/s, worst minute 1.0
+ *   before, one per 63 m (141 cars)  mean 1.68 m/s, 61 per cent standing
+ *   before, one per 72 m (123 cars)  mean 1.87 m/s, 57 per cent standing
+ *   after,  one per 63 m (141 cars)  mean 2.42 m/s, 45 per cent standing
+ *   after,  one per 72 m (123 cars)  mean 2.76 m/s, 39 per cent standing
  *
- * 63 m buys a fifth more traffic for a twentieth of the speed; 54 m starts to
- * produce minutes where two thirds of the fleet is standing still, which reads
- * as gridlock rather than as a busy city. `tests/traffic.test.ts` guards the
- * floor so a future change cannot quietly tip it over.
+ * 72 m is the point where the last of the standing queues goes: the city at
+ * 123 cars now moves half as fast again as it did at 141, and it no longer
+ * degrades over time. `tests/traffic.test.ts` guards both the floor and the
+ * absence of the slide so a future change cannot quietly reintroduce either.
  *
  * Queues concentrate at junctions, which is where the player is looking, so
  * the city reads busier than the raw count suggests.
@@ -90,7 +94,7 @@ export interface TrafficSystemOptions {
  * draw calls and about 0.22 ms of frame time, plus 0.2 ms of CPU for the
  * simulation. See the note in `TrafficRenderer`.
  */
-const DENSITY: Record<QualityLevel, number> = { low: 120, medium: 85, high: 63 };
+const DENSITY: Record<QualityLevel, number> = { low: 120, medium: 85, high: 72 };
 const RENDER_DISTANCE: Record<QualityLevel, number> = { low: 150, medium: 200, high: 260 };
 const MAX_POPULATION = 240;
 

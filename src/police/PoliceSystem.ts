@@ -36,6 +36,14 @@
  * enough away - the fleet only carries five or six - an ordinary saloon is
  * taken instead and works as an unmarked unit.
  *
+ * THE RESPONSE BUILDS. Nothing is sent for `dispatchDelay(stars)` seconds
+ * after the alarm is raised, the unit that answers starts `dispatchDistance`
+ * metres away, and the next one follows `dispatchInterval` later - all three
+ * functions of the wanted level, all three in `policy.ts`. A first star is a
+ * distant single car that takes half a minute to find you; a fifth is five
+ * cars from just beyond the fog. See the escalation note in `policy.ts` for
+ * the measured before and after.
+ *
  * WHAT IT ADDS TO THE FRAME: two draw calls during a pursuit (one instanced
  * mesh of officers, one of beacon lenses), and none at all while nobody is
  * wanted, because both meshes are hidden. It adds NO LIGHTS.
@@ -63,10 +71,8 @@ import {
   CAR_HOLD_RANGE,
   COMMANDEER_DISTANCE,
   DISMOUNT_RANGE,
-  DISPATCH_DISTANCE,
   MAX_OFFICERS,
   MAX_UNITS,
-  OFFICER_AIM_TIME,
   OFFICER_FIRE_RANGE,
   OFFICER_RUN_SPEED,
   OFFICER_SHOT_DAMAGE,
@@ -76,8 +82,11 @@ import {
   SIGHT_RANGE_FOOT,
   canArrest,
   carsForStars,
+  dispatchDelay,
+  dispatchDistance,
   dispatchInterval,
   officerAccuracy,
+  officerAimTime,
   officersPerCar,
   shootsOnSight,
 } from './policy';
@@ -241,6 +250,10 @@ export interface PoliceStats {
   readonly officersDown: number;
   readonly vehiclesWrecked: number;
   readonly unmarked: number;
+  /** Which officer mesh is live. `procedural` means the bake failed to load. */
+  readonly officerModel: 'baked' | 'procedural';
+  /** Seconds still to wait before the first unit is sent, 0 once it has been. */
+  readonly dispatchIn: number;
 }
 
 export class PoliceSystem implements LawTargets {
@@ -260,6 +273,16 @@ export class PoliceSystem implements LawTargets {
   /** Reused so writing the rig allocates nothing per frame. */
   private readonly onFoot: Officer[] = [];
   private dispatchTimer = 0;
+  /**
+   * World time the current alarm was raised, or -1 while the player is clean.
+   *
+   * The whole of `dispatchDelay` is measured from here, so the wait belongs to
+   * the OFFENCE and not to each dispatch: a player who goes from one star to
+   * four during the delay gets the four-star wait counted from the original
+   * shot, which is a shorter remaining wait rather than a fresh one. Cleared
+   * the moment the stars reach zero, so the next offence is a new alarm.
+   */
+  private alarmAt = -1;
   /** The shared world clock, latched each update so damage can read it. */
   private now = 0;
   private nextUnitId = 1;
@@ -298,7 +321,7 @@ export class PoliceSystem implements LawTargets {
 
     const group = new Group();
     group.name = 'police';
-    group.add(this.rig.mesh, this.beacons.object);
+    group.add(...this.rig.meshes, this.beacons.object);
     group.userData.police = this;
     this.group = group;
   }
@@ -406,8 +429,21 @@ export class PoliceSystem implements LawTargets {
       units: this.units.length,
       officers: this.officers.filter((o) => o.state === 'chasing').length,
       pursued: this.pursuedNow,
+      officerModel: this.rig.ready ? 'baked' : 'procedural',
+      dispatchIn: this.remainingDelay(),
       ...this.counters,
     };
+  }
+
+  /**
+   * Seconds left of the dispatch delay, for the diagnostics overlay and for
+   * automated QA that wants to assert the pacing without a stopwatch.
+   */
+  private remainingDelay(): number {
+    const stars = this.options.player.wanted;
+    if (stars <= 0 || this.alarmAt < 0) return 0;
+    const left = dispatchDelay(stars) - (this.now - this.alarmAt);
+    return left > 0 ? Number(left.toFixed(2)) : 0;
   }
 
   /** Ends the chase and returns every car to traffic. Used on respawn. */
@@ -418,7 +454,8 @@ export class PoliceSystem implements LawTargets {
     this.pursuedNow = false;
     this.hostileUntil = -1;
     this.dispatchTimer = 0;
-    this.rig.write(this.officers);
+    this.alarmAt = -1;
+    this.rig.write(this.officers, 0);
     this.beacons.write([], 0);
   }
 
@@ -471,15 +508,34 @@ export class PoliceSystem implements LawTargets {
   // -- dispatch -------------------------------------------------------------
 
   private updateDispatch(dt: number, stars: number, ctx: PoliceContext): void {
-    if (stars <= 0) return;
+    if (stars <= 0) {
+      // Clean again: the next offence starts its own alarm from scratch.
+      this.alarmAt = -1;
+      this.dispatchTimer = 0;
+      return;
+    }
     // Nobody is dispatched to a player who is already down. Without this the
     // city keeps sending cars through the two and a half seconds the outcome
     // is on screen, and one of them is still in the street on respawn.
     if (!this.options.player.alive) return;
+    if (this.alarmAt < 0) {
+      this.alarmAt = ctx.time;
+      this.dispatchTimer = 0;
+    }
+
     const wanted = carsForStars(stars);
     const live = this.units.filter((u) => u.state === 'driving' || u.state === 'holding').length;
-    this.dispatchTimer -= dt;
+    // CLAMPED AT ZERO, not allowed to run negative. It used to keep counting
+    // down while the quota was already met, so a player who sat at two stars
+    // for a minute had banked a minute of credit: the instant a third star
+    // landed, or a unit was wrecked, two replacements went out on consecutive
+    // frames. That is most of what "three units arrived within four seconds"
+    // was. The interval now means the same thing whenever it is reached.
+    this.dispatchTimer = Math.max(0, this.dispatchTimer - dt);
     if (live >= wanted || this.units.length >= MAX_UNITS) return;
+    // Nothing at all goes out until the call has had time to. This is the
+    // difference between a response and an ambush.
+    if (ctx.time - this.alarmAt < dispatchDelay(stars)) return;
     if (this.dispatchTimer > 0) return;
     this.dispatchTimer = dispatchInterval(stars);
     this.dispatch(stars, ctx);
@@ -488,13 +544,19 @@ export class PoliceSystem implements LawTargets {
   private dispatch(stars: number, ctx: PoliceContext): void {
     const source = this.pickVehicle(ctx.playerX, ctx.playerZ);
     if (!source) return;
+    // Spread consecutive dispatches over a band of distances rather than
+    // stacking them on one street. This is what makes a four-car response
+    // arrive as four separate cars from four directions instead of a convoy,
+    // and it is drawn from the seeded RNG so a replay is still identical.
+    const spread = 0.85 + this.rng.next() * 0.3;
     const spot = dispatchLane(
       this.options.network,
       ctx.playerX,
       ctx.playerZ,
       ctx.forwardX,
       ctx.forwardZ,
-      DISPATCH_DISTANCE,
+      dispatchDistance(stars) * spread,
+      (laneId) => Number.isFinite(this.field.cost(laneId)),
     );
     if (!spot) return;
     const handle = this.options.traffic.takeControl(source.id);
@@ -557,6 +619,9 @@ export class PoliceSystem implements LawTargets {
         phase: this.rng.next(),
         gait: 0,
         variant: look.variant,
+        walked: this.rng.next() * 4,
+        lastX: unit.x,
+        lastZ: unit.z,
       };
       this.nextOfficerId += 1;
       unit.officers.push(officer);
@@ -796,6 +861,11 @@ export class PoliceSystem implements LawTargets {
     officer.heading = unit.yaw;
     officer.speed = 0;
     officer.state = 'chasing';
+    // Getting out of a car is a teleport, not a stride: reseed the walk
+    // accumulator's reference point so the first frame on foot does not
+    // advance the clip by the width of the car.
+    officer.lastX = officer.x;
+    officer.lastZ = officer.z;
   }
 
   // -- officers -------------------------------------------------------------
@@ -935,7 +1005,7 @@ export class PoliceSystem implements LawTargets {
         continue;
       }
       officer.aim += dt;
-      if (officer.aim < OFFICER_AIM_TIME || officer.shotTimer > 0) continue;
+      if (officer.aim < officerAimTime(stars) || officer.shotTimer > 0) continue;
       officer.shotTimer = OFFICER_SHOT_INTERVAL * (0.85 + this.rng.next() * 0.35);
       this.fireAtPlayer(officer, stars, ctx);
     }
@@ -1065,7 +1135,7 @@ export class PoliceSystem implements LawTargets {
     for (const officer of this.officers) {
       if (officer.state === 'chasing') this.onFoot.push(officer);
     }
-    this.rig.write(this.onFoot);
+    this.rig.write(this.onFoot, time);
   }
 
   /** Where an officer thinks the lane runs, used by the pursuit driver. */

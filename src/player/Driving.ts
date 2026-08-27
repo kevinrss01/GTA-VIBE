@@ -47,8 +47,43 @@ const CAM_LAG = 9;
 
 /** Reverse is deliberately slow - this is a city car park, not a race. */
 const REVERSE_SPEED = 6;
-/** Rolling resistance and drag, as a fraction of speed per second. */
+/** Engine braking felt when the driver lifts off, as a fraction of speed. */
 const COAST_DRAG = 0.55;
+
+/**
+ * Hard ceiling on speed, in metres per second. A backstop, not the cruise.
+ *
+ * There has to be one. Without it the throttle added acceleration every frame
+ * with nothing opposing it, so speed grew without bound: measured 0 to 111
+ * km/h in ten seconds and still climbing, at which point one frame moved the
+ * car 0.51 m - more than half its own half-width. A frame that steps further
+ * than the body is wide can pass clean through a wall between two collision
+ * tests, so this is a correctness limit, not a handling preference.
+ *
+ * In practice drag settles every vehicle well below it: solving thrust against
+ * the two drag terms gives 16.9 m/s (61 km/h) for the least powerful chassis
+ * up to 23.9 m/s (86 km/h) for the most, which is 0.28 to 0.40 m per frame -
+ * inside `MAX_COLLISION_STEP` on its own, with the sub-stepping below as the
+ * guarantee rather than the only defence. This constant is also what scales
+ * the drag curve, so raising it raises every vehicle's cruise together.
+ */
+const TOP_SPEED = 33;
+
+/**
+ * Rolling resistance, applied at ALL times including under power. Small enough
+ * that it does not feel like a handbrake, large enough that a car coasts to a
+ * stop instead of gliding forever.
+ */
+const ROLL_DRAG = 0.14;
+
+/**
+ * Largest distance the car may move between two collision tests.
+ *
+ * The collision resolve checks the footprint at the END of a displacement, so
+ * anything longer than this is split into several steps. Half a metre is
+ * comfortably inside the narrowest body half-width in the fleet.
+ */
+const MAX_COLLISION_STEP = 0.45;
 /** Speed below which the car is simply stopped, to kill numerical creep. */
 const CREEP_EPSILON = 0.12;
 
@@ -254,6 +289,23 @@ export class Driving {
     controller.setPaused(false);
   }
 
+  /**
+   * Called when this car knocks a pedestrian down.
+   *
+   * A person does not stop a car, but you feel it: a short scrub of speed and
+   * a jolt through the body, which the chase camera then inherits through the
+   * suspension. Deliberately small - making it stop the car would turn a
+   * pedestrian into a bollard.
+   */
+  reportImpact(speed: number, _dirX: number, _dirZ: number): void {
+    if (!this.handle) return;
+    const severity = Math.min(1, Math.abs(speed) / 14);
+    this.speed *= 1 - 0.10 * severity;
+    // Nose-down jolt, on top of whatever the suspension is already doing.
+    this.pitchLean -= 0.045 * severity;
+    this.braking = true;
+  }
+
   /** Integrates the car and puts the camera in the driver's seat. */
   update(dt: number): void {
     const handle = this.handle;
@@ -292,10 +344,21 @@ export class Driving {
     if (throttle === 0 && brake === 0) accel -= this.speed * COAST_DRAG;
     if (handbrake) accel -= Math.sign(this.speed) * chassis.brakeMax * 1.15;
 
+    // Resistance that never switches off. Aerodynamic drag rises with the
+    // square of speed, so it is negligible in traffic and is what actually
+    // sets the top speed: the car settles where thrust equals drag. Deriving
+    // the coefficient from this vehicle's own `accelMax` means a laden truck
+    // tops out lower than a coupe without needing a second number per vehicle.
+    const dragK = chassis.accelMax / (TOP_SPEED * TOP_SPEED);
+    accel -= dragK * this.speed * Math.abs(this.speed);
+    accel -= this.speed * ROLL_DRAG;
+
     this.braking = brake > 0 || handbrake;
     this.speed += accel * dt;
-    // Reverse is capped well below the forward limit.
+    // Hard limits behind the drag, so no combination of inputs, dt spikes or
+    // downhill slope can put the car beyond what collision can resolve.
     if (this.speed < -REVERSE_SPEED) this.speed = -REVERSE_SPEED;
+    if (this.speed > TOP_SPEED) this.speed = TOP_SPEED;
     // Only kill creep when the driver is asking for NOTHING. Testing throttle
     // alone meant that holding brake from rest - which is how you select
     // reverse - had its speed zeroed every frame before it could build, so the
@@ -336,35 +399,56 @@ export class Driving {
     // Other traffic is included as well, so the player cannot drive through the
     // cars that are already braking for them.
     collision.refreshVehicles(this.x, this.z, VEHICLE_QUERY_RADIUS, handle.id);
-    const surface = ground.sample(this.x, this.z);
-    const moved = collision.moveBox(
-      this.x,
-      this.z,
-      this.yaw,
-      dx,
-      dz,
-      handle.view.halfLength,
-      handle.view.halfWidth,
-      surface.y,
-      BODY_HEIGHT,
-      true,
-    );
-    const gotX = moved.x - this.x;
-    const gotZ = moved.z - this.z;
+
+    // Swept, not teleported. `moveBox` tests the footprint where the step ENDS,
+    // so one long step can begin in front of a wall and end behind it, having
+    // touched nothing in between. Splitting the frame into sub-steps no longer
+    // than `MAX_COLLISION_STEP` makes that impossible at any speed the car can
+    // reach, and costs nothing at ordinary speeds where the loop runs once.
     const wanted = Math.hypot(dx, dz);
-    const achieved = Math.hypot(gotX, gotZ);
-    if (wanted > 1e-5 && achieved < wanted - 1e-4) {
-      // Something is in the way. Keep whatever sliding the world allowed and
-      // scrub speed by how much was refused, so a glance costs less than a
-      // head-on hit.
-      const lost = 1 - achieved / wanted;
+    const steps = Math.max(1, Math.ceil(wanted / MAX_COLLISION_STEP));
+    let achieved = 0;
+    let blocked = false;
+    for (let i = 0; i < steps; i += 1) {
+      const stepX = dx / steps;
+      const stepZ = dz / steps;
+      const surface = ground.sample(this.x, this.z);
+      const moved = collision.moveBox(
+        this.x,
+        this.z,
+        this.yaw,
+        stepX,
+        stepZ,
+        handle.view.halfLength,
+        handle.view.halfWidth,
+        surface.y,
+        BODY_HEIGHT,
+        true,
+      );
+      const gotX = moved.x - this.x;
+      const gotZ = moved.z - this.z;
+      this.x = moved.x;
+      this.z = moved.z;
+      achieved += Math.hypot(gotX, gotZ);
+      const stepWanted = Math.hypot(stepX, stepZ);
+      if (stepWanted > 1e-6 && Math.hypot(gotX, gotZ) < stepWanted - 1e-5) {
+        blocked = true;
+        // Nothing further this frame: the remaining sub-steps would push into
+        // whatever just stopped us.
+        break;
+      }
+    }
+
+    if (blocked && wanted > 1e-5) {
+      // Keep whatever sliding the world allowed and scrub speed by how much
+      // was refused, so a glance costs less than a head-on hit.
+      const lost = Math.max(0, 1 - achieved / wanted);
       this.speed *= Math.max(0, 1 - lost * 1.6);
       if (lost > 0.75) this.speed = -this.speed * 0.12;
-      dx = gotX;
-      dz = gotZ;
     }
-    this.x += dx;
-    this.z += dz;
+    // The sub-step loop has already committed the movement.
+    dx = 0;
+    dz = 0;
 
     // Keep the car inside the world rather than letting it drive into the bay.
     if (!ground.isInBounds(this.x, this.z) || ground.sample(this.x, this.z).surface === 'water') {

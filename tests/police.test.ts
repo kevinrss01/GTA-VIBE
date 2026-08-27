@@ -22,14 +22,18 @@ import {
   MAX_UNITS,
   canArrest,
   carsForStars,
+  dispatchDelay,
+  dispatchDistance,
   dispatchInterval,
   officerAccuracy,
+  officerAimTime,
   officersPerCar,
   shootsOnSight,
 } from '../src/police/policy';
 import {
   angleDelta,
   chooseExit,
+  dispatchLane,
   headingTo,
   nearestLane,
   PursuitField,
@@ -145,6 +149,7 @@ function makeSystem(options: {
   player: PlayerState;
   fleet: StubFleet;
   onArrest?: () => void;
+  onOfficerShot?: () => void;
 }): PoliceSystem {
   return new PoliceSystem({
     player: options.player,
@@ -158,6 +163,7 @@ function makeSystem(options: {
     quality: 'low',
     seed: 'police-test',
     ...(options.onArrest ? { onArrest: options.onArrest } : {}),
+    ...(options.onOfficerShot ? { onOfficerShot: options.onOfficerShot } : {}),
   });
 }
 
@@ -186,7 +192,15 @@ function pinStars(player: PlayerState, stars: number): void {
   }
 }
 
-/** Runs the pursuit for `seconds`, holding the wanted level steady. */
+/**
+ * Runs the pursuit for `seconds`, holding the wanted level steady, and returns
+ * the world time it stopped at.
+ *
+ * THE CLOCK HAS TO BE CONTINUOUS. The dispatch delay is measured against
+ * `ctx.time`, so a second call that restarted at zero would hand the police a
+ * clock that ran backwards and re-serve the whole wait. Callers that run in
+ * more than one leg must thread the returned time into the next `from`.
+ */
 function run(
   police: PoliceSystem,
   player: PlayerState,
@@ -194,13 +208,15 @@ function run(
   seconds: number,
   at: { x: number; z: number },
   extra: Partial<PoliceContext> = {},
-): void {
+  from = 0,
+): number {
   const dt = 1 / 30;
   const steps = Math.round(seconds / dt);
   for (let i = 0; i < steps; i += 1) {
     pinStars(player, stars);
-    police.update(dt, context(at.x, at.z, { ...extra, time: i * dt }));
+    police.update(dt, context(at.x, at.z, { ...extra, time: from + i * dt }));
   }
+  return from + steps * dt;
 }
 
 // -- policy -------------------------------------------------------------------
@@ -228,6 +244,30 @@ describe('escalation policy', () => {
       expect(dispatchInterval(stars)).toBeLessThan(dispatchInterval(stars - 1));
     }
     expect(officerAccuracy(5)).toBeGreaterThan(officerAccuracy(2));
+  });
+
+  it('makes the response build: later, further and slower at the bottom', () => {
+    // Nothing is sent to a clean player, ever.
+    expect(dispatchDelay(0)).toBe(Infinity);
+    expect(dispatchDistance(0)).toBe(dispatchDistance(5));
+
+    // The three quantities that carry the pacing all ease off as the level
+    // climbs, and none of them is allowed to go the other way. This is the
+    // whole of "the response builds rather than arrives", asserted directly
+    // rather than inferred from watching a chase.
+    for (let stars = 2; stars <= MAX_WANTED; stars += 1) {
+      expect(dispatchDelay(stars)).toBeLessThan(dispatchDelay(stars - 1));
+      expect(dispatchDistance(stars)).toBeLessThan(dispatchDistance(stars - 1));
+      expect(officerAimTime(stars)).toBeLessThanOrEqual(officerAimTime(stars - 1));
+    }
+
+    // A first star is a real wait; a fifth is very nearly none.
+    expect(dispatchDelay(1)).toBeGreaterThan(5);
+    expect(dispatchDelay(5)).toBeLessThan(1);
+    // ... and the ceiling stays where it was, because the complaint was about
+    // the first star feeling instant and not about five being too gentle.
+    expect(dispatchDistance(5)).toBe(115);
+    expect(officerAimTime(5)).toBe(0.8);
   });
 
   it('stops trying to arrest and starts shooting at the third star', () => {
@@ -331,6 +371,39 @@ describe('pursuit routing', () => {
     expect(checked).toBeGreaterThan(100);
   });
 
+  it('only ever places a unit on a lane that can drive back to the player', () => {
+    // THE REGRESSION THIS PINS. `dispatchLane` used to pick purely on
+    // distance, and its pick is deterministic, so a wanted distance that
+    // happened to land on a lane with no legal route back produced a unit
+    // that could never arrive, was written off after the lost-patience
+    // timeout, and was replaced by an identical unit on the identical lane -
+    // measured at 21 dispatches in 150 seconds with none reaching the player.
+    // Every distance the policy can ask for must land somewhere routable.
+    const field = new PursuitField(network);
+    const spot = onTheRoad();
+    expect(field.update(spot.x, spot.z)).toBe(true);
+    const reachable = (laneId: string): boolean => Number.isFinite(field.cost(laneId));
+
+    let checked = 0;
+    for (let distance = 60; distance <= 260; distance += 5) {
+      const chosen = dispatchLane(network, spot.x, spot.z, 0, -1, distance, reachable);
+      expect(chosen).not.toBeNull();
+      if (!chosen) continue;
+      expect(Number.isFinite(field.cost(chosen.lane.id))).toBe(true);
+      checked += 1;
+    }
+    expect(checked).toBeGreaterThan(35);
+
+    // Without the filter the same sweep really does pick unroutable lanes:
+    // the fix is load-bearing, not belt and braces.
+    let unroutable = 0;
+    for (let distance = 60; distance <= 260; distance += 5) {
+      const chosen = dispatchLane(network, spot.x, spot.z, 0, -1, distance);
+      if (chosen && !Number.isFinite(field.cost(chosen.lane.id))) unroutable += 1;
+    }
+    expect(unroutable).toBeGreaterThan(0);
+  });
+
   it('does not re-search until the player has actually moved', () => {
     const field = new PursuitField(network);
     const spot = onTheRoad();
@@ -378,6 +451,111 @@ describe('police response', () => {
     expect(seen).toEqual([1, 2, 3, 4, 5]);
   });
 
+  it('sends nothing at all until the call has had time to go out', () => {
+    // Measured before this change: a unit was dispatched on the SAME FRAME as
+    // the offence at every wanted level, one star included. That is what "since
+    // I shot, they came to me in a few seconds" was.
+    for (const stars of [1, 2, 3, 4, 5]) {
+      const player = new PlayerState();
+      const fleet = new StubFleet(8);
+      const police = makeSystem({ player, fleet });
+      const spot = onTheRoad();
+
+      const clock = run(police, player, stars, dispatchDelay(stars) - 0.5, spot);
+      expect(police.stats.dispatched).toBe(0);
+      expect(police.stats.dispatchIn).toBeGreaterThan(0);
+
+      run(police, player, stars, 1, spot, {}, clock);
+      expect(police.stats.dispatched).toBe(1);
+      expect(police.stats.dispatchIn).toBe(0);
+      police.dispose();
+    }
+  });
+
+  it('shortens the remaining wait when the heat climbs instead of restarting it', () => {
+    const player = new PlayerState();
+    const fleet = new StubFleet(8);
+    const police = makeSystem({ player, fleet });
+    const spot = onTheRoad();
+
+    // Three seconds into a one-star wait, which has six left to run.
+    const clock = run(police, player, 1, 3, spot);
+    expect(police.stats.dispatched).toBe(0);
+
+    // The player makes it much worse. Five stars' delay has ALREADY elapsed,
+    // so the next frame sends a car - the wait belongs to the offence, not to
+    // the escalation, and a suspect cannot buy time by getting worse.
+    run(police, player, 5, 2 / 30, spot, {}, clock);
+    expect(police.stats.dispatched).toBeGreaterThan(0);
+    police.dispose();
+  });
+
+  it('does not bank dispatches while the quota is already met', () => {
+    // THE REGRESSION THIS PINS. The dispatch countdown used to keep running
+    // below zero while the street already had its quota, so a player who sat
+    // at two stars for a minute had banked a minute of credit: the instant a
+    // fourth star landed, the replacements went out on consecutive frames.
+    // Measured in play as "three units dispatched within 2-4 seconds".
+    const player = new PlayerState();
+    const fleet = new StubFleet(8);
+    const police = makeSystem({ player, fleet });
+    const spot = onTheRoad();
+
+    const clock = run(police, player, 2, 60, spot);
+    expect(police.stats.units).toBe(2);
+    const banked = police.stats.dispatched;
+
+    // One second at four stars can add at most one car, whatever happened
+    // before, because the interval is measured from the last dispatch.
+    run(police, player, 4, 1, spot, {}, clock);
+    expect(police.stats.dispatched - banked).toBeLessThanOrEqual(1);
+    police.dispose();
+  });
+
+  it('holds fire below three stars unless the player shoots first', () => {
+    for (const stars of [1, 2]) {
+      const player = new PlayerState();
+      const fleet = new StubFleet(8);
+      let shots = 0;
+      const police = makeSystem({ player, fleet, onOfficerShot: () => { shots += 1; } });
+      const spot = onTheRoad();
+
+      const dt = 1 / 30;
+      // Long enough for a car to arrive, a crew to get out and stand over the
+      // player for a while. `player.heal` keeps an arrest from ending the run.
+      for (let i = 0; i < 30 * 120; i += 1) {
+        pinStars(player, stars);
+        player.heal(100);
+        police.update(dt, context(spot.x, spot.z, { time: i * dt }));
+      }
+      expect(police.stats.officers).toBeGreaterThan(0);
+      expect(shots).toBe(0);
+      expect(player.health).toBe(100);
+      police.dispose();
+    }
+  });
+
+  it('still lands a five-star response quickly', () => {
+    // The complaint was that the FIRST star felt instant, not that the ceiling
+    // was too low. A five-star response must still be on the player fast.
+    const player = new PlayerState();
+    const fleet = new StubFleet(8);
+    const police = makeSystem({ player, fleet });
+    const spot = onTheRoad();
+
+    run(police, player, 5, 1, spot);
+    expect(police.stats.dispatched).toBeGreaterThan(0);
+
+    run(police, player, 5, 34, spot, {}, 1);
+    expect(police.stats.units).toBe(MAX_UNITS);
+    expect(police.pursued).toBe(true);
+    const closest = Math.min(
+      ...police.unitReport.map((u) => Math.hypot(u.x - spot.x, u.z - spot.z)),
+    );
+    expect(closest).toBeLessThan(30);
+    police.dispose();
+  });
+
   it('takes real patrol cars out of the fleet and gives them back', () => {
     const player = new PlayerState();
     const fleet = new StubFleet(8);
@@ -413,12 +591,18 @@ describe('police response', () => {
     const police = makeSystem({ player, fleet });
     const spot = onTheRoad();
 
-    run(police, player, 1, 3, spot);
+    // Nothing at all until the call has gone out. This is the pacing change:
+    // one star used to put a car on the road on the same frame as the shot.
+    let clock = run(police, player, 1, dispatchDelay(1) - 1, spot);
+    expect(fleet.views.some((v) => v.control === 'player')).toBe(false);
+    expect(police.stats.dispatched).toBe(0);
+
+    clock = run(police, player, 1, 2, spot, {}, clock);
     const unit = fleet.views.find((v) => v.control === 'player');
     expect(unit).toBeDefined();
     const startDistance = Math.hypot((unit?.x ?? 0) - spot.x, (unit?.z ?? 0) - spot.z);
 
-    run(police, player, 1, 20, spot);
+    run(police, player, 1, 20, spot, {}, clock);
     const endDistance = Math.hypot((unit?.x ?? 0) - spot.x, (unit?.z ?? 0) - spot.z);
     expect(endDistance).toBeLessThan(startDistance);
     police.dispose();

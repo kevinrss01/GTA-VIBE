@@ -165,6 +165,37 @@ Two things fall out of the same measurement:
 The lorry model has three axles. The renderer draws four wheels, so its rear
 bogie keeps one baked pair, which does not turn. An empty arch would read worse.
 
+### Wheel wells
+
+Cutting a wheel out of a single-surface body leaves a hole, and a generated
+body has no interior behind it. Measured with rays against the fitted body
+before and after the cut - counting only sight lines the solid body blocked,
+and only above the vehicle's own underbody - between 1.4 and 14.3 per cent of
+those sight lines went straight through the shell and out the other side. From
+beside a car it read as a black ring around every wheel; from any low angle you
+could see the far side of the street through the sills.
+
+Each shell therefore carries a wheel well behind each arch and a plate under
+the floor, built by `VehicleMeshBuilder.wheelWell` into the SAME geometry as
+the body, so the fleet still draws in twelve calls. Three details are load
+bearing:
+
+- **The well is sized to what the cut REACHED, not what it swept.** A triangle
+  is dropped when its centroid lands inside the wheel, so a triangle straddling
+  the boundary takes bodywork out past the circle - by up to a fifth of the
+  wheel's radius on these assets. `detectAndCutWheels` now measures the true
+  reach and reports it as the arch radius.
+- **The inner wing is clipped to the bodywork.** Unclipped it hung below the
+  sills as a pair of black skirts, visible from across the street.
+- **It is never painted.** A wheel well is moulded liner and a floorpan is
+  underseal; a yellow taxi with yellow wheel arches would be a worse lie than
+  the hole.
+
+It costs 122 triangles a shell - 1662-2321 becomes 1784-2443, about six per
+cent - and no draw calls, no materials and no lights.
+`tests/vehicleModels.test.ts` fires the same rays at every shipped kind and
+requires that at most one in two hundred still passes through.
+
 ## What the shader had to recover
 
 A fused single-material mesh cannot express any of the per-instance behaviour

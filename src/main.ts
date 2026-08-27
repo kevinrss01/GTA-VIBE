@@ -30,7 +30,7 @@ import { PedestrianSystem } from './agents/PedestrianSystem';
 import { TrafficSystem } from './traffic/TrafficSystem';
 import { SignalHeads } from './city/SignalHeads';
 import { StreetAudio } from './audio/StreetAudio';
-import { MAX_HEALTH, PlayerState } from './player/PlayerState';
+import { HEAT, MAX_HEALTH, PlayerState } from './player/PlayerState';
 import { GunShop } from './shop/GunShop';
 import { Furnishings } from './world/furnishings/Furnishings';
 import { loadStreetPropModels } from './world/furnishings/StreetProps';
@@ -323,6 +323,20 @@ async function boot(): Promise<void> {
     domElement: canvas,
   });
 
+  // Running somebody over: the car feels it, and it counts against the player.
+  // Only the player's vehicle strikes anyone - ambient drivers cannot see
+  // pedestrians, so letting them strike was measured at 210 knock-downs in ten
+  // minutes that the player neither caused nor could avoid.
+  pedestrians.onImpact = (hit) => {
+    driving.reportImpact(hit.speed, hit.dirX, hit.dirZ);
+    player.addHeat(HEAT.vehicleImpact);
+  };
+
+  // Traffic brakes for people who are actually on a crossing. The array is
+  // read live, so this is handed over once and the crowd keeps mutating it.
+  traffic.setObstacles(pedestrians.carriagewayObstacles());
+  traffic.setCrossingBlocked((id: string) => pedestrians.crossingBlocked(id));
+
   const audio = new AudioDirector();
   const streetAudio = new StreetAudio({
     host: audio,
@@ -407,7 +421,14 @@ async function boot(): Promise<void> {
 
   // -- law and order ---------------------------------------------------------
   const worldRays = new WorldRayIndex(sink.colliders);
-  const civilians = new CrowdTargets(pedestrians.group);
+  // `removeAt` is what makes a shot civilian actually fall over instead of
+  // walking on with the hit merely recorded. Struck and shot people share one
+  // `down` state inside the crowd.
+  const civilians = new CrowdTargets(pedestrians.group, {
+    removeAt: (x: number, y: number, z: number) => {
+      pedestrians.downAt(x, y, z);
+    },
+  });
 
   const police = new PoliceSystem({
     player,
@@ -473,7 +494,14 @@ async function boot(): Promise<void> {
     window.setTimeout(() => audio.playOneShot('door-close'), 420);
   };
 
-  controller.onFootstep = (surface, running) => audio.footstep(surface, running);
+  // A driver has no feet on the pavement. The controller is paused while
+  // driving, but its velocity DAMPS to zero rather than snapping there, so it
+  // can still cross the footstep threshold for a moment after getting in -
+  // which is audible as walking while sitting in a car.
+  controller.onFootstep = (surface, running) => {
+    if (driving.driving) return;
+    audio.footstep(surface, running);
+  };
 
   // -- pause / pointer lock --------------------------------------------------
 

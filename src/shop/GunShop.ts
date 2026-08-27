@@ -40,6 +40,8 @@
  * `group` adds at most three draw calls (clerk, rifles, pistols) and NO
  * lights: the interior light budget is already at its cap, and this shop's
  * four fittings are requested by the world builder like every other room's.
+ * The counter's display case renders in its OWN small context on its own tiny
+ * canvas, and only while the counter is open; see `WeaponPreview.ts`.
  *
  * ============================================================================
  *
@@ -117,11 +119,14 @@ export class GunShop {
     // Nothing to draw until the counter is found and the assets land.
     this.clerk.group.visible = false;
 
-    this.ui = new GunShopUi({
-      onBuyWeapon: (id) => this.buyWeapon(id),
-      onBuyAmmo: (id) => this.buyAmmo(id),
-      onClose: () => this.close(),
-    });
+    this.ui = new GunShopUi(
+      {
+        onBuyWeapon: (id) => this.buyWeapon(id),
+        onBuyAmmo: (id) => this.buyAmmo(id),
+        onClose: () => this.close(),
+      },
+      options.baseUrl ?? '/',
+    );
     this.element = this.ui.element;
 
     if (this.anchors) {
@@ -205,7 +210,13 @@ export class GunShop {
    * stock is close enough to be worth drawing.
    */
   update(dt: number, at: { readonly x: number; readonly z: number }): void {
-    if (this.disposed || !this.anchors) return;
+    if (this.disposed) return;
+    // The display case turns on the game's clock, not on a private
+    // `requestAnimationFrame`, so it stops exactly when the game stops and
+    // steps exactly when an automated harness steps the game by hand. A no-op
+    // while the counter is shut.
+    this.ui.tick(dt);
+    if (!this.anchors) return;
     const anchor = this.anchors.clerk;
     this.stock.update(at.x, at.z, anchor);
     // The clerk shares the stock's visibility rule: he is in the same room.

@@ -54,6 +54,7 @@ import {
   measureWheel,
   type BodyFit,
   type BodyMeasurement,
+  type WheelArch,
   type WheelMount,
 } from './VehicleModelFit';
 import type { VehicleShell } from './VehicleGeometry';
@@ -142,6 +143,38 @@ const WHEEL_ASSET = {
 
 /** Surface values used where the generated maps do not reach. */
 const GENERATED_BODY: SurfaceStyle = { albedo: 0xffffff, roughness: 0.35, metalness: 0.0 };
+/**
+ * The inside of a car: wheel wells and underbody.
+ *
+ * Deliberately not paintable and deliberately dark. A wheel well is moulded
+ * liner and a floorpan is underseal, and neither is the colour of the car - a
+ * yellow taxi with yellow wheel arches is a worse lie than the hole this
+ * replaces. It carries no texture either (`aTex` stays 0 for authored
+ * geometry), so it reads off `albedo` and shares the body's draw call.
+ */
+const VEHICLE_INTERIOR: SurfaceStyle = { albedo: 0x33373b, roughness: 0.9, metalness: 0.0 };
+/**
+ * How far inside the cut opening the well surface sits.
+ *
+ * The well is a strip of the same cylinder the cut swept. Drawing it at
+ * exactly the cut radius would leave it fighting the bodywork it is supposed
+ * to hide behind; a few per cent inside is enough to stay behind the panel at
+ * every angle without opening a visible rim.
+ */
+const WELL_INSET = 0.99;
+/** Clearance between the well and the wheel the renderer drops into it. */
+const WELL_WHEEL_CLEARANCE = 1.06;
+/**
+ * How far past the cut radius the inner wing reaches.
+ *
+ * The cut drops a whole triangle whenever its centroid lands inside the wheel,
+ * so the opening it leaves is wider than the circle it swept. The plate behind
+ * the well has to cover that margin as well as the circle, and inboard there
+ * is nothing for it to collide with.
+ */
+const WELL_CAP_MARGIN = 1.02;
+/** Highest the inner wing may reach, as a fraction of the body height. */
+const WELL_CAP_CEILING = 0.55;
 const GENERATED_WHEEL: SurfaceStyle = { albedo: 0xffffff, roughness: 0.6, metalness: 0.0 };
 /**
  * What a lit brake lamp adds. Softer than the authored shells used, because
@@ -171,6 +204,20 @@ interface LoadedAsset {
   readonly triangles: number;
 }
 
+/** One wheel well, already sized to the opening it has to sit behind. */
+interface FittedWell {
+  readonly archZ: number;
+  readonly centreY: number;
+  readonly radius: number;
+  /** Half extent of the inner wing, which has to cover the whole opening. */
+  readonly capRadius: number;
+  /** The inner wing is clipped to this band so it stays inside the body. */
+  readonly capBottom: number;
+  readonly capTop: number;
+  readonly xInner: number;
+  readonly xOuter: number;
+}
+
 interface FittedBody {
   /** Positions already in the vehicle's frame, metres, nose at -Z. */
   readonly geometry: BufferGeometry;
@@ -178,6 +225,10 @@ interface FittedBody {
   readonly fit: BodyFit;
   readonly tintable: boolean;
   readonly mount: WheelMount;
+  /** Where the cut opened the bodywork, and how wide the flank is there. */
+  readonly wells: readonly FittedWell[];
+  /** Height and extent of the plate that closes the underbody. */
+  readonly floor: { readonly y: number; readonly halfWidth: number; readonly from: number; readonly to: number } | null;
   /** Wheel triangles removed from the generated body. */
   readonly wheelsRemoved: number;
   /** Vertices sitting on the model's own tail lamps, or null if it has none. */
@@ -309,6 +360,101 @@ function findBrakeLamps(
   return found > 0 ? mask : null;
 }
 
+/**
+ * How far out the bodywork reaches beside one wheel arch.
+ *
+ * The well has to end flush with the flank it sits behind, and the flank is
+ * not where the bounding box says it is: a saloon's widest point is its belt
+ * line, well above the arch, and its sills tuck in below. Measuring the kept
+ * triangles in the arch's own band gives the number the well actually needs,
+ * and taking it from the kept index rather than the raw vertex array is what
+ * keeps the tyre that was just cut away from setting it.
+ */
+function flankAtArch(
+  positions: ArrayLike<number>,
+  index: ArrayLike<number>,
+  arch: WheelArch,
+): number {
+  let widest = 0;
+  const lowest = 0.02;
+  const highest = arch.centreY + arch.radius;
+  for (let i = 0; i < index.length; i += 1) {
+    const v = index[i] ?? 0;
+    const y = positions[v * 3 + 1] ?? 0;
+    if (y < lowest || y > highest) continue;
+    const z = positions[v * 3 + 2] ?? 0;
+    if (Math.abs(z - arch.z) > arch.radius) continue;
+    const x = Math.abs(positions[v * 3] ?? 0);
+    if (x > widest) widest = x;
+  }
+  return widest;
+}
+
+/**
+ * Sizes the wheel wells and the underbody plate for one fitted body.
+ *
+ * Everything here is derived from what the cut actually did rather than from
+ * the blueprint, because the two disagree: a generated wheelbase can be most
+ * of a metre away from the blueprint's on a truck, and a well in the wrong
+ * place is a hole in a different position rather than no hole.
+ */
+function fitInterior(
+  positions: ArrayLike<number>,
+  index: ArrayLike<number>,
+  arches: readonly WheelArch[],
+  mount: WheelMount,
+  wheelRadius: number,
+  wheelWidth: number,
+  bodyHeight: number,
+): { wells: FittedWell[]; floor: FittedBody['floor'] } {
+  let lowest = Infinity;
+  for (let i = 0; i < index.length; i += 1) {
+    const v = index[i] ?? 0;
+    const y = positions[v * 3 + 1] ?? 0;
+    if (y < lowest) lowest = y;
+  }
+  const floorY = (Number.isFinite(lowest) ? lowest : 0) + 0.03;
+  const wells: FittedWell[] = [];
+  const xInner = Math.max(0.05, mount.halfTrack - wheelWidth * 0.5 - 0.07);
+  for (const arch of arches) {
+    // Inside the opening so the panel always covers the join, but never so
+    // tight that the wheel the renderer drops in pokes through it.
+    const radius = Math.max(arch.radius * WELL_INSET, wheelRadius * WELL_WHEEL_CLEARANCE);
+    const flank = flankAtArch(positions, index, arch);
+    const xOuter = Math.max(flank, mount.halfTrack + wheelWidth * 0.5);
+    if (xOuter <= xInner) continue;
+    wells.push({
+      archZ: arch.z,
+      centreY: arch.centreY,
+      radius,
+      capRadius: Math.max(radius, arch.radius) * WELL_CAP_MARGIN,
+      // Never below the floorpan and never up into the glazing: outside that
+      // band there is no bodywork to hide behind.
+      capBottom: floorY,
+      capTop: bodyHeight * WELL_CAP_CEILING,
+      xInner,
+      xOuter,
+    });
+  }
+
+  // The underbody: what you see when you crouch beside a car and look under
+  // it. Set just above the model's own lowest point, so a body that already
+  // has a floor keeps it - that one is nearer the eye and wins the depth test
+  // - and one that does not gets this instead of a view up into the roof.
+  const first = wells[0];
+  const last = wells[wells.length - 1];
+  const floor =
+    first && last && Number.isFinite(lowest)
+      ? {
+          y: floorY,
+          halfWidth: xInner,
+          from: Math.min(first.archZ, last.archZ) - first.radius,
+          to: Math.max(first.archZ, last.archZ) + last.radius,
+        }
+      : null;
+  return { wells, floor };
+}
+
 function buildFitted(fitted: FittedBody, lamps: boolean): VehicleShell {
   const mesh = new VehicleMeshBuilder();
   const position = fitted.geometry.getAttribute('position');
@@ -324,6 +470,37 @@ function buildFitted(fitted: FittedBody, lamps: boolean): VehicleShell {
     lamps ? fitted.brakeLamps : null,
     BRAKE_EMISSION,
   );
+
+  // Close what the wheel cut opened. This is authored geometry appended to the
+  // SAME builder, so it joins the body's own batch: the fleet still draws in
+  // one call per shell plus one for every wheel in the city.
+  for (const well of fitted.wells) {
+    for (const side of [-1, 1] as const) {
+      mesh.wheelWell(
+        side,
+        well.archZ,
+        well.centreY,
+        well.radius,
+        well.capRadius,
+        well.capBottom,
+        well.capTop,
+        well.xInner,
+        well.xOuter,
+        VEHICLE_INTERIOR,
+      );
+    }
+  }
+  const floor = fitted.floor;
+  if (floor) {
+    mesh.quad(
+      [-floor.halfWidth, floor.y, floor.from],
+      [floor.halfWidth, floor.y, floor.from],
+      [floor.halfWidth, floor.y, floor.to],
+      [-floor.halfWidth, floor.y, floor.to],
+      VEHICLE_INTERIOR,
+      [0, -1, 0],
+    );
+  }
   return { geometry: mesh.build(), triangles: mesh.triangleCount };
 }
 
@@ -393,12 +570,24 @@ export class VehicleModelSet {
       geometry.computeBoundingBox();
 
       const uv = geometry.getAttribute('uv');
+      const keptIndex = geometry.getIndex();
+      const interior = fitInterior(
+        geometry.getAttribute('position').array,
+        keptIndex ? keptIndex.array : [],
+        detection.arches,
+        detection.mount,
+        bp.wheelRadius,
+        bp.wheelWidth,
+        bp.height,
+      );
       this.fitted.set(kind, {
         geometry,
         material: asset.material,
         fit,
         tintable: bodyAsset.tintable,
         mount: detection.mount,
+        wells: interior.wells,
+        floor: interior.floor,
         wheelsRemoved: detection.removed,
         brakeLamps: findBrakeLamps(
           asset.material,

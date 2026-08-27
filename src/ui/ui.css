@@ -1064,3 +1064,218 @@ body.mb-map-open .mb-hud__vitals {
     font-size: 24px;
   }
 }
+
+/* --------------------------------------------------------------------- */
+/* Gun shop: the display case                                             */
+/* --------------------------------------------------------------------- */
+
+/*
+ * The counter used to be a price list. It is now a display case with a price
+ * list under it, which is a wider thing: the panel grows to hold a 300px stand
+ * beside a column of bars without either one being squeezed.
+ *
+ * Everything here is the same vocabulary as the rest of the interface - the
+ * same hairlines, the same uppercase 10px labels, the same single gold accent -
+ * because the shop and the pause menu are the same game.
+ */
+.mb-shop__panel {
+  width: min(768px, 100%);
+}
+
+.mb-shop__showcase {
+  display: flex;
+  align-items: stretch;
+  gap: 26px;
+  padding: 20px 0 6px;
+  border-top: 1px solid var(--mb-line);
+}
+
+/*
+ * The stand. A pool of warm light behind the weapon and a hairline shelf
+ * under it, both painted in CSS: the 3D scene inside the canvas is lit by its
+ * own baked environment and has no floor of its own to catch a shadow on.
+ */
+.mb-shop__stage {
+  position: relative;
+  flex: none;
+  width: 300px;
+  height: 214px;
+  border: 1px solid var(--mb-line);
+  border-radius: var(--mb-radius);
+  background:
+    radial-gradient(118% 88% at 50% 30%, rgba(200, 160, 106, 0.13), rgba(6, 9, 11, 0.94) 66%);
+  overflow: hidden;
+}
+
+/* No WebGL, no stand: an empty bordered box reads as a broken image. */
+.mb-shop__stage.is-empty {
+  display: none;
+}
+
+.mb-shop__stage::after {
+  content: '';
+  position: absolute;
+  left: 16%;
+  right: 16%;
+  bottom: 34px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(200, 160, 106, 0.38), transparent);
+}
+
+.mb-shop__preview {
+  position: relative;
+  z-index: 1;
+  display: block;
+}
+
+.mb-shop__figures {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.mb-shop__figurehead {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.mb-shop__showname {
+  margin: 0;
+  font-size: 19px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--mb-ink-bright);
+}
+
+.mb-shop__showprice {
+  margin: 0;
+  flex: none;
+  font-size: 19px;
+  letter-spacing: 0.05em;
+  font-variant-numeric: tabular-nums;
+  color: var(--mb-accent);
+}
+
+.mb-shop__showprice.is-owned {
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--mb-ink-dim);
+}
+
+.mb-shop__bars {
+  display: grid;
+  gap: 9px;
+  margin: 18px 0 0;
+}
+
+.mb-shop__bar {
+  display: grid;
+  grid-template-columns: 74px 1fr;
+  align-items: center;
+  gap: 12px;
+}
+
+.mb-shop__barlabel {
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--mb-ink-dim);
+}
+
+.mb-shop__barvalue {
+  display: grid;
+  grid-template-columns: 1fr 58px;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+}
+
+.mb-shop__track {
+  position: relative;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(198, 214, 224, 0.1);
+  overflow: hidden;
+}
+
+.mb-shop__fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 0;
+  border-radius: 2px;
+  background: linear-gradient(90deg, rgba(200, 160, 106, 0.45), var(--mb-accent));
+  transition: width 220ms ease;
+}
+
+/* A full bar means nothing in the shop beats it, so it is drawn as the one
+   bright thing in the column rather than as more of the same gold. */
+.mb-shop__bar.is-best .mb-shop__fill {
+  background: linear-gradient(90deg, rgba(231, 237, 241, 0.45), var(--mb-ink-bright));
+}
+
+.mb-shop__number {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: var(--mb-ink);
+}
+
+.mb-shop__shownote {
+  margin: 15px 0 0;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--mb-ink-dim);
+}
+
+/* The link between the list and the stand: whatever the keyboard is on. */
+.mb-shop__row {
+  position: relative;
+  cursor: pointer;
+}
+
+.mb-shop__row::before {
+  content: '';
+  position: absolute;
+  top: 10px;
+  bottom: 10px;
+  left: -15px;
+  width: 2px;
+  background: var(--mb-accent);
+  opacity: 0;
+  transition: opacity 160ms ease;
+}
+
+.mb-shop__row.is-selected::before {
+  opacity: 1;
+}
+
+.mb-shop__row.is-selected .mb-shop__name {
+  color: var(--mb-ink-bright);
+}
+
+@media (max-width: 720px) {
+  .mb-shop__showcase {
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .mb-shop__figures {
+    width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mb-shop__fill {
+    transition: none;
+  }
+}

@@ -21,7 +21,18 @@
  * `group` is a `THREE.Object3D` holding one `InstancedMesh`. Adding it costs
  * ONE colour draw call, plus one shadow draw call above 'low' quality, for the
  * entire population. It adds no lights: the measured profile for this game says
- * point lights are 61 per cent of the frame, so the crowd uses none.
+ * point lights are 61 per cent of the frame, so the crowd uses none. A person a
+ * car has knocked over is drawn by the SAME instance of the SAME mesh - the
+ * topple rides in the instance matrix - so a street full of casualties costs
+ * exactly what a street full of walkers does. See `writeMatrix`.
+ *
+ * Two hooks another layer is expected to attach, both documented at their
+ * definitions with the exact call to make:
+ *   `onImpact`               a vehicle knocked somebody down; jolt the car and
+ *                            charge the player for it.
+ *   `downAt`                 put somebody on the ground, for a shot civilian.
+ *   `carriagewayObstacles`   people on a crossing, so traffic brakes for them.
+ *   `crossingBlocked`
  *
  * `ctx.time` must be the same seconds-since-start the traffic signals use, or
  * pedestrians and vehicles will disagree about who has right of way.
@@ -65,7 +76,13 @@ import type { CityGround } from '../world/CityGround';
 import type { CityPlan } from '../world/CityPlan';
 import type { ColliderBox } from '../world/build/types';
 import { hash2 } from '../core/rng';
-import { Crowd, RENDER_RADIUS, type CrowdContext, type CrowdVehicle } from './crowd';
+import {
+  Crowd,
+  RENDER_RADIUS,
+  type CrowdContext,
+  type CrowdVehicle,
+  type PedestrianImpact,
+} from './crowd';
 import { ObstacleIndex } from './obstacles';
 import { buildPavementGraph, type PavementGraph } from './pavement';
 import { hipAmplitude } from './gait';
@@ -90,7 +107,7 @@ export interface PedestrianSystemOptions {
   readonly density?: number | undefined;
 }
 
-export type { CrowdVehicle, CrowdContext };
+export type { CrowdVehicle, CrowdContext, PedestrianImpact };
 
 /**
  * People simulated at once, per quality level.
@@ -108,6 +125,15 @@ const POPULATION: Readonly<Record<PedestrianQuality, number>> = {
 
 /** Triangles in one procedural person, reported when no character loaded. */
 const PROC_TRIANGLES = 560;
+
+/**
+ * Half a torso's thickness, in rig units. Raises a body lying flat so it rests
+ * ON the pavement rather than half inside it. See `writeMatrix`.
+ */
+const DOWN_LIFT = 0.12;
+
+/** How far from the reported point `downAt` will look for a body, in metres. */
+const DOWN_SEARCH = 1;
 
 /** Beyond this a pedestrian is not drawn at all. Fog hides the difference. */
 const DRAW_RADIUS: Readonly<Record<PedestrianQuality, number>> = {
@@ -128,6 +154,10 @@ export interface PedestrianStats {
   readonly waiting: number;
   readonly crossing: number;
   readonly detours: number;
+  /** People currently on the ground, knocked down or shot. */
+  readonly down: number;
+  /** Times a vehicle has knocked somebody down. Cumulative. */
+  readonly struck: number;
   readonly obstacles: number;
   readonly links: number;
   /** Mean milliseconds spent in `update` over the last 60 calls. */
@@ -286,6 +316,86 @@ export class PedestrianSystem {
     return this.characters.length > 0;
   }
 
+  /**
+   * Reports every genuine vehicle-versus-pedestrian collision.
+   *
+   * WIRING, for whoever owns the driving layer and the wanted level. Set this
+   * once after construction:
+   *
+   *     pedestrians.onImpact = (hit) => {
+   *       // `hit.vehicle` is the very object handed to `update` in
+   *       // `ctx.vehicles`, so identity is enough to tell your own car from
+   *       // ambient traffic - no coordinate matching.
+   *       if (hit.vehicle === myCrowdCarForThePlayer) {
+   *         driving.reportImpact(hit.speed, hit.dirX, hit.dirZ);  // jolt + scrub
+   *         player.addHeat(HEAT.vehicleImpact);                   // = 8
+   *       }
+   *     };
+   *
+   * It is a REAL collision - the chassis box grown by a shoulder and six
+   * centimetres, moving above 1.6 m/s - so it cannot fire for driving past a
+   * queue, which is the only reason it is safe to attach heat to it. One call
+   * per person per knock-down; somebody already on the ground is never struck
+   * twice.
+   */
+  set onImpact(listener: ((impact: PedestrianImpact) => void) | null) {
+    this.crowd.onImpact = listener;
+  }
+
+  get onImpact(): ((impact: PedestrianImpact) => void) | null {
+    return this.crowd.onImpact;
+  }
+
+  /**
+   * Puts the person nearest a world point on the ground, permanently.
+   *
+   * This is the hook `CrowdTargets` documents as missing - "three lines in
+   * `PedestrianSystem` exposing kill the agent nearest this point". Wire it as:
+   *
+   *     new CrowdTargets(pedestrians.group, {
+   *       removeAt: (x, y, z) => { pedestrians.downAt(x, y, z); },
+   *     });
+   *
+   * A shot civilian goes down through exactly the same state a struck one does,
+   * so there is one kind of body in this city and the crowd only has to know
+   * about one. Returns false when nobody was close enough - the pool slot may
+   * have been recycled between the shot and the call.
+   */
+  downAt(x: number, _y: number, z: number, radius = DOWN_SEARCH): boolean {
+    return this.crowd.downNearest(x, z, radius, true);
+  }
+
+  /**
+   * Everybody standing on a carriageway, so traffic can brake for them.
+   *
+   * WIRING, for whoever owns `main.ts`. Two lines, once, after both systems
+   * exist:
+   *
+   *     traffic.setObstacles(pedestrians.carriagewayObstacles());
+   *     traffic.setCrossingBlocked((id) => pedestrians.crossingBlocked(id));
+   *
+   * `setObstacles` keeps the array by reference and this one is rebuilt in
+   * place, so it never needs calling again.
+   *
+   * WHY IT MATTERS. Nothing in the shipped game makes a driver aware of a
+   * pedestrian, and the crowd cannot make up the difference from its own side:
+   * measured over ten minutes with 240 vehicles and 270 people, letting every
+   * car hit somebody produced 210 knock-downs, of which 20 per cent were
+   * traffic turning off the cross street on a green that runs at the same time
+   * as the walk signal and 37 per cent were cars clearing the junction across
+   * the far crossing during the 1.5 s all-red. A pedestrian cannot see either
+   * coming. Until these are wired, `Crowd.trafficStrikes` stays off and only
+   * the player's own vehicle knocks anybody over.
+   */
+  carriagewayObstacles(): readonly { x: number; z: number; radius: number }[] {
+    return this.crowd.carriagewayObstacles();
+  }
+
+  /** True when somebody is standing on the crossing with this `Crossing.id`. */
+  crossingBlocked(id: string): boolean {
+    return this.crowd.crossingBlocked(id);
+  }
+
   setQuality(quality: PedestrianQuality): void {
     if (this.quality === quality) return;
     this.quality = quality;
@@ -309,6 +419,8 @@ export class PedestrianSystem {
       waiting: s.waiting,
       crossing: s.crossing,
       detours: s.detours,
+      down: s.down,
+      struck: s.struck,
       obstacles: this.obstacleCount,
       links: this.graph.links.length,
       updateMs: this.lastUpdateMs,
@@ -342,8 +454,9 @@ export class PedestrianSystem {
       this.lastX[i] = ped.x;
       this.lastZ[i] = ped.z;
       if (!ped.active) continue;
-      // A respawn teleports the agent across the city; that is not a step.
-      if (dx * dx + dz * dz > 2.25) continue;
+      // A respawn teleports the agent across the city; that is not a step, and
+      // neither is being thrown along the road on your back.
+      if (dx * dx + dz * dz > 2.25 || ped.state === 'down') continue;
       const forward = -dx * Math.sin(ped.heading) - dz * Math.cos(ped.heading);
       if (forward <= 0) continue;
       this.walked[i] = (this.walked[i] ?? 0) + forward / Math.max(0.4, ped.look.girth);
@@ -361,19 +474,48 @@ export class PedestrianSystem {
     }
   }
 
-  /** Writes the instance matrix for one person into `matrices` at slot `n`. */
+  /**
+   * Writes the instance matrix for one person into `matrices` at slot `n`.
+   *
+   * The 3x3 is `Ry(heading) * Rx(tilt) * scale(girth, height, girth)`, stored
+   * column-major as Three.js expects. `tilt` is zero for everybody on their
+   * feet, which collapses to the yaw-and-scale form this used to write; for
+   * somebody a car has knocked down it is the topple, and THAT IS THE WHOLE
+   * KNOCK-DOWN RENDERER. A body on the ground is the same instance of the same
+   * `InstancedMesh`, drawn by the same program from the same vertex animation
+   * texture, so the crowd is still 270 people in six draw calls whether they
+   * are walking or lying in the road.
+   *
+   * The four off-diagonal slots a tilt uses are written unconditionally rather
+   * than left at the zero they were initialised to, because a pool slot that
+   * held a body last frame and a walker this frame would otherwise keep the
+   * body's shear.
+   */
   private writeMatrix(matrices: Float32Array, n: number, ped: Crowd['peds'][number]): void {
     const m = n * 16;
     const c = Math.cos(ped.heading);
     const s = Math.sin(ped.heading);
     const width = ped.look.girth;
+    const height = ped.look.height;
+    const tilt = Crowd.tilt(ped);
+    const ct = Math.cos(tilt);
+    const st = Math.sin(tilt);
     matrices[m] = c * width;
+    matrices[m + 1] = 0;
     matrices[m + 2] = -s * width;
-    matrices[m + 5] = ped.look.height;
-    matrices[m + 8] = s * width;
-    matrices[m + 10] = c * width;
+    matrices[m + 4] = s * height * st;
+    matrices[m + 5] = height * ct;
+    matrices[m + 6] = c * height * st;
+    matrices[m + 8] = s * width * ct;
+    matrices[m + 9] = -width * st;
+    matrices[m + 10] = c * width * ct;
     matrices[m + 12] = ped.x;
-    matrices[m + 13] = ped.y;
+    // A body that has gone over is pivoting about its feet, so its front-back
+    // axis is now the vertical one and half its thickness would be under the
+    // pavement. Lifting by that half - the rig is authored one unit tall, so a
+    // torso is about 0.12 of it - is the whole correction, and it is zero for
+    // anybody upright.
+    matrices[m + 13] = ped.y + DOWN_LIFT * width * Math.abs(st);
     matrices[m + 14] = ped.z;
   }
 
@@ -423,7 +565,12 @@ export class PedestrianSystem {
       // per-person rate and offset; two neighbours breathing in unison is the
       // giveaway this avoids.
       const idle = character.idle;
-      if (idle && idle.duration > 1e-3) {
+      if (ped.state === 'down') {
+        // A body does not shift its weight. The clip is frozen at this
+        // person's own offset, which keeps a row of casualties from all
+        // holding an identical pose.
+        anim[a + 1] = hash2(look.height, look.girth, 23);
+      } else if (idle && idle.duration > 1e-3) {
         const rate = (0.85 + 0.3 * hash2(look.preferredSpeed, look.cadence, 11)) / idle.duration;
         anim[a + 1] = (hash2(look.height, look.girth, 23) + ctx.time * rate) % 1;
       } else {

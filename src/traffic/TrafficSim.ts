@@ -75,6 +75,42 @@ const IDM_EXPONENT = 4;
 /** Hard floor on acceleration, so a surprise never produces an impossible stop. */
 const BRAKE_LIMIT_SCALE = 1.0;
 
+/**
+ * Route choice. See `chooseNext` for the measurements these came from.
+ *
+ * `GOAL_BIAS` is how hard a driver steers their route towards where they are
+ * actually going, applied as `1 + GOAL_BIAS * cos(angle to the destination)`:
+ * a continuation pointing at the destination is favoured, one pointing
+ * straight back is nearly suppressed, and everything between is graded rather
+ * than switched. Much above 1 the fleet stops reading as traffic and starts
+ * reading as pathfinding.
+ *
+ * `ROAD_CLASS_REFERENCE` is the posted speed at which a continuation is
+ * neither favoured nor penalised - the secondary streets that make up most of
+ * Meridian Bay - so an arterial pulls traffic onto itself and a promenade
+ * pushes it away, which is how a real city distributes its traffic.
+ *
+ * `QUEUE_AVERSION` is how strongly a driver avoids a continuation that is
+ * already full: at 4, a lane standing bumper to bumper is a fifth as
+ * attractive as an empty one.
+ */
+const GOAL_BIAS = 0.85;
+/** A destination is reached, and a new one chosen, inside this radius. */
+const ARRIVAL_RADIUS = 45;
+const ROAD_CLASS_REFERENCE = 12;
+const QUEUE_AVERSION = 4;
+/** Metres of lane one stationary vehicle occupies, for the queue estimate. */
+const JAM_SPACING = 8;
+/** How far before the stop line the turn decision is taken again. */
+const RECONSIDER_RANGE = 14;
+/**
+ * Seconds of the leader's own motion credited when asking whether there is
+ * room on the far side of a junction. See `exitHasRoom`: roughly how long a
+ * vehicle spends committed to crossing the box.
+ */
+const EXIT_LOOKAHEAD = 1.5;
+
+
 /** Lateral acceleration a driver is willing to take through a junction turn. */
 const TURN_COMFORT = 2.9;
 /** How far ahead the junction's admission rules start being evaluated. */
@@ -223,6 +259,15 @@ export interface Vehicle {
   /** Seconds the brake lamps stay lit after the brake is released. */
   brakeHold: number;
   claim: string | null;
+  /**
+   * True once the turn has been re-decided on this lane. See `stepVehicle`:
+   * the first choice is made a whole block early, and a driver who cannot
+   * change their mind on the approach cannot avoid a queue they can see.
+   */
+  reconsidered: boolean;
+  /** Where this driver is going. See `chooseNext`. */
+  destX: number;
+  destZ: number;
   stuck: number;
   groundTimer: number;
 
@@ -709,6 +754,9 @@ export class TrafficSim {
       braking: false,
       brakeHold: 0,
       claim: null,
+      reconsidered: false,
+      destX: 0,
+      destZ: 0,
       stuck: 0,
       groundTimer: 0,
       paint: linearTriple(this.rng.pick(blueprint.paints)),
@@ -758,6 +806,8 @@ export class TrafficSim {
       vehicle.along = along;
       vehicle.claim = null;
       vehicle.stuck = 0;
+      // A vehicle that reappears somewhere else is a different journey.
+      this.pickDestination(vehicle);
       vehicle.x = point.x;
       vehicle.z = point.z;
       vehicle.y = this.heightAt(point.x, point.z);
@@ -800,8 +850,39 @@ export class TrafficSim {
     return info.speedLimit * vehicle.blueprint.speedFactor * variation;
   }
 
+  /**
+   * Gives a driver somewhere to be going.
+   *
+   * Sampled from the lane graph weighted by length, so destinations are spread
+   * over the city in proportion to how much street there is. That is what
+   * makes the resulting traffic distribution match the network instead of
+   * matching whichever corner the turn preference happens to favour.
+   */
+  private pickDestination(vehicle: Vehicle): void {
+    if (this.spawnLanes.length === 0) {
+      vehicle.destX = vehicle.x;
+      vehicle.destZ = vehicle.z;
+      return;
+    }
+    const info = this.rng.weighted(this.spawnLanes, this.spawnWeights);
+    const point = lanePoint(info.lane, this.rng.range(0, info.lane.length));
+    vehicle.destX = point.x;
+    vehicle.destZ = point.z;
+  }
+
+  /**
+   * How full a lane is, as a fraction of what it would hold at a standstill.
+   *
+   * Read straight off the occupancy index this frame has already built, so a
+   * route decision costs a divide rather than a search.
+   */
+  private laneLoad(info: LaneInfo): number {
+    return info.occupants.length / Math.max(1, info.lane.length / JAM_SPACING);
+  }
+
   private chooseNext(vehicle: Vehicle, info: LaneInfo): void {
     if (info.liveExits.length === 0) {
+      vehicle.reconsidered = false;
       vehicle.next = null;
       vehicle.nextArc = null;
       vehicle.turn = 0;
@@ -809,13 +890,66 @@ export class TrafficSim {
     }
     // Straight is preferred, then right, then left: a city where every driver
     // turns as often as they go straight reads as random rather than as traffic.
+    //
+    // THAT ALONE IS NOT ENOUGH, and the reason is measurable. A turn choice
+    // that only looks at the shape of the junction is a random walk on the
+    // street grid, and a walk that prefers to go straight REFLECTS off the
+    // edge of the map: every car reaching the outer ring must join it, and the
+    // one option that would take it back into the city is the one the straight
+    // preference makes least likely. Measured on an uncongested fleet of forty
+    // - too few cars for a queue to distort anything - the shape preference
+    // alone put 2.6 times its fair share of turns onto the northern ring road
+    // and a third of its fair share onto Dock Street. At the shipping fleet
+    // size that became 4.4 cars per 100 m of ring against a city average of
+    // 1.6, while the two arterials Meridian Bay was drawn around carried 0.5
+    // and 0.9: its widest roads were its emptiest and its seafront was a car
+    // park. The imbalance was in the route choice, not in the traffic.
+    //
+    // So a driver here weighs three more things, all of them things a real
+    // driver weighs:
+    //
+    //  - WHERE THEY ARE GOING. This is what breaks the reflection. A driver
+    //    with a destination is drawn across the city towards it rather than
+    //    rattling around the edge of the map, and because destinations are
+    //    drawn from the lane graph by length, the fleet ends up spread the way
+    //    the street network is.
+    //  - ROAD CLASS. An arterial attracts more traffic than a service street,
+    //    in proportion to the speed it is posted at.
+    //  - WHAT IS ALREADY THERE. A queue on the continuation is visible from
+    //    the junction behind it, and a driver who can turn instead does. This
+    //    is the term that makes the distribution self-levelling: any street
+    //    that fills up stops attracting traffic until it drains.
+    let goalX = vehicle.destX - vehicle.x;
+    let goalZ = vehicle.destZ - vehicle.z;
+    if (goalX * goalX + goalZ * goalZ < ARRIVAL_RADIUS * ARRIVAL_RADIUS) {
+      this.pickDestination(vehicle);
+      goalX = vehicle.destX - vehicle.x;
+      goalZ = vehicle.destZ - vehicle.z;
+    }
+    const range = Math.hypot(goalX, goalZ);
+    const goalUnitX = range > 1e-3 ? goalX / range : 0;
+    const goalUnitZ = range > 1e-3 ? goalZ / range : 0;
+
     const weights: number[] = [];
     for (const candidate of info.liveExits) {
       const sweep = normaliseAngle(laneHeading(candidate) - info.heading);
-      weights.push(sweep > 0.5 ? 1.1 : sweep < -0.5 ? 1.7 : 3.2);
+      let weight = sweep > 0.5 ? 1.1 : sweep < -0.5 ? 1.7 : 3.2;
+      // Forward is (-sin yaw, 0, -cos yaw); this is its dot with the bearing
+      // to the destination, so +1 heads straight there and -1 straight away.
+      const heading = laneHeading(candidate);
+      weight *= 1 + GOAL_BIAS * (-Math.sin(heading) * goalUnitX - Math.cos(heading) * goalUnitZ);
+      const next = this.laneInfo.get(candidate.id);
+      if (next) {
+        weight *= next.speedLimit / ROAD_CLASS_REFERENCE;
+        weight /= 1 + QUEUE_AVERSION * this.laneLoad(next);
+      }
+      // Never zero: a merely unattractive continuation must stay reachable, or
+      // a car with nowhere else to go has no legal move at all.
+      weights.push(Math.max(weight, 0.02));
     }
     const chosen = this.rng.weighted(info.liveExits, weights);
     const sweep = normaliseAngle(laneHeading(chosen) - info.heading);
+    vehicle.reconsidered = false;
     vehicle.next = chosen;
     vehicle.nextArc =
       info.arcs.get(chosen.id) ??
@@ -1014,6 +1148,31 @@ export class TrafficSim {
     // was set on entry keeps a vehicle placed by any other path - a test, a
     // handover, a future spawner - from running off the end of its lane.
     if (!vehicle.next && info.liveExits.length > 0) this.chooseNext(vehicle, info);
+
+    // Re-decide the turn once, on the approach.
+    //
+    // The first choice is taken the instant the vehicle enters the lane, which
+    // is a whole block and ten to twenty seconds before it reaches the
+    // junction - far too early for the queue it is trying to avoid to still be
+    // the queue that is there. Taking the decision again where a driver
+    // actually takes it is what turns route choice from a statistical
+    // preference into something that responds to the street ahead.
+    //
+    // Once only, and never after the wheel has started going over: a car that
+    // changes its mind mid-turn swings back across the junction, which is far
+    // worse than the queue it was avoiding.
+    if (
+      !vehicle.reconsidered &&
+      info.exit !== null &&
+      vehicle.claim === null &&
+      vehicle.along > info.exit.stopAlong - RECONSIDER_RANGE
+    ) {
+      const committed = vehicle.nextArc;
+      if (!committed || vehicle.along < committed.startAlong - 0.5) {
+        this.chooseNext(vehicle, info);
+      }
+      vehicle.reconsidered = true;
+    }
 
     const halfLength = vehicle.blueprint.length * 0.5;
     const chassis = vehicle.blueprint.chassis;
@@ -1289,21 +1448,37 @@ export class TrafficSim {
   /**
    * Never enter a junction without somewhere to be on the far side of it.
    *
-   * The rule only bites when the far side is actually standing still. Applying
-   * it to a car that is simply still accelerating away throttles the junction
-   * to roughly one vehicle per two and a half seconds, which is below the
-   * demand this city generates and turns every green into a queue that never
-   * clears - measured, before this check was narrowed.
+   * This is the rule that stops a city gridlocking, and how it decides matters
+   * more than whether it exists. Two versions were wrong before this one. The
+   * strict version - is there room RIGHT NOW - throttled every junction to
+   * about one vehicle every two and a half seconds, below the demand this city
+   * generates, so a green never cleared its own queue. The version that
+   * replaced it waived the check entirely for a leader moving faster than
+   * 2.5 m/s, which is a cliff: a car pulling away at 2.6 m/s let a whole
+   * queue in behind it and then stopped, and every vehicle that had committed
+   * on the strength of that was left standing in the box. Anything on the
+   * crossing axis then had nowhere to go either, and because a junction with
+   * a stopped car in it refuses all four approaches, the block spread outwards
+   * and never recovered. Measured over fifteen minutes with the camera held
+   * still, the fleet fell from 3.1 m/s and a third standing to 1.1 m/s and
+   * three quarters standing - a city that visibly slid into gridlock the
+   * longer it was watched.
+   *
+   * The rule here asks the question a driver actually asks: will there be room
+   * by the time I get across? The leader's own speed carries it forward while
+   * the turn is happening, so a leader genuinely pulling away opens the gap
+   * and one that is merely rolling does not. It is the same test at every
+   * speed rather than two different tests either side of a threshold, and it
+   * held the same fifteen-minute run at 2.2 m/s and half standing.
    */
   private exitHasRoom(vehicle: Vehicle): boolean {
     if (!vehicle.next) return true;
     const nextInfo = this.laneInfo.get(vehicle.next.id);
     if (!nextInfo || nextInfo.occupants.length === 0) return true;
     const first = nextInfo.occupants[0] as Vehicle;
-    if (first.speed > 2.5) return true;
     const entry = vehicle.nextArc?.endAlong ?? 0;
     const needed = vehicle.blueprint.length + first.blueprint.length * 0.5 + 1.6;
-    return first.along - entry > needed;
+    return first.along - entry + first.speed * EXIT_LOOKAHEAD > needed;
   }
 
   /**
@@ -1353,6 +1528,23 @@ export class TrafficSim {
     // The gap a driver will accept shrinks the longer they have been sitting
     // there: without that, one waiting left-turner blocks the single lane
     // behind it for a whole cycle and the queue never recovers.
+    //
+    // THE GAP IS MEASURED IN TIME, and that is not a detail. The first version
+    // of this measured it in distance - `toJunction < other.speed * patience +
+    // 6` - which has a floor of six metres that no amount of patience removes.
+    // An oncoming car STANDING at its own stop line is inside six metres and
+    // is going nowhere, so the left-turner yielded to it forever; two opposing
+    // queues, each headed by a left-turner, each yielded to the other's
+    // stationary head car and neither ever moved again. Measured over fifteen
+    // minutes on a fixed camera, that took the fleet from 3.1 m/s and a third
+    // standing to 1.1 m/s and three quarters standing - a city that visibly
+    // slid into gridlock the longer it was watched, which is exactly what it
+    // looked like.
+    //
+    // Time to arrive fixes it by construction: a car that is not moving does
+    // not arrive. The speed floor keeps a car that is about to pull away from
+    // reading as harmless, and a head car that has been standing for longer
+    // than the turn itself takes is a queue rather than a hazard.
     if (vehicle.turn === 1 && info.oncoming) {
       const oncomingInfo = this.laneInfo.get(info.oncoming.id);
       if (oncomingInfo) {

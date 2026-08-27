@@ -110,6 +110,12 @@ export function buildPavementGraph(plan: CityPlan, network: RoadNetwork): Paveme
   const byKey = new Map<string, number>();
 
   const streetById = new Map<string, Street>(plan.streets.map((s) => [s.id, s]));
+  /**
+   * Where each crossing's kerb station ended up on each side of its street,
+   * keyed `${crossingId}:${side}`. The crossing link is built to these rather
+   * than to the crossing's own coordinate; see the merge below.
+   */
+  const anchors = new Map<string, number>();
 
   const addNode = (x: number, z: number): number => {
     const key = nodeKey(x, z);
@@ -226,16 +232,37 @@ export function buildPavementGraph(plan: CityPlan, network: RoadNetwork): Paveme
       // Merge stations that land within a few centimetres of each other, but
       // never lose a crossing: an arterial's corner and its crossing coincide
       // whenever the pavement happens to be 3.2 m wide.
+      //
+      // THE CORNER'S POSITION IS THE ONE THAT SURVIVES, whichever of the two
+      // was seen first. A corner station is not just a point on this street: it
+      // is where the CROSS street's own chain has a node, and the two only join
+      // because they are computed to the same coordinate. A crossing station is
+      // 1.6 m past the junction box and lands 0.2 m from the corner on this
+      // city's 2.8 m pavements, so `sort` decides which of them the merge keeps
+      // - and, before this, whichever it dropped was silently disconnected.
+      // Measured on the unfixed graph: of the four arms of every junction, the
+      // two whose crossing sorted first lost the corner turn (harbour-walk's
+      // node at z = -24.60 had no cooper-street link leaving it at all) and the
+      // two whose corner sorted first lost the crossing, which was then built
+      // 0.2 m off the chain and left as an island reachable from nowhere - 100
+      // of 964 links, 50 whole crossings, with a walkable world of two.
       const merged: Station[] = [];
       for (const station of stations) {
         const last = merged[merged.length - 1];
         if (last && Math.abs(last.at - station.at) < 0.25) {
-          if (!last.crossing && station.crossing) {
-            merged[merged.length - 1] = { at: last.at, crossing: station.crossing };
-          }
+          merged[merged.length - 1] = {
+            at: station.crossing ? last.at : station.at,
+            crossing: last.crossing ?? station.crossing,
+          };
           continue;
         }
         merged.push(station);
+      }
+
+      // Where each crossing's kerb ACTUALLY ended up on this side, so the
+      // crossing link can be built to the chain rather than to the ideal.
+      for (const station of merged) {
+        if (station.crossing) anchors.set(`${station.crossing.id}:${side}`, station.at);
       }
 
       const point = (at: number): { x: number; z: number } =>
@@ -255,15 +282,21 @@ export function buildPavementGraph(plan: CityPlan, network: RoadNetwork): Paveme
       }
     }
 
-    // Crossing links: kerb to kerb, at the crossing's own position along the
-    // street, joining the two pavement chains this street already has.
+    // Crossing links: kerb to kerb, joining the two pavement chains this street
+    // already has AT THE POINT EACH CHAIN ACTUALLY REACHED. Using the
+    // crossing's own coordinate instead is what orphaned half of them: the
+    // station that represents it may have been merged onto a corner up to
+    // 0.25 m away, and a kerb-to-kerb link built 0.25 m off the chain shares no
+    // node with it. A crossing whose station survived on only one side is not
+    // built at all - there is no pavement on the far kerb to arrive at.
     for (const crossing of ownCrossings) {
-      const at = street.axis === 'x' ? crossing.z : crossing.x;
-      if (at < street.from - 0.01 || at > street.to + 0.01) continue;
+      const nearAt = anchors.get(`${crossing.id}:1`);
+      const farAt = anchors.get(`${crossing.id}:-1`);
+      if (nearAt === undefined || farAt === undefined) continue;
       const near = pavementOffset(street, 1);
       const far = pavementOffset(street, -1);
-      const pa = street.axis === 'x' ? { x: near, z: at } : { x: at, z: near };
-      const pb = street.axis === 'x' ? { x: far, z: at } : { x: at, z: far };
+      const pa = street.axis === 'x' ? { x: near, z: nearAt } : { x: nearAt, z: near };
+      const pb = street.axis === 'x' ? { x: far, z: farAt } : { x: farAt, z: far };
       const half = Math.max(MIN_HALF_WIDTH, crossing.halfWidth - PAVEMENT_MARGIN);
       addLink(`x:${crossing.id}`, pa.x, pa.z, pb.x, pb.z, half, street.id, crossing);
       addLink(`x:${crossing.id}:r`, pb.x, pb.z, pa.x, pa.z, half, street.id, crossing);

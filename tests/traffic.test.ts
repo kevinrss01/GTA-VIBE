@@ -825,3 +825,105 @@ describe('traffic keeps moving', () => {
     }
   }, 60000);
 });
+
+/**
+ * The two faults that made Meridian Bay gridlock the longer it ran.
+ *
+ * Both are structural rather than cosmetic, and both are invisible in a short
+ * run - the city looks fine for the first three minutes either way - so they
+ * are asserted over twelve minutes with the camera moving the way a player
+ * moves. See `TrafficSim.chooseNext` and `TrafficSim.exitHasRoom` for what
+ * each of them was and what it measured before and after.
+ */
+describe('traffic distributes itself and stays distributed', () => {
+  const SEEDS = ['meridian-traffic-01', 'probe-b', 'probe-c'];
+
+  /** Metres of lane belonging to each street, for a density per street. */
+  const laneMetres = new Map<string, number>();
+  for (const lane of network.lanes) {
+    laneMetres.set(lane.streetId, (laneMetres.get(lane.streetId) ?? 0) + lane.length);
+  }
+  const totalLaneMetres = [...laneMetres.values()].reduce((a, b) => a + b, 0);
+
+  it('sends traffic down the arterials instead of round the edge of the map', () => {
+    const arterials = plan.streets.filter((s) => s.kind === 'arterial').map((s) => s.id);
+    expect(arterials.length).toBeGreaterThan(0);
+    const arterialMetres = arterials.reduce((a, id) => a + (laneMetres.get(id) ?? 0), 0);
+
+    for (const seed of SEEDS) {
+      const sim = new TrafficSim({
+        network,
+        plan,
+        heightAt: (x, z) => ground.heightAt(x, z),
+        population: 123,
+        seed,
+      });
+      const step = 1 / 30;
+      let samples = 0;
+      let onArterials = 0;
+      let everywhere = 0;
+      for (let i = 0; i < (6 * 60) / step; i += 1) {
+        const time = i * step;
+        sim.update(step, Math.sin(time * 0.05) * 150, Math.cos(time * 0.037) * 130, time);
+        // Let the fleet leave its seeded positions before counting.
+        if (time < 60 || i % 30 !== 0) continue;
+        samples += 1;
+        for (const vehicle of sim.vehicles) {
+          if (!vehicle.active) continue;
+          const info = sim.laneMeta(vehicle.laneId);
+          if (!info) continue;
+          everywhere += 1;
+          if (arterials.includes(info.lane.streetId)) onArterials += 1;
+        }
+      }
+      expect(samples).toBeGreaterThan(50);
+      // Cars per metre of arterial, against cars per metre of any lane. The
+      // committed route choice put 0.38 to 0.47 here: the widest streets in
+      // the city were also its emptiest. A grid whose traffic ignores its own
+      // arterials is one that has piled up somewhere else instead.
+      const share =
+        onArterials / arterialMetres / (everywhere / totalLaneMetres);
+      expect(share, `${seed}: arterial share ${share.toFixed(2)}`).toBeGreaterThan(0.6);
+    }
+  }, 120000);
+
+  it('keeps moving after ten minutes rather than sliding into gridlock', () => {
+    for (const seed of SEEDS) {
+      const sim = new TrafficSim({
+        network,
+        plan,
+        heightAt: (x, z) => ground.heightAt(x, z),
+        population: 123,
+        seed,
+      });
+      const step = 1 / 30;
+      const early: number[] = [];
+      const late: number[] = [];
+      for (let i = 0; i < (12 * 60) / step; i += 1) {
+        const time = i * step;
+        sim.update(step, Math.sin(time * 0.05) * 150, Math.cos(time * 0.037) * 130, time);
+        if (i % 30 !== 0) continue;
+        let sum = 0;
+        let count = 0;
+        for (const vehicle of sim.vehicles) {
+          if (!vehicle.active) continue;
+          sum += vehicle.speed;
+          count += 1;
+        }
+        if (count === 0) continue;
+        if (time < 180) early.push(sum / count);
+        else if (time > 9 * 60) late.push(sum / count);
+      }
+      const mean = (values: number[]): number =>
+        values.reduce((a, b) => a + b, 0) / values.length;
+      expect(early.length).toBeGreaterThan(50);
+      expect(late.length).toBeGreaterThan(50);
+      // Measured before the fixes: 1.5 to 2.1 m/s in the last three minutes
+      // against 2.7 to 2.9 in the first three, a city visibly running down.
+      // After: 2.6 to 2.8 against 3.0 to 3.2.
+      expect(mean(late), `${seed}: late mean ${mean(late).toFixed(2)}`).toBeGreaterThan(2.2);
+      const held = mean(late) / mean(early);
+      expect(held, `${seed}: held ${held.toFixed(2)} of its opening speed`).toBeGreaterThan(0.78);
+    }
+  }, 180000);
+});

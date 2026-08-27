@@ -35,9 +35,25 @@
  *   - a route street furniture has closed is not offered at all, and a walker
  *     pressed against a prop looks for the gap rather than sliding into the
  *     kerb. See `ObstacleIndex.blocksCorridor` and `clearLateralAhead`.
+ *   - EVERY REASON TO STAND STILL IS BOUNDED. A pause is at most 6.5 s and a
+ *     wait at most one signal cycle, after which the crossing is abandoned and
+ *     not offered again for a while. `watchStall` cannot help here: it does
+ *     not police a `wait`, on the correct grounds that waiting is a decision
+ *     rather than a failure, which made `wait` the one state that could last
+ *     for ever. Measured with live traffic before this, 202 of 270 people
+ *     spent more than a minute at a kerb and one stood still for ten minutes.
+ *   - A VEHICLE IS THE ONLY THING THAT MAY STOP SOMEBODY DEAD, and only when
+ *     it is bearing down on them. Everything else - a neighbour, a prop, a
+ *     parked car - is a brake with a shuffling floor under it. See `step`.
  *
- * `watchStall` sits under both as a bounded ladder of last resorts, and its
- * final rung is a step along the link, which always works.
+ * `watchStall` sits under the first two as a bounded ladder of last resorts,
+ * and its final rung is a step along the link, which always works.
+ *
+ * A test that runs the crowd WITHOUT `ctx.vehicles` exercises none of this.
+ * The shipped game passes 240 of them and the crossing gate is a function of
+ * that list; the whole of it was unexercised until `tests/crowdCorners.test.ts`
+ * put a live `TrafficSim` next to a live crowd. See
+ * `docs/crowd-corners-and-knockdowns.md`.
  *
  * SIMULATION LOD. Full steering runs inside `LOD_NEAR`. Between there and
  * `LOD_MID` the predicted-contact dodge and the obstacle push are dropped and
@@ -46,12 +62,14 @@
  * nothing is drawn, and past `RECYCLE_RADIUS` the agent is returned to the pool
  * and respawned where the player is heading. The walk cycle phase advances
  * every frame at every level, which costs one add and keeps distant figures
- * from stuttering.
+ * from stuttering. A body on the ground is stepped every frame at every level,
+ * because a topple at a quarter rate reads as a stutter at the one moment the
+ * eye is certainly on them, and it costs three adds.
  */
 
 import { clamp, damp, TAU } from '../core/mathx';
 import { createRng, type Rng } from '../core/rng';
-import { walkSignal, type RoadNetwork } from '../city/RoadNetwork';
+import { SIGNAL_CYCLE, walkSignal, type RoadNetwork } from '../city/RoadNetwork';
 import type { CityGround } from '../world/CityGround';
 import { makeLook, type PedestrianLook } from './appearance';
 import { gaitCadence } from './gait';
@@ -111,7 +129,138 @@ const LATERAL_PROBE_STEP = 0.12;
 /** How long a walker keeps aiming past a prop before it turns a corner. */
 const DODGE_TIME = 1.4;
 
-export type PedState = 'walk' | 'wait' | 'cross' | 'pause';
+/**
+ * Shortest obstacle correction that counts as something to walk around.
+ *
+ * A centimetre: below that the walker is grazing the box rather than pressing
+ * into it, and reacting to a graze is what pinned people at corners. See the
+ * obstacle branch of `step`.
+ */
+const CONTACT_PUSH = 0.01;
+
+/**
+ * Longest a crossing decision looks ahead, in seconds.
+ *
+ * Beyond this a prediction from a constant velocity is worthless: every driver
+ * in this city brakes for a red inside six seconds.
+ */
+const CROSSING_HORIZON = 6;
+
+/**
+ * Clearance a pedestrian wants from a MOVING vehicle's box, in metres, on top
+ * of their own radius. Deliberately not applied to a stopped one: the stop line
+ * leaves 0.4 m and a margin wider than that vetoes every legally parked queue.
+ */
+const CROSSING_MARGIN = 0.5;
+
+/**
+ * How much faster than their usual pace somebody crosses a carriageway. Must
+ * match `desiredSpeed`, because `crossingClear` uses it to decide whether they
+ * can finish before the lights change.
+ */
+const CROSSING_HURRY = 1.16;
+
+/**
+ * Speed multiplier for somebody who has a car bearing down on them while they
+ * are on a carriageway. Capped by `preferredSpeed * 1.75` like every other
+ * steering output, so this is a run rather than a teleport.
+ */
+const CROSSING_SPRINT = 1.7;
+
+/**
+ * Speed below which a vehicle is treated as parked rather than as traffic.
+ *
+ * A car stopped at a stop line is the SAFEST thing on the road - the walk
+ * signal exists because it is stopped - and treating it as a hazard is what
+ * made every kerb in the city a permanent queue. See `crossingClear`.
+ */
+const VEHICLE_STOPPED = 0.4;
+
+/** Clearance from a chassis at which a pedestrian treats it as upon them. */
+const VEHICLE_NEAR = 0.45;
+
+/**
+ * Longest anybody stands at a kerb before giving up and walking on, in seconds.
+ *
+ * One whole signal cycle, so a pedestrian who has already been offered a
+ * complete walk phase and still has not moved is looking at a crossing that is
+ * not going to clear - a vehicle broken down on it, or a bug in the gate above.
+ * The bound is the point: `watchStall` deliberately does not police a `wait`,
+ * because waiting is a decision rather than a failure, so `wait` is the one
+ * state that can last for ever unless something ends it. It could, and did:
+ * measured with live traffic before this, 202 of 270 people spent more than a
+ * minute at a kerb and one stood there for the entire ten minute run.
+ */
+const WAIT_PATIENCE = SIGNAL_CYCLE;
+
+/**
+ * How long somebody who has given up on a crossing walks past every other one,
+ * in seconds. Long enough to clear the junction they gave up at.
+ */
+const CROSS_COOLDOWN = 14;
+
+// -- being knocked down -----------------------------------------------------
+
+/** Seconds from the impact to lying flat. */
+const FALL_TIME = 0.34;
+/** Seconds a survivor lies there before starting to get up. */
+const DOWN_TIME = 6.5;
+/** Seconds getting back on their feet. Slower than the fall, as it should be. */
+const RISE_TIME = 1.2;
+/**
+ * Closing speed at or above which a pedestrian does not get up again, m/s.
+ *
+ * 7 m/s is 25 km/h, the speed at which real survivability starts to fall away.
+ * Below it a knock-down is a knock-down; above it, it is a casualty.
+ */
+const FATAL_SPEED = 7;
+/** Slowest a vehicle may be going and still knock anybody over, m/s. */
+const KNOCKDOWN_SPEED = 1.6;
+/** Seconds a casualty lies in the street before the pool slot is reused. */
+const CASUALTY_TIME = 60;
+/** Clearance added to a chassis before it counts as having hit somebody. */
+const STRIKE_MARGIN = 0.06;
+/** Fraction of the striking speed a body is thrown at. */
+const THROW_SHARE = 0.55;
+/** Fastest a body is thrown, m/s. Above this it looks like a rag doll. */
+const THROW_MAX = 6;
+/** How quickly a thrown body scrubs off speed on the ground, per second. */
+const THROW_DRAG = 4.5;
+/** Radius a body on the ground keeps clear around it. A person is not a disc. */
+export const DOWN_RADIUS = 0.85;
+
+/**
+ * How close a vehicle's centre has to be to the viewer to be taken for the
+ * player's own car, in metres. A car the player is sitting in is at the viewer
+ * to within a frame of travel; nothing else in the city can be, because the
+ * player is solid to traffic and cannot stand inside a chassis.
+ */
+const PLAYER_CAR_RADIUS = 1.6;
+
+export type PedState = 'walk' | 'wait' | 'cross' | 'pause' | 'down';
+
+/**
+ * What a vehicle did to somebody, reported to whoever owns the vehicle.
+ *
+ * `vehicle` is the very object that was passed in `CrowdContext.vehicles`, and
+ * `index` is its position in that array, so a caller can recognise its own car
+ * by identity rather than by guessing from coordinates.
+ */
+export interface PedestrianImpact {
+  readonly vehicle: CrowdVehicle;
+  readonly index: number;
+  /** Where the body was struck. */
+  readonly x: number;
+  readonly y: number;
+  readonly z: number;
+  /** Closing speed along the vehicle's direction of travel, m/s. */
+  readonly speed: number;
+  /** Unit direction the body was thrown in - the vehicle's line of travel. */
+  readonly dirX: number;
+  readonly dirZ: number;
+  /** True when this one is not getting up. */
+  readonly fatal: boolean;
+}
 
 /**
  * The minimum a vehicle has to tell us. Deliberately structural so the vehicle
@@ -126,6 +275,23 @@ export interface CrowdVehicle {
   /** Half extents in metres. Defaults to a family car if absent. */
   readonly halfLength?: number | undefined;
   readonly halfWidth?: number | undefined;
+  /**
+   * True when the player is driving this one.
+   *
+   * ONLY A PLAYER'S VEHICLE KNOCKS PEOPLE DOWN. Ambient traffic passes through
+   * the crowd exactly as it always has, because nothing makes it yield: nobody
+   * wires `TrafficSystem.setObstacles`, so a driver has no idea a pedestrian
+   * is on the crossing. Letting every car knock people over on those terms was
+   * measured at 210 knock-downs in ten minutes - a third of the population run
+   * over, none of it the player's doing and none of it avoidable from here.
+   * See `crossingClear` for why, and `PedestrianSystem.carriagewayObstacles`
+   * for the two lines that would fix it and let this be relaxed.
+   *
+   * Leaving it unset is safe: `Crowd` then falls back to recognising the
+   * player's car as the vehicle sitting on the viewer, which is exactly what
+   * it is while somebody is driving it.
+   */
+  readonly player?: boolean | undefined;
 }
 
 export interface Pedestrian {
@@ -166,10 +332,28 @@ export interface Pedestrian {
    * corner". Set when street furniture is actually being touched.
    */
   dodge: number;
+  /**
+   * Seconds left of "do not try to cross anything". Set when a crossing has
+   * already been waited out once; without it a give-up is not a give-up at
+   * all, because the very next node offers the same crossing again.
+   */
+  crossCooldown: number;
   lod: number;
   /** Frames until this agent's next simulation step. */
   due: number;
   groundAge: number;
+  /**
+   * Seconds since this pedestrian was knocked down. Drives the topple and, on
+   * the way back, the rise; meaningless unless `state` is 'down'.
+   */
+  downFor: number;
+  /** True while this one is never getting up again. */
+  fatal: boolean;
+  /**
+   * Which way they topple: +1 over backwards, -1 onto their face. Chosen from
+   * where the impact came from relative to the way they were facing.
+   */
+  fallSign: number;
   look: PedestrianLook;
 }
 
@@ -211,6 +395,16 @@ export interface CrowdStats {
    * for the density.
    */
   detours: number;
+  /**
+   * Times somebody gave up on a crossing that never cleared and walked on
+   * instead. Cumulative, and should stay near zero: a sustained rise means
+   * `crossingClear` is refusing crossings the signals are offering.
+   */
+  gaveUp: number;
+  /** Pedestrians currently on the ground. See `knockDown`. */
+  down: number;
+  /** Times a vehicle has knocked somebody down. Cumulative. */
+  struck: number;
 }
 
 const GRID_BITS = 12;
@@ -220,6 +414,53 @@ const CELL = 2.4;
 
 function hashCell(ix: number, iz: number): number {
   return (Math.imul(ix, 92837111) ^ Math.imul(iz, 689287499)) & GRID_MASK;
+}
+
+/**
+ * Clips `window` to the times a point at `p` moving at `v` lies within `half`
+ * of the origin on one axis. Returns false when that never happens inside the
+ * window - which, applied to both axes of a rectangle in turn, is a swept
+ * point-versus-box test with no sampling in it.
+ */
+function slab(p: number, v: number, half: number, window: { lo: number; hi: number }): boolean {
+  if (Math.abs(v) < 1e-4) return Math.abs(p) <= half;
+  const a = (-half - p) / v;
+  const b = (half - p) / v;
+  if (Math.min(a, b) > window.lo) window.lo = Math.min(a, b);
+  if (Math.max(a, b) < window.hi) window.hi = Math.max(a, b);
+  return window.lo <= window.hi;
+}
+
+/**
+ * True when a disc of `radius` at (x, z) overlaps a vehicle's chassis.
+ *
+ * The chassis is an oriented box lined up with where the vehicle is GOING,
+ * which is the only orientation `CrowdVehicle` carries. A vehicle with no
+ * velocity has no orientation to offer, so it falls back to the circle its box
+ * fits inside - conservative, and only ever consulted for something that is not
+ * moving and therefore cannot hit anybody.
+ *
+ * Growing the box by the disc radius rather than doing a true disc-box distance
+ * test overstates the corners by at most `radius * (sqrt 2 - 1)`, 11 cm for a
+ * person. That is the right way to be wrong for both of this function's callers.
+ */
+function vehicleOverlap(vehicle: CrowdVehicle, x: number, z: number, radius: number): boolean {
+  const halfLength = (vehicle.halfLength ?? 2.3) + radius;
+  const halfWidth = (vehicle.halfWidth ?? 0.95) + radius;
+  const rx = x - vehicle.x;
+  const rz = z - vehicle.z;
+  const vx = vehicle.vx ?? 0;
+  const vz = vehicle.vz ?? 0;
+  const speed = Math.hypot(vx, vz);
+  if (speed < 1e-3) {
+    const reach = Math.hypot(halfLength, halfWidth);
+    return rx * rx + rz * rz < reach * reach;
+  }
+  const fx = vx / speed;
+  const fz = vz / speed;
+  return (
+    Math.abs(rx * fx + rz * fz) < halfLength && Math.abs(-rx * fz + rz * fx) < halfWidth
+  );
 }
 
 function dampAngle(current: number, target: number, rate: number, dt: number): number {
@@ -247,7 +488,19 @@ export class Crowd {
     crossing: 0,
     respawned: 0,
     detours: 0,
+    gaveUp: 0,
+    down: 0,
+    struck: 0,
   };
+
+  /** Told whenever a vehicle knocks somebody down. See `PedestrianImpact`. */
+  onImpact: ((impact: PedestrianImpact) => void) | null = null;
+
+  /**
+   * Lets AMBIENT traffic knock people down too. Off by design - see
+   * `CrowdVehicle.player`. Turn it on only once traffic yields to the crowd.
+   */
+  trafficStrikes = false;
 
   private readonly ground: CityGround;
   private readonly network: RoadNetwork;
@@ -262,6 +515,10 @@ export class Crowd {
   private readonly push = { x: 0, z: 0 };
   private readonly probe = { x: 0, z: 0 };
   private readonly probePush = { x: 0, z: 0 };
+  /** Reused time window for the swept crossing test. See `crossingClear`. */
+  private readonly window = { lo: 0, hi: 0 };
+  /** Reused output of `carriagewayObstacles`. Grown, never reallocated. */
+  private readonly onRoad: { x: number; z: number; radius: number }[] = [];
   /**
    * Links street furniture has closed outright, by index. Built once, because
    * the scatter is static: see `ObstacleIndex.blocksCorridor` for why a route
@@ -290,6 +547,41 @@ export class Crowd {
       if (!link) continue;
       if (this.obstacles.blocksCorridor(link, PED_RADIUS + 0.14)) this.closed[i] = 1;
     }
+  }
+
+  /**
+   * Everybody currently standing on a carriageway, as circles.
+   *
+   * This is the crowd's half of the contract `TrafficSystem.setObstacles`
+   * exists for and nobody has ever wired: with it, drivers brake for people on
+   * a crossing; without it, they do not know anybody is there. The array is
+   * rebuilt in place and returned by reference, so a caller may hand it over
+   * once and let it keep changing.
+   *
+   * Only people on a crossing link are listed. Somebody on a pavement is
+   * behind a kerb and braking for them would stop the city dead.
+   */
+  carriagewayObstacles(): readonly { x: number; z: number; radius: number }[] {
+    this.onRoad.length = 0;
+    for (const ped of this.peds) {
+      if (!ped.active) continue;
+      if (!this.graph.links[ped.link]?.crossing) continue;
+      this.onRoad.push({
+        x: ped.x,
+        z: ped.z,
+        radius: ped.state === 'down' ? DOWN_RADIUS : PED_RADIUS,
+      });
+    }
+    return this.onRoad;
+  }
+
+  /** True when somebody is on this crossing, by `Crossing.id`. */
+  crossingBlocked(id: string): boolean {
+    for (const ped of this.peds) {
+      if (!ped.active) continue;
+      if (this.graph.links[ped.link]?.crossing?.id === id) return true;
+    }
+    return false;
   }
 
   /** How many links street furniture has closed. Diagnostics and tests. */
@@ -333,8 +625,33 @@ export class Crowd {
       lod: 2,
       due: 0,
       groundAge: 0,
+      crossCooldown: 0,
+      downFor: 0,
+      fatal: false,
+      fallSign: 1,
       look: makeLook(this.rng),
     };
+  }
+
+  /**
+   * How far over a downed pedestrian has toppled, in radians, and which way.
+   *
+   * Zero on their feet, `±PI/2` flat out. Everything about drawing a body is
+   * this one number: `PedestrianSystem` folds it into the same instance matrix
+   * that already carries the heading and the build, so a body on the ground
+   * costs the crowd exactly nothing extra to draw - no second mesh, no second
+   * material, no extra draw call.
+   */
+  static tilt(ped: Pedestrian): number {
+    if (ped.state !== 'down') return 0;
+    const fall = clamp(ped.downFor / FALL_TIME, 0, 1);
+    // Ease out: a falling body accelerates and then stops dead on the ground.
+    let amount = 1 - (1 - fall) * (1 - fall);
+    if (!ped.fatal) {
+      const rising = ped.downFor - (FALL_TIME + DOWN_TIME);
+      if (rising > 0) amount = Math.min(amount, clamp(1 - rising / RISE_TIME, 0, 1));
+    }
+    return ped.fallSign * amount * Math.PI * 0.5;
   }
 
   // -- spawning -------------------------------------------------------------
@@ -422,6 +739,10 @@ export class Crowd {
     ped.stall = 0;
     ped.stallTries = 0;
     ped.dodge = 0;
+    ped.crossCooldown = 0;
+    ped.downFor = 0;
+    ped.fatal = false;
+    ped.fallSign = 1;
     ped.phase = this.rng.next();
     ped.lod = 2;
     ped.due = 0;
@@ -549,6 +870,7 @@ export class Crowd {
     this.stats.stepped = 0;
     this.stats.waiting = 0;
     this.stats.crossing = 0;
+    let down = 0;
 
     this.reindex();
 
@@ -579,6 +901,15 @@ export class Crowd {
       if (ped.state === 'wait') this.stats.waiting += 1;
       if (ped.state === 'cross') this.stats.crossing += 1;
 
+      if (ped.state === 'down') {
+        down += 1;
+        // A body is stepped EVERY frame whatever its LOD. It costs three adds,
+        // and running the topple at a quarter rate would make a distant fall
+        // read as a stutter - the one moment the eye is certainly on them.
+        this.stepDown(ped, step, distance, ctx);
+        continue;
+      }
+
       // The walk cycle advances every frame even when the agent does not, so
       // a distant figure never stutters. One add per pedestrian.
       this.advancePhase(ped, step);
@@ -590,8 +921,227 @@ export class Crowd {
       this.stats.stepped += 1;
       this.step(ped, i, step * stride, ctx);
     }
+    this.stats.down = down;
 
+    this.strike(ctx);
     this.resolveOverlaps(2);
+  }
+
+  // -- being knocked down ---------------------------------------------------
+
+  /**
+   * Lies a pedestrian down and throws them along `dir`.
+   *
+   * One code path for both ways of ending up on the pavement - hit by a car and
+   * shot - so a body behaves the same however it got there and there is only
+   * one state for the rest of the simulation to understand. A shot civilian
+   * arrives here through `PedestrianSystem.downAt`, which is the hook
+   * `CrowdTargets` has been waiting for.
+   */
+  knockDown(ped: Pedestrian, dirX: number, dirZ: number, speed: number, fatal: boolean): void {
+    if (!ped.active || ped.state === 'down') return;
+    ped.state = 'down';
+    ped.downFor = 0;
+    ped.fatal = fatal;
+    ped.timer = 0;
+    ped.stall = 0;
+    ped.stallTries = 0;
+    ped.dodge = 0;
+    ped.gait = 0;
+    ped.next = -1;
+    // Topple away from wherever the blow came from: shoved the way they were
+    // already facing goes onto the face, shoved against it goes over backwards.
+    // `heading` is the direction the model FACES, which is -(sin, cos).
+    const facingX = -Math.sin(ped.heading);
+    const facingZ = -Math.cos(ped.heading);
+    ped.fallSign = dirX * facingX + dirZ * facingZ > 0 ? -1 : 1;
+    const thrown = Math.min(THROW_MAX, speed * THROW_SHARE);
+    ped.vx = dirX * thrown;
+    ped.vz = dirZ * thrown;
+    ped.speed = thrown;
+  }
+
+  /**
+   * A body on the ground: slide to a stop, count the seconds, get up or don't.
+   *
+   * Deliberately NOT routed through `step`. A body has no route, no steering
+   * target and no opinion about crossings, and putting it through the walking
+   * model would have it inch toward a kerb while lying on its back.
+   */
+  private stepDown(ped: Pedestrian, dt: number, distance: number, ctx: CrowdContext): void {
+    ped.downFor += dt;
+
+    if (ped.speed > 1e-3) {
+      const drag = Math.max(0, 1 - THROW_DRAG * dt);
+      ped.vx *= drag;
+      ped.vz *= drag;
+      ped.speed = Math.hypot(ped.vx, ped.vz);
+      if (ped.speed < 0.05) {
+        ped.vx = 0;
+        ped.vz = 0;
+        ped.speed = 0;
+      }
+      ped.x += ped.vx * dt;
+      ped.z += ped.vz * dt;
+      // Still bound by the pavement corridor: being run over is not a licence
+      // to slide through a wall. `project` owns where they end up, as ever.
+      const link = this.graph.links[ped.link];
+      if (link) this.project(ped, link);
+    }
+
+    // The ground under a body, sampled at the cheap rate a stationary thing
+    // deserves. A fall on a kerb should not leave anybody hovering.
+    ped.groundAge += dt;
+    if (ped.groundAge >= 0.35) {
+      ped.groundAge = 0;
+      ped.y = this.ground.sample(ped.x, ped.z).y;
+    }
+
+    if (ped.fatal) {
+      // A casualty is scenery until the player has walked away from them. Only
+      // then is the pool slot reused, so nobody watches a body blink out.
+      if (ped.downFor > CASUALTY_TIME && distance > LOD_NEAR) {
+        this.respawn(ped, ctx.x, ctx.z);
+      }
+      return;
+    }
+    if (ped.downFor >= FALL_TIME + DOWN_TIME + RISE_TIME) {
+      ped.state = 'walk';
+      ped.downFor = 0;
+      ped.timer = 0;
+      ped.stall = 0;
+      ped.stallTries = 0;
+      ped.anchorX = ped.x;
+      ped.anchorZ = ped.z;
+      ped.gait = 0;
+      // Whatever they were heading for is long gone; pick the route afresh.
+      ped.next = -1;
+      const link = this.graph.links[ped.link];
+      if (link) ped.lateralTarget = this.preferredLateral(link, ped.look);
+    }
+  }
+
+  /**
+   * Runs every vehicle over anybody it is actually touching.
+   *
+   * A REAL COLLISION, NOT PROXIMITY. `vehicleOverlap` is the chassis box grown
+   * by a shoulder and six centimetres, so nothing here fires for driving past a
+   * bus queue - which matters, because a caller wires this to the player's
+   * wanted level and a false star is worse than no feature at all. A vehicle
+   * that is barely moving cannot knock anybody over either.
+   *
+   * Broad phase is the crowd's own hash grid, walked over the cells the chassis
+   * covers, and only for vehicles near enough to the viewer to be simulated
+   * properly. Measured cost is in `docs/crowd-corners-and-knockdowns.md`.
+   */
+  private strike(ctx: CrowdContext): void {
+    const vehicles = ctx.vehicles;
+    if (!vehicles || vehicles.length === 0) return;
+    // Which vehicle is the player in? Whichever one is sitting on the viewer:
+    // while somebody is driving, the position handed to `update` IS their car.
+    // Only consulted when no vehicle declares itself, so a caller that sets
+    // `player` is always believed instead.
+    let declared = false;
+    for (const vehicle of vehicles) if (vehicle?.player) declared = true;
+    let viewer = -1;
+    if (!declared) {
+      let best = PLAYER_CAR_RADIUS * PLAYER_CAR_RADIUS;
+      for (let v = 0; v < vehicles.length; v += 1) {
+        const vehicle = vehicles[v];
+        if (!vehicle) continue;
+        const d = (vehicle.x - ctx.x) ** 2 + (vehicle.z - ctx.z) ** 2;
+        if (d < best) {
+          best = d;
+          viewer = v;
+        }
+      }
+    }
+
+    for (let v = 0; v < vehicles.length; v += 1) {
+      const vehicle = vehicles[v];
+      if (!vehicle) continue;
+      if (!(this.trafficStrikes || vehicle.player === true || v === viewer)) continue;
+      const vx = vehicle.vx ?? 0;
+      const vz = vehicle.vz ?? 0;
+      const speed = Math.hypot(vx, vz);
+      if (speed < KNOCKDOWN_SPEED) continue;
+      // Nobody is simulated past the recycle radius, so nothing out there can
+      // be hit; skipping those vehicles is most of the saving.
+      if (Math.hypot(vehicle.x - ctx.x, vehicle.z - ctx.z) > RECYCLE_RADIUS) continue;
+
+      const reach = (vehicle.halfLength ?? 2.3) + PED_RADIUS + STRIKE_MARGIN;
+      const span = Math.ceil(reach / CELL);
+      const cx = Math.floor(vehicle.x / CELL);
+      const cz = Math.floor(vehicle.z / CELL);
+      for (let i = -span; i <= span; i += 1) {
+        for (let j = -span; j <= span; j += 1) {
+          let other = this.cellHead[hashCell(cx + i, cz + j)] ?? -1;
+          while (other >= 0) {
+            const next = this.cellNext[other] ?? -1;
+            const ped = this.peds[other];
+            if (
+              ped &&
+              ped.active &&
+              ped.state !== 'down' &&
+              vehicleOverlap(vehicle, ped.x, ped.z, PED_RADIUS + STRIKE_MARGIN)
+            ) {
+              const fatal = speed >= FATAL_SPEED;
+              const hitX = ped.x;
+              const hitZ = ped.z;
+              this.knockDown(ped, vx / speed, vz / speed, speed, fatal);
+              this.stats.struck += 1;
+              this.onImpact?.({
+                vehicle,
+                index: v,
+                x: hitX,
+                y: ped.y,
+                z: hitZ,
+                speed,
+                dirX: vx / speed,
+                dirZ: vz / speed,
+                fatal,
+              });
+            }
+            other = next;
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Puts down whoever is standing nearest a point, and reports whether anybody
+   * was. `PedestrianSystem.downAt` is the public face of this; it exists so a
+   * shot civilian goes down exactly the way a struck one does.
+   */
+  downNearest(x: number, z: number, radius: number, fatal: boolean): boolean {
+    let best: Pedestrian | null = null;
+    let bestDistance = radius * radius;
+    const span = Math.ceil(radius / CELL);
+    const cx = Math.floor(x / CELL);
+    const cz = Math.floor(z / CELL);
+    for (let i = -span; i <= span; i += 1) {
+      for (let j = -span; j <= span; j += 1) {
+        let other = this.cellHead[hashCell(cx + i, cz + j)] ?? -1;
+        while (other >= 0) {
+          const next = this.cellNext[other] ?? -1;
+          const ped = this.peds[other];
+          if (ped && ped.active && ped.state !== 'down') {
+            const d = (ped.x - x) * (ped.x - x) + (ped.z - z) * (ped.z - z);
+            if (d < bestDistance) {
+              bestDistance = d;
+              best = ped;
+            }
+          }
+          other = next;
+        }
+      }
+    }
+    if (!best) return false;
+    // Dropped where they stand: a bullet carries no useful shove at this scale,
+    // so the direction only decides which way they topple.
+    this.knockDown(best, -Math.sin(best.heading), -Math.cos(best.heading), 0, fatal);
+    return true;
   }
 
   private advancePhase(ped: Pedestrian, dt: number): void {
@@ -631,6 +1181,7 @@ export class Crowd {
     const goalAlong = stopped ? ped.waitAlong : ped.along + this.lookahead(ped);
 
     ped.dodge = Math.max(0, ped.dodge - dt);
+    ped.crossCooldown = Math.max(0, ped.crossCooldown - dt);
 
     let targetX: number;
     let targetZ: number;
@@ -711,16 +1262,30 @@ export class Crowd {
       steerX += this.push.x;
       steerZ += this.push.z;
       desired *= brake;
-      // A shuffling floor. Without it a jam is absorbing: everyone reaches
-      // zero, the avoidance terms that depend on motion vanish, and the knot
-      // never unties. Only a vehicle or a deliberate wait may stop someone.
-      if (!stopped) desired = Math.max(desired, 0.22);
     }
 
+    // A vehicle is the one influence allowed to stop somebody dead, and it says
+    // so by returning exactly zero. Anything else it returns is a brake, and a
+    // brake has to stay above the shuffling floor below.
+    let frozen = false;
     if (ped.lod === 0 || ped.state === 'cross') {
       const vehicleBrake = this.avoidVehicles(ped, dx, dz, ctx);
       desired *= vehicleBrake;
+      frozen = vehicleBrake <= 0;
     }
+
+    // A shuffling floor. Without it a jam is absorbing: everyone reaches zero,
+    // the avoidance terms that depend on motion vanish, and the knot never
+    // unties. Only a vehicle bearing down or a deliberate wait may stop anyone.
+    //
+    // THE FLOOR HAS TO BE THE LAST WORD. It used to be applied inside the
+    // neighbour block above, where the vehicle factor could then multiply it
+    // away: a pedestrian on a pavement beside a car queued at a red light was
+    // held at a tenth of a metre a second for as long as the queue lasted,
+    // because `avoidVehicles` measures from the chassis CENTRE and its
+    // clearance of nearly three metres reaches the far kerb of this city's
+    // narrower streets. Measured at one corner: 0.19 m travelled in 12 s.
+    if (!stopped && !frozen) desired = Math.max(desired, 0.22);
 
     const maxSpeed = ped.look.preferredSpeed * 1.75;
     const steerLength = Math.hypot(steerX, steerZ);
@@ -767,8 +1332,21 @@ export class Crowd {
         ped.x += this.push.x;
         ped.z += this.push.z;
         // Same slide, against the lamp post rather than the kerb.
+        //
+        // ONLY FOR A CONTACT THAT IS ACTUALLY IN THE WAY. `resolve` reports a
+        // hit for any overlap at all, including the grazing one where the disc
+        // touches the box and the correction is a fraction of a millimetre.
+        // Treating that as a blockage is self-sustaining: the slide cancels
+        // exactly the velocity that would have carried the walker into the
+        // prop, so they never penetrate, so the push stays at zero, so the
+        // slide runs again - and `dodge`, refreshed on the same branch, holds
+        // off the corner hand-off for as long as it lasts. Traced at the
+        // vestry-street corner: `resolve` true with a push of (0.00, 0.00) for
+        // hundreds of consecutive frames while the walker ground along at
+        // 0.1 m/s. Below a centimetre there is nothing to walk around; let
+        // them press on and take the real push next frame if there is one.
         const length = Math.hypot(this.push.x, this.push.z);
-        if (length > 1e-5) {
+        if (length > CONTACT_PUSH) {
           const into = (ped.vx * this.push.x + ped.vz * this.push.z) / length;
           if (into < 0) {
             ped.vx -= (into * this.push.x) / length;
@@ -926,8 +1504,9 @@ export class Crowd {
 
   private desiredSpeed(ped: Pedestrian, link: PavementLink): number {
     let speed = ped.look.preferredSpeed;
-    // Nobody dawdles on a carriageway.
-    if (link.crossing) speed *= 1.16;
+    // Nobody dawdles on a carriageway. `crossingClear` assumes exactly this
+    // much hurry when it decides whether they can get across in time.
+    if (link.crossing) speed *= CROSSING_HURRY;
     return speed;
   }
 
@@ -979,7 +1558,7 @@ export class Crowd {
 
     // Choose the continuation early enough to slow down for it.
     if (ped.next < 0 && ped.along > link.length - Math.max(3.5, ped.speed * 2.2)) {
-      ped.next = this.chooseNext(link);
+      ped.next = this.chooseNext(link, ped.crossCooldown <= 0);
     }
 
     if (ped.state === 'wait') {
@@ -993,6 +1572,22 @@ export class Crowd {
         ped.state = 'cross';
         ped.timer = 0;
         this.commit(ped);
+        return;
+      }
+      // Nobody waits at a kerb for ever. See `WAIT_PATIENCE`.
+      if (ped.timer > WAIT_PATIENCE) {
+        ped.state = 'walk';
+        ped.timer = 0;
+        // AND THEN WALK AWAY FROM IT. Excluding crossings from this one choice
+        // is not enough: the corner stubs on this city's pavements are 0.9 to
+        // 1.7 m long, so a walker who declines a crossing reaches the next
+        // node a second later and is offered the same crossing again. Traced
+        // at the harbour-walk corner: two agents cycling give-up, walk 1.6 m,
+        // wait 26 s, give up, for forty seconds at a stretch.
+        ped.crossCooldown = CROSS_COOLDOWN;
+        ped.next = this.chooseNext(link, false);
+        ped.lateralTarget = this.preferredLateral(link, ped.look);
+        this.stats.gaveUp += 1;
       }
       return;
     }
@@ -1014,7 +1609,10 @@ export class Crowd {
       return;
     }
 
-    const next = this.graph.links[ped.next < 0 ? (ped.next = this.chooseNext(link)) : ped.next];
+    const next =
+      this.graph.links[
+        ped.next < 0 ? (ped.next = this.chooseNext(link, ped.crossCooldown <= 0)) : ped.next
+      ];
     if (!next) {
       // Nowhere to go: turn around rather than stand in the way for ever.
       // A crossing is never a legal fallback; only the signalled path enters one.
@@ -1057,8 +1655,11 @@ export class Crowd {
    * Straight on is much the most likely; a U-turn is a last resort. Crossings
    * are picked far less often than the geometry alone would suggest, because a
    * crowd that crosses at every single opportunity spends its life in the road.
+   *
+   * `allowCrossing` is false for somebody who has just given up on a crossing:
+   * offering them the same one again is how a give-up turns into a loop.
    */
-  private chooseNext(link: PavementLink): number {
+  private chooseNext(link: PavementLink, allowCrossing = true): number {
     const options = this.graph.linksFrom[link.to];
     if (!options || options.length === 0) return link.reverse;
 
@@ -1071,6 +1672,7 @@ export class Crowd {
       // strands whoever takes it, and on a crossing that means standing in a
       // carriageway until the watchdog notices.
       if (this.closed[candidate] === 1) continue;
+      if (!allowCrossing && next.crossing) continue;
       const straight = next.dx * link.dx + next.dz * link.dz;
       let weight: number;
       if (candidate === link.reverse) weight = 0.02;
@@ -1091,37 +1693,117 @@ export class Crowd {
    * True when a pedestrian may step onto a crossing.
    *
    * Two conditions, both required: the shared signal says the traffic this
-   * crossing cuts across is stopped, and no vehicle is close enough to reach
-   * the crossing before we are off it. The second is what makes a red-light
-   * runner survivable.
+   * crossing cuts across is stopped, and no vehicle will be ON THE CROSSING
+   * while we are. The second is what makes a red-light runner survivable.
+   *
+   * THE QUESTION HAS TO BE ABOUT THE CROSSING, NOT ABOUT A CIRCLE ROUND IT.
+   * This used to veto whenever any vehicle's centre came within
+   * `link.length / 2 + 2.4` of the crossing's centre - 11.15 m at a typical
+   * junction here. That radius is larger than the junction, so it contains:
+   * the queue stopped at the stop line, whose nose is parked 0.4 m short of
+   * the crossing by construction (`TrafficSim`'s `stopAlong`); the traffic on
+   * the cross street, which is confined to its own carriageway and can never
+   * touch this strip at all; and anything merely passing nearby.
+   *
+   * The two conditions were therefore very nearly mutually exclusive, because
+   * `walkSignal` is true PRECISELY WHEN the traffic on this carriageway is
+   * stopped - which is when the queue that fills that circle exists. Measured
+   * over three minutes with 240 vehicles and 270 people: of 118,098 frames in
+   * which somebody stood at a kerb with the walk signal in their favour,
+   * 117,809 were vetoed and 1 was clear. 51.6 per cent of those vetoes were a
+   * STOPPED vehicle and 78.8 per cent were a vehicle nowhere near the strip;
+   * a moving vehicle actually on the crossing accounted for 1.1 per cent.
+   *
+   * So the test is now the crossing's own rectangle - `link.length` kerb to
+   * kerb by `2 * crossing.halfWidth` along the street - swept against each
+   * vehicle's own box over the time we would be exposed. Two 1-D slab clips,
+   * exact for a constant velocity, so no sampling interval can step over a
+   * fast car.
+   *
+   * THE MARGIN HAS TO BE HONEST ABOUT THE STOP LINE. `TrafficSim` parks a
+   * queue with its nose exactly 0.4 m short of the strip, so the whole question
+   * of whether a waiting crowd ever gets to cross comes down to a few
+   * centimetres. Inflating the vehicle isotropically by its circumradius - the
+   * obvious conservative choice - adds a car's half LENGTH to the axis where
+   * only 0.4 m exists, and puts every correctly stopped car back inside the
+   * box; measured that way, 401 of 1,311 waits still ran to the full patience
+   * timeout. So the vehicle is projected onto each axis as the oriented box it
+   * is, and only a MOVING one gets a safety margin on top: a car that is not
+   * moving cannot run anybody over, and the only thing it can do is physically
+   * block the strip, which needs no margin at all to detect.
    */
   private crossingClear(link: PavementLink, ctx: CrowdContext, speed: number): boolean {
     const crossing = link.crossing;
     if (!crossing) return true;
     if (!walkSignal(this.network, crossing, ctx.time)) return false;
 
+    // A "do not start what you cannot finish" gate was tried here and removed.
+    // It is the obvious answer - the walk phase is 14.5 s and the widest
+    // crossing in this city is 27 m, which a slow walker cannot clear inside
+    // one phase however early they set off - but it is answering the wrong
+    // question. Measured over ten minutes with 240 vehicles: refusing every
+    // crossing somebody could not finish in time changed the number of people
+    // struck by ambient traffic from 208 to 210 and more than doubled the
+    // number left standing at a kerb (379 stalls over five seconds to 888,
+    // give-ups 73 to 209). It prevents nothing because the collisions are not
+    // caused by the lights changing: 20 per cent are traffic TURNING off the
+    // cross street, which has a green at exactly the same time as the walk
+    // signal, and another 37 per cent are cars clearing the junction on the
+    // 1.5 s all-red. Neither is visible to a pedestrian in advance, and
+    // neither is fixable from inside `src/agents`. The fix is for the traffic
+    // to yield, which `TrafficSystem` already supports and nobody has wired:
+    // see `PedestrianSystem.carriagewayObstacles`.
+    const need = link.length / Math.max(0.4, speed * CROSSING_HURRY);
+
     const vehicles = ctx.vehicles;
     if (!vehicles || vehicles.length === 0) return true;
 
-    const need = link.length / Math.max(0.4, speed);
-    const horizon = Math.min(6, need + 1.2);
+    const horizon = Math.min(CROSSING_HORIZON, need + 1.2);
     const cx = (link.ax + link.bx) * 0.5;
     const cz = (link.az + link.bz) * 0.5;
-    const reach = link.length * 0.5 + 2.4;
+    // The link's own axes: `d` runs kerb to kerb across the carriageway, `n`
+    // runs along the street, which is the direction its traffic travels.
+    const halfAcross = link.length * 0.5;
+    // The band pedestrians may actually occupy, not the painted crossing: the
+    // link's own half width is already `crossing.halfWidth` less the pavement
+    // margin, and using the wider figure spends 0.46 m of the 0.4 m the stop
+    // line leaves.
+    const halfAlong = link.halfWidth;
+
     for (const vehicle of vehicles) {
       const vx = vehicle.vx ?? 0;
       const vz = vehicle.vz ?? 0;
-      let rx = vehicle.x - cx;
-      let rz = vehicle.z - cz;
-      if (Math.hypot(rx, rz) < reach) return false;
-      const closing = rx * vx + rz * vz;
-      if (closing >= 0) continue;
-      const speedSq = vx * vx + vz * vz;
-      if (speedSq < 0.25) continue;
-      const t = Math.min(horizon, -closing / speedSq);
-      rx += vx * t;
-      rz += vz * t;
-      if (Math.hypot(rx, rz) < reach) return false;
+      const moving = Math.hypot(vx, vz);
+      // Forward axis. A vehicle that is going somewhere is pointing where it is
+      // going; a parked one is assumed to be lined up with the street, which is
+      // what every queue at a stop line actually is.
+      let fx: number;
+      let fz: number;
+      if (moving >= VEHICLE_STOPPED) {
+        fx = vx / moving;
+        fz = vz / moving;
+      } else {
+        fx = link.nx;
+        fz = link.nz;
+      }
+      const halfLength = vehicle.halfLength ?? 2.3;
+      const halfWidth = vehicle.halfWidth ?? 0.95;
+      // Projection radius of an oriented box onto an axis. The chassis' right
+      // vector is the forward one turned a quarter turn, so its dot products
+      // with `d` and `n` are the forward vector's with `n` and `d` swapped.
+      const fd = Math.abs(fx * link.dx + fz * link.dz);
+      const fn = Math.abs(fx * link.nx + fz * link.nz);
+      const margin = moving >= VEHICLE_STOPPED ? PED_RADIUS + CROSSING_MARGIN : PED_RADIUS;
+      const rx = vehicle.x - cx;
+      const rz = vehicle.z - cz;
+      const window = this.window;
+      window.lo = 0;
+      window.hi = horizon;
+      const onD = halfAcross + fd * halfLength + fn * halfWidth + margin;
+      const onN = halfAlong + fn * halfLength + fd * halfWidth + margin;
+      if (!slab(rx * link.dx + rz * link.dz, vx * link.dx + vz * link.dz, onD, window)) continue;
+      if (!slab(rx * link.nx + rz * link.nz, vx * link.nx + vz * link.nz, onN, window)) continue;
+      return false;
     }
     return true;
   }
@@ -1179,8 +1861,12 @@ export class Crowd {
           }
           const d = Math.sqrt(d2);
 
-          if (d < contact + 0.85) {
-            const strength = ((contact + 0.85 - d) / (contact + 0.85)) * 2.2;
+          // A body on the ground is not a person to squeeze past: it is a
+          // metre and a half of obstacle lying across the pavement, and the
+          // crowd has to go round it rather than through it.
+          const reach = o.state === 'down' ? contact + DOWN_RADIUS + 0.85 : contact + 0.85;
+          if (d < reach) {
+            const strength = ((reach - d) / reach) * 2.2;
             this.push.x -= (rx / d) * strength;
             this.push.z -= (rz / d) * strength;
           }
@@ -1240,7 +1926,8 @@ export class Crowd {
   avoidPlayer(px: number, pz: number, dt: number): void {
     const radius = 0.95;
     for (const ped of this.peds) {
-      if (!ped.active || ped.lod !== 0) continue;
+      // A body is not shoved out of the way by somebody walking over it.
+      if (!ped.active || ped.lod !== 0 || ped.state === 'down') continue;
       const rx = ped.x - px;
       const rz = ped.z - pz;
       const d = Math.hypot(rx, rz);
@@ -1276,8 +1963,27 @@ export class Crowd {
       const halfLength = vehicle.halfLength ?? 2.3;
       const halfWidth = vehicle.halfWidth ?? 0.95;
       const clearance = Math.max(halfLength, halfWidth) + PED_RADIUS + 0.5;
-      const d = Math.sqrt(d2);
-      if (d < clearance) return 0;
+      // ARM'S LENGTH FROM THE CHASSIS, NOT FROM ITS CENTRE. This used to be a
+      // circle of `max(halfLength, halfWidth) + 0.77` - nearly three metres,
+      // which on this city's narrower streets reaches the far pavement. Every
+      // car that drove past froze the people walking on it, because a car is
+      // 4.6 m long and 1.9 m wide and the circle was drawn to the long axis.
+      if (vehicleOverlap(vehicle, ped.x, ped.z, PED_RADIUS + VEHICLE_NEAR)) {
+        // A PARKED vehicle is scenery: walk round it.
+        if (Math.hypot(vx, vz) < VEHICLE_STOPPED) {
+          factor = Math.min(factor, 0.6);
+          continue;
+        }
+        // A moving one this close is an emergency, and what to do about it
+        // depends entirely on where you are standing. On a pavement, stop and
+        // let it go by. ON A CARRIAGEWAY, STOPPING IS THE WORST THING YOU CAN
+        // DO: the branch below already knows that and hurries people off the
+        // road, and this early return used to pre-empt it and plant them in
+        // the car's path instead.
+        if (!onRoad) return 0;
+        factor = Math.max(factor, CROSSING_SPRINT);
+        continue;
+      }
       const rvx = ped.vx - vx;
       const rvz = ped.vz - vz;
       const rvSq = rvx * rvx + rvz * rvz;
@@ -1287,15 +1993,18 @@ export class Crowd {
       const mz = rz - rvz * t;
       if (Math.hypot(mx, mz) > clearance + 0.6) continue;
       if (!onRoad) {
-        // On the pavement a near miss just means standing still for a moment.
-        factor = Math.min(factor, t < 1.4 ? 0 : 0.5);
+        // Behind a kerb a near miss is a reason to hesitate, not to freeze:
+        // the lateral clamp is what actually keeps the car off them, and a
+        // pedestrian who stops dead every time a car goes by never gets
+        // anywhere on a street with traffic on it.
+        factor = Math.min(factor, t < 1.4 ? 0.35 : 0.6);
         continue;
       }
       // Already committed to the road: getting off it fast beats stopping,
       // unless the vehicle arrives before we could clear its path.
       const ahead = rx * dx + rz * dz;
       factor = Math.min(factor, t < 0.9 && ahead > 0 ? 0 : 1);
-      if (t < 2.6) factor = Math.max(factor, 1.45);
+      if (t < 2.6) factor = Math.max(factor, CROSSING_SPRINT);
     }
     return factor;
   }
@@ -1306,9 +2015,15 @@ export class Crowd {
    * Runs after integration, so it is the last word. The correction is split
    * between the pair and then re-projected onto the pavement, which is why
    * someone squeezed against a wall stops rather than being pushed through it.
+   *
+   * A BODY IS NOT SPLIT WITH. Somebody on the ground has no legs to brace with,
+   * so the whole correction is taken by whoever walked into them; otherwise a
+   * busy pavement would slowly shove a casualty down the street. A body also
+   * takes up a person's LENGTH rather than their width, so the separation is
+   * larger for a pair that includes one.
    */
   private resolveOverlaps(iterations: number): void {
-    const minimum = PED_RADIUS * 2;
+    const pairMinimum = PED_RADIUS * 2;
     for (let pass = 0; pass < iterations; pass += 1) {
       for (let i = 0; i < this.peds.length; i += 1) {
         const ped = this.peds[i];
@@ -1329,6 +2044,13 @@ export class Crowd {
                 other = step;
                 continue;
               }
+              const aDown = ped.state === 'down';
+              const bDown = o.state === 'down';
+              if (aDown && bDown) {
+                other = step;
+                continue;
+              }
+              const minimum = aDown || bDown ? PED_RADIUS + DOWN_RADIUS : pairMinimum;
               let rx = o.x - ped.x;
               let rz = o.z - ped.z;
               let d = Math.hypot(rx, rz);
@@ -1344,17 +2066,23 @@ export class Crowd {
                 rz = Math.sin(angle);
                 d = 1;
               }
-              const correction = (minimum - d) * 0.5;
+              // Whoever is on their feet takes the whole correction.
+              const share = aDown || bDown ? 1 : 0.5;
+              const correction = (minimum - d) * share;
               const ux = (rx / d) * correction;
               const uz = (rz / d) * correction;
-              ped.x -= ux;
-              ped.z -= uz;
-              o.x += ux;
-              o.z += uz;
-              const la = this.graph.links[ped.link];
-              const lb = this.graph.links[o.link];
-              if (la) this.project(ped, la);
-              if (lb) this.project(o, lb);
+              if (!aDown) {
+                ped.x -= ux;
+                ped.z -= uz;
+                const la = this.graph.links[ped.link];
+                if (la) this.project(ped, la);
+              }
+              if (!bDown) {
+                o.x += ux;
+                o.z += uz;
+                const lb = this.graph.links[o.link];
+                if (lb) this.project(o, lb);
+              }
               other = step;
             }
           }

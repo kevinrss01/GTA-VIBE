@@ -17,7 +17,10 @@ export {
   MAX_UNITS,
   canArrest,
   carsForStars,
+  dispatchDelay,
+  dispatchDistance,
   dispatchInterval,
+  officerAimTime,
   officersPerCar,
   shootsOnSight,
 } from './policy';

@@ -25,6 +25,7 @@ import type { PropKey } from '../world/build/types';
 import { buildBuilding } from '../world/build/BuildingFactory';
 import { buildBlockGround, buildIntersections, buildStreet } from '../world/build/StreetBuilder';
 import { TrafficSystem } from './TrafficSystem';
+import { loadVehicleModels } from './VehicleModels';
 
 interface PreviewApi {
   look(x: number, z: number, yaw: number, pitch?: number, height?: number): unknown;
@@ -70,7 +71,12 @@ async function boot(): Promise<void> {
   const { group } = sink.bake(materials, new Map<PropKey, readonly PropPart[]>());
   engine.scene.add(group);
 
-  const traffic = new TrafficSystem({ plan, ground, network, quality: 'high' });
+  // The generated fleet, exactly as the game loads it. Without this the
+  // harness drew the authored fallback shells, which is the one thing it must
+  // not do: the whole point of looking at a vehicle here is to look at the
+  // asset that actually ships.
+  const models = await loadVehicleModels({ baseUrl: import.meta.env.BASE_URL });
+  const traffic = new TrafficSystem({ plan, ground, network, quality: 'high', models });
   engine.scene.add(traffic.group);
   // One update at build time so the views exist before the first frame; a
   // backgrounded tab may not get a frame for a long time.

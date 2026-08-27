@@ -26,7 +26,9 @@ import {
   measureWheel,
   transformPositions,
 } from '../src/traffic/VehicleModelFit';
-import { BODY_FOR_KIND, VEHICLE_BODY_ASSETS } from '../src/traffic/VehicleModels';
+import { BufferAttribute, BufferGeometry, MeshStandardMaterial } from 'three';
+
+import { BODY_FOR_KIND, VEHICLE_BODY_ASSETS, VehicleModelSet } from '../src/traffic/VehicleModels';
 import { ALL_VEHICLE_KINDS, VEHICLE_BLUEPRINTS } from '../src/traffic/VehicleCatalogue';
 
 const PUBLIC = 'public/';
@@ -298,4 +300,196 @@ describe('shipped vehicle assets', () => {
     expect(maxR).toBeGreaterThan(0.96);
     expect(maxR).toBeLessThan(1.04);
   });
+});
+/**
+ * You cannot see inside a car.
+ *
+ * `detectAndCutWheels` opens a disc in each flank so the renderer can mount a
+ * wheel that turns, and a generated body is a single surface with nothing
+ * behind it - so before the wheel wells were built, up to 14 per cent of the
+ * sight lines a solid body blocked went straight through the shell and out the
+ * other side. From beside a car it read as a black hole ringing every wheel.
+ *
+ * The test is stated the way the fault was: take the fitted body with its
+ * wheels still ON - the solid the cut started from - and fire rays at it. Every
+ * ray that solid stopped must still be stopped by the shell the game draws,
+ * counting the four wheels the renderer puts back. Rays below the underbody are
+ * excluded, because daylight under a car is what a car looks like.
+ */
+describe('you cannot see inside a car', () => {
+  /** Moller-Trumbore, either winding: this asks whether a surface is there. */
+  function rayHitsTriangle(
+    o: readonly number[],
+    d: readonly number[],
+    a: readonly number[],
+    b: readonly number[],
+    c: readonly number[],
+  ): boolean {
+    const e1 = [(b[0] ?? 0) - (a[0] ?? 0), (b[1] ?? 0) - (a[1] ?? 0), (b[2] ?? 0) - (a[2] ?? 0)];
+    const e2 = [(c[0] ?? 0) - (a[0] ?? 0), (c[1] ?? 0) - (a[1] ?? 0), (c[2] ?? 0) - (a[2] ?? 0)];
+    const p = [
+      (d[1] ?? 0) * (e2[2] ?? 0) - (d[2] ?? 0) * (e2[1] ?? 0),
+      (d[2] ?? 0) * (e2[0] ?? 0) - (d[0] ?? 0) * (e2[2] ?? 0),
+      (d[0] ?? 0) * (e2[1] ?? 0) - (d[1] ?? 0) * (e2[0] ?? 0),
+    ];
+    const det = (e1[0] ?? 0) * (p[0] ?? 0) + (e1[1] ?? 0) * (p[1] ?? 0) + (e1[2] ?? 0) * (p[2] ?? 0);
+    if (Math.abs(det) < 1e-10) return false;
+    const inv = 1 / det;
+    const t0 = [(o[0] ?? 0) - (a[0] ?? 0), (o[1] ?? 0) - (a[1] ?? 0), (o[2] ?? 0) - (a[2] ?? 0)];
+    const u = ((t0[0] ?? 0) * (p[0] ?? 0) + (t0[1] ?? 0) * (p[1] ?? 0) + (t0[2] ?? 0) * (p[2] ?? 0)) * inv;
+    if (u < 0 || u > 1) return false;
+    const q = [
+      (t0[1] ?? 0) * (e1[2] ?? 0) - (t0[2] ?? 0) * (e1[1] ?? 0),
+      (t0[2] ?? 0) * (e1[0] ?? 0) - (t0[0] ?? 0) * (e1[2] ?? 0),
+      (t0[0] ?? 0) * (e1[1] ?? 0) - (t0[1] ?? 0) * (e1[0] ?? 0),
+    ];
+    const v = ((d[0] ?? 0) * (q[0] ?? 0) + (d[1] ?? 0) * (q[1] ?? 0) + (d[2] ?? 0) * (q[2] ?? 0)) * inv;
+    if (v < 0 || u + v > 1) return false;
+    return ((e2[0] ?? 0) * (q[0] ?? 0) + (e2[1] ?? 0) * (q[1] ?? 0) + (e2[2] ?? 0) * (q[2] ?? 0)) * inv > 1e-5;
+  }
+
+  function blocked(
+    pos: ArrayLike<number>,
+    idx: ArrayLike<number>,
+    o: readonly number[],
+    d: readonly number[],
+  ): boolean {
+    const at = (v: number): number[] => [pos[v * 3] ?? 0, pos[v * 3 + 1] ?? 0, pos[v * 3 + 2] ?? 0];
+    for (let t = 0; t < idx.length / 3; t += 1) {
+      if (
+        rayHitsTriangle(o, d, at(idx[t * 3] ?? 0), at(idx[t * 3 + 1] ?? 0), at(idx[t * 3 + 2] ?? 0))
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** The four road wheels the renderer instances back into the arches. */
+  function wheelBlocks(
+    o: readonly number[],
+    d: readonly number[],
+    mount: { frontZ: number; rearZ: number; halfTrack: number },
+    radius: number,
+    halfWidth: number,
+  ): boolean {
+    for (const side of [-1, 1]) {
+      for (const z of [-mount.frontZ, mount.rearZ]) {
+        const cx = side * mount.halfTrack;
+        const oy = (o[1] ?? 0) - radius;
+        const oz = (o[2] ?? 0) - z;
+        const dy = d[1] ?? 0;
+        const dz = d[2] ?? 0;
+        const dx = d[0] ?? 0;
+        const a = dy * dy + dz * dz;
+        const c = oy * oy + oz * oz - radius * radius;
+        if (a < 1e-9) {
+          // Parallel to the axle: in through one face and out through the other.
+          if (c >= 0 || Math.abs(dx) < 1e-9) continue;
+          const t0 = (cx - halfWidth - (o[0] ?? 0)) / dx;
+          const t1 = (cx + halfWidth - (o[0] ?? 0)) / dx;
+          if (Math.max(t0, t1) > 1e-5) return true;
+          continue;
+        }
+        const b = 2 * (oy * dy + oz * dz);
+        const disc = b * b - 4 * a * c;
+        if (disc < 0) continue;
+        const root = Math.sqrt(disc);
+        for (const t of [(-b - root) / (2 * a), (-b + root) / (2 * a)]) {
+          if (t < 1e-5) continue;
+          if (Math.abs((o[0] ?? 0) + dx * t - cx) <= halfWidth) return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  it('leaves no sight line through any shipped shell', () => {
+    for (const kind of ALL_VEHICLE_KINDS) {
+      const bodyId = BODY_FOR_KIND[kind];
+      const asset = VEHICLE_BODY_ASSETS[bodyId];
+      const mesh = readGlbMesh(`${PUBLIC}${asset.path}`);
+      const bp = VEHICLE_BLUEPRINTS[kind];
+      const measurement = measureBody(mesh.positions);
+      const fit = fitBody(
+        measurement,
+        { length: bp.length, width: bp.width, height: bp.height },
+        asset.noseTowardsMax,
+      );
+      const solid = transformPositions(mesh.positions, fit.matrix);
+      const cut = detectAndCutWheels(solid, mesh.index, {
+        halfWidth: fit.metres.width * 0.5,
+        length: bp.length,
+        wheelRadius: bp.wheelRadius,
+        wheelWidth: bp.wheelWidth,
+        frontAxleZ: -bp.chassis.frontAxle,
+        rearAxleZ: bp.chassis.wheelbase - bp.chassis.frontAxle,
+        track: bp.chassis.track,
+        rideHeight: bp.rideHeight,
+      });
+
+      // The shell the game actually draws, built through the real loader path.
+      const geometry = new BufferGeometry();
+      geometry.setAttribute('position', new BufferAttribute(mesh.positions, 3));
+      geometry.setAttribute('normal', new BufferAttribute(mesh.normals, 3));
+      if (mesh.uvs) geometry.setAttribute('uv', new BufferAttribute(mesh.uvs, 2));
+      geometry.setIndex(new BufferAttribute(mesh.index, 1));
+      const set = new VehicleModelSet(false);
+      set.addBody(
+        bodyId,
+        {
+          geometry,
+          material: new MeshStandardMaterial(),
+          measurement,
+          triangles: mesh.triangles,
+        },
+        { id: bodyId, url: asset.path, triangles: mesh.triangles, measurement },
+      );
+      const shell = set.buildShell(kind);
+      expect(shell, kind).not.toBeNull();
+      if (!shell) continue;
+      const shellPos = shell.geometry.getAttribute('position').array;
+      const shellIndex = shell.geometry.getIndex();
+      expect(shellIndex, kind).not.toBeNull();
+      if (!shellIndex) continue;
+
+      let lowest = Infinity;
+      for (let i = 0; i < cut.index.length; i += 1) {
+        const y = solid[(cut.index[i] ?? 0) * 3 + 1] ?? 0;
+        if (y < lowest) lowest = y;
+      }
+      const yFrom = lowest + 0.05;
+
+      const rays: [number[], number[]][] = [];
+      for (let z = -bp.length * 0.48; z <= bp.length * 0.48; z += bp.length * 0.03) {
+        for (let y = yFrom; y <= 0.9; y += 0.05) rays.push([[-6, y, z], [1, 0, 0]]);
+      }
+      for (let x = -bp.width * 0.48; x <= bp.width * 0.48; x += bp.width * 0.06) {
+        for (let y = yFrom; y <= 0.9; y += 0.05) rays.push([[x, y, -9], [0, 0, 1]]);
+      }
+      // The low three-quarter view the fault was reported from.
+      const diag = Math.hypot(1, 0.55);
+      for (let z = -bp.length * 0.48; z <= bp.length * 0.48; z += bp.length * 0.05) {
+        for (let y = yFrom; y <= 0.7; y += 0.06) {
+          rays.push([[-6, y, z - 3.3], [1 / diag, 0, 0.55 / diag]]);
+        }
+      }
+
+      let tested = 0;
+      let through = 0;
+      for (const [o, d] of rays) {
+        if (!blocked(solid, mesh.index, o, d)) continue;
+        if (wheelBlocks(o, d, cut.mount, bp.wheelRadius, bp.wheelWidth * 0.5)) continue;
+        tested += 1;
+        if (!blocked(shellPos, shellIndex.array, o, d)) through += 1;
+      }
+      expect(tested, `${kind} had no sight lines to test`).toBeGreaterThan(150);
+      // Measured: 1.4 to 14.3 per cent of these went straight through before
+      // the wells were built, and at most one ray does now.
+      expect(
+        through / tested,
+        `${kind}: ${through} of ${tested} sight lines pass through the body`,
+      ).toBeLessThan(0.005);
+    }
+  }, 120000);
 });

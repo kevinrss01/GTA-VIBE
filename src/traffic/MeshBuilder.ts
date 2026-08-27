@@ -222,6 +222,98 @@ export class VehicleMeshBuilder {
   }
 
   /**
+   * The inside of a wheel arch.
+   *
+   * A generated body arrives as a single closed-ish SURFACE with no interior,
+   * and `detectAndCutWheels` then opens a disc in each flank to make room for
+   * a wheel that can actually turn. Nothing was behind that disc, so from any
+   * low angle beside a car you looked straight through the arch into an empty
+   * shell - the far bodywork is back-facing and gets culled, so what you saw
+   * was a black hole ringing every wheel. This is the surface that goes behind
+   * it, and it is the same thing a real car has there: a wheel well.
+   *
+   * It is a strip of the cylinder the cut swept, drawn just inside the radius
+   * of the opening so it can never poke back out through the bodywork, closed
+   * at the inboard end by a fan. The sweep runs from ground level in front of
+   * the wheel, over the top, down to ground level behind it, because that is
+   * exactly the part of the opening a viewer outside the car can see through.
+   *
+   * The normals face the axle: the visible side of a wheel well is always its
+   * inside.
+   */
+  wheelWell(
+    side: -1 | 1,
+    archZ: number,
+    centreY: number,
+    radius: number,
+    capRadius: number,
+    capBottom: number,
+    capTop: number,
+    xInner: number,
+    xOuter: number,
+    style: SurfaceStyle,
+    segments = 14,
+  ): void {
+    if (radius < 1e-3 || xOuter <= xInner) return;
+    // Stop where the well would go under the road. Below this the tyre and the
+    // road surface itself are what close the gap.
+    const CLEARANCE = 0.02;
+    const lowest = Math.max(-1, Math.min(1, (CLEARANCE - centreY) / radius));
+    const from = Math.asin(lowest);
+    const to = Math.PI - from;
+
+    const inner = side * xInner;
+    const outer = side * xOuter;
+    const rim: number[] = [];
+    let previous: { i0: number; i1: number; ny: number; nz: number } | null = null;
+    for (let j = 0; j <= segments; j += 1) {
+      const angle = from + ((to - from) * j) / segments;
+      const y = centreY + Math.sin(angle) * radius;
+      const z = archZ + Math.cos(angle) * radius;
+      const ny = -Math.sin(angle);
+      const nz = -Math.cos(angle);
+      const i0 = this.pushVertex(inner, y, z, 0, ny, nz, style);
+      const i1 = this.pushVertex(outer, y, z, 0, ny, nz, style);
+      rim.push(i0);
+      if (previous) {
+        // Wound so the visible face is the one looking back at the axle. The
+        // near side of the car is mirrored, so the order has to swap with it.
+        if (side > 0) this.index.push(previous.i0, previous.i1, i1, previous.i0, i1, i0);
+        else this.index.push(previous.i0, i1, previous.i1, previous.i0, i0, i1);
+      }
+      previous = { i0, i1, ny, nz };
+    }
+
+    void rim;
+    // The inner wing: the plate that closes the well on the cabin side.
+    //
+    // It is deliberately BIGGER than the well, and that is the whole reason it
+    // is a plate rather than a disc capping the tube. The cut drops a triangle
+    // whenever its centroid falls inside the wheel, so the opening it leaves is
+    // larger than the circle it swept by most of a triangle - and a viewer
+    // looking straight down the axle line sees past the tube through exactly
+    // that margin. Measured on the crossover, a disc flush with the tube left
+    // 5.7 per cent of the body's sight lines open and every one of them ran
+    // parallel to the axle. Inboard there is nothing to collide with, so the
+    // plate simply covers the opening and the margin with it.
+    // Clipped to the bodywork it hides behind. Left unclipped it hung below
+    // the sills as a pair of skirts, visible from across the street: a plate
+    // that fixes a hole you can only see from underneath is not worth a slab
+    // of black sticking out of a car in plain view.
+    const top = Math.min(centreY + capRadius, capTop);
+    const bottom = Math.max(capBottom, centreY - capRadius);
+    if (top <= bottom) return;
+    this.quad(
+      [inner, bottom, archZ - capRadius],
+      [inner, bottom, archZ + capRadius],
+      [inner, top, archZ + capRadius],
+      [inner, top, archZ - capRadius],
+      style,
+      [side, 0, 0],
+    );
+  }
+
+  /**
    * Flat-shaded quad.
    *
    * `outward` is a hint at which way the face should look. Pass it for anything
