@@ -1168,3 +1168,35 @@ describe('robustness', () => {
     expect(musicFetches()).toHaveLength(0);
   });
 });
+
+describe('the listener cannot take the game down with it', () => {
+  /*
+   * `AudioParam.value` throws on a non-finite number, and the listener is
+   * updated from inside the frame loop - so one NaN reaching it stops
+   * rendering, input and the simulation, not just the sound. Found by handing
+   * it a NaN position from a QA harness; the fix is that the audio layer is
+   * the wrong place to discover that something upstream produced one.
+   */
+  it('ignores a non-finite pose instead of throwing', async () => {
+    const audio = new AudioDirector();
+    await audio.unlock();
+    const good = {
+      x: 10, y: 1.7, z: 20, forwardX: 0, forwardZ: -1,
+      district: 'harbourside' as const, surface: 'pavement' as const,
+      indoors: false, speed: 0,
+    };
+    audio.update(1 / 60, good);
+    for (const bad of [
+      { ...good, x: Number.NaN },
+      { ...good, y: Number.POSITIVE_INFINITY },
+      { ...good, z: Number.NaN },
+      { ...good, forwardX: Number.NaN },
+      { ...good, forwardZ: Number.NEGATIVE_INFINITY },
+    ]) {
+      expect(() => audio.update(1 / 60, bad)).not.toThrow();
+    }
+    // And it is still working afterwards.
+    expect(() => audio.update(1 / 60, good)).not.toThrow();
+    audio.dispose();
+  });
+});

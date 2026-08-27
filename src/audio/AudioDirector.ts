@@ -741,6 +741,27 @@ export class AudioDirector implements AudioBusHost {
   private updateListener(state: ListenerState): void {
     const listener = (this.ctx as AudioContext).listener;
 
+    /*
+     * A non-finite listener position must not be able to kill the game.
+     *
+     * `AudioParam.value` THROWS on NaN or Infinity - "The provided float value
+     * is non-finite" - and this runs inside the frame loop, so one bad number
+     * anywhere upstream takes down rendering, input and the simulation with it
+     * rather than making the sound wrong for a frame. Nothing should ever hand
+     * us one, and the audio layer is the wrong place to find out that
+     * something did: the last good pose is kept and the frame carries on.
+     */
+    if (
+      !Number.isFinite(state.x) ||
+      !Number.isFinite(state.y) ||
+      !Number.isFinite(state.z) ||
+      !Number.isFinite(state.forwardX) ||
+      !Number.isFinite(state.forwardZ) ||
+      !Number.isFinite(state.forwardY ?? 0)
+    ) {
+      return;
+    }
+
     // The modern AudioParam interface where available, the deprecated setters
     // otherwise; Safari only grew the former relatively recently.
     const forwardY = state.forwardY ?? 0;

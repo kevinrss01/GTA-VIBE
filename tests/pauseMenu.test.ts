@@ -646,3 +646,31 @@ describe('the dialog itself', () => {
     }
   });
 });
+
+describe('a tab panel that is hidden stays hidden', () => {
+  /*
+   * Tab panels are hidden with the `hidden` ATTRIBUTE, which the user-agent
+   * stylesheet turns into `display: none` at the lowest specificity there is.
+   * Any rule that sets `display` on a panel by class therefore beats it and
+   * leaves that panel drawn on top of the one the player chose - which is
+   * exactly what happened to the Map tab, and what TesterArmy caught.
+   *
+   * jsdom does not apply the real user-agent sheet, so this asserts the
+   * mechanism the CSS depends on rather than the computed style: exactly one
+   * panel is ever un-hidden, and it is the selected one.
+   */
+  it('leaves exactly one panel showing, and it is the selected tab', () => {
+    const { menu: pause } = mount();
+    pause.show();
+    for (const name of ['mission', 'map', 'controls', 'audio', 'graphics', 'gameplay', 'access'] as const) {
+      pause.show(name);
+      const panels = [...pause.element.querySelectorAll('[role="tabpanel"]')];
+      const shown = panels.filter((p) => !(p as HTMLElement).hidden);
+      expect(shown, `${name}: ${shown.length} panels visible`).toHaveLength(1);
+      const selected = [...pause.element.querySelectorAll('[role="tab"]')].filter(
+        (t) => t.getAttribute('aria-selected') === 'true',
+      );
+      expect(selected).toHaveLength(1);
+    }
+  });
+});

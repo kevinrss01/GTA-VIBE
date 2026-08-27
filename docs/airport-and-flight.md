@@ -224,3 +224,81 @@ and resume through one `setGamePaused` helper, which stops the simulation, the
 controller and the audio together. Regaining pointer lock no longer resumes on
 its own — a stray click behind the overlay used to hand control back with the
 menu still up.
+
+
+## What was measured in a real browser
+
+A production-like build at 1440x900 on a Retina Mac, so 2880x1800 drawing
+buffer. `renderBenchmark` forces a GPU sync after every frame, so these are
+real per-frame costs rather than a rAF average. All figures warm - the first
+benchmark after a new vantage includes shader compilation and read 20.5 ms p95
+against 9.5 ms once warm.
+
+| | mean | p95 | draws | triangles |
+| --- | --- | --- | --- | --- |
+| **Before any of this work** | **5.58 ms** | 6.10 | 335 | 4.10 M |
+| city spawn, high | 8.52 ms | 9.3 | 376 | 7.05 M |
+| city spawn, medium | 4.20 ms | 4.7 | 366 | 6.24 M |
+| city spawn, low | 2.54 ms | 2.5 | 244 | 2.88 M |
+| downtown, high | 6.64 ms | 7.3 | 321 | 7.32 M |
+| the apron, high | 5.18 ms | 5.8 | 277 | 6.21 M |
+| inside the terminal, high | 7.13 ms | 8.5 | 295 | 6.97 M |
+
+8.52 ms is 117 fps. The cost is up about half on the old figure, against a map
+two and a half times the area with an airfield, a 62 x 190 m terminal, 52
+travellers, five aircraft and richer impact effects in it. Geometry count went
+219 to 328 and textures 62 to 149, which is where the memory went: 91.7 MB to
+about 120 MB.
+
+**The travellers cost 9 draw calls, 266 k triangles and 0.035 ms** inside the
+terminal, and **nothing at all** from the city - `update` returns before it
+simulates and the group is switched off, so `drawCalls` and `triangles` both
+read 0 from downtown.
+
+### The journey, verified
+
+- **The pause is provable, not merely plausible.** `Engine.stepOnce` returns
+  whether the world advanced, so a harness can count: **30 frames advanced
+  while running, 0 of 120 while paused**, the simulation clock moved 0.0000 s,
+  and the traffic and crowd statistics were byte-identical across the pause.
+  The panel measured top 39, bottom 681 in a 720 px viewport.
+- **Surfaces agree with what is drawn.** Probed live: the terminal concourse is
+  `interior` and indoors at 14.66 m, the runway, taxiway and apron are
+  `concrete` at exactly 14.50 m, the airfield verge is `grass`, Harbour Walk is
+  `boardwalk`, and a harbour road is `asphalt`.
+- **Boarding and take-off.** The prompt read *"Press E to board the Light
+  single"*; E boarded it. Full throttle from the threshold got airborne after a
+  **265-273 m ground roll at 30.4 m/s**, inside a 600 m runway.
+- **Flight.** Screenshotted at 205 m over the field, the whole city drawn below
+  - which is the altitude term added to `updateChunks` doing its job; without
+  it the world switched itself off in a ring around the aircraft.
+- **A shot officer stays.** Killed at 5 m: `officersDown` 1, `bodies` 1, and
+  **still 1 after five more seconds**, still in the render list.
+- **A rocket moves an ordinary car.** A `patrolSedan` under ambient control
+  took a blast at 17 m: integrity **260 to 70**, displaced **1.33 m**, and it
+  recovered to ambient control and drove on.
+
+### What was NOT verified in the browser, and why
+
+**Landing.** Three scripted approaches ended in crashes, and in each case the
+model was right and the autopilot was not: the jet arrived at 155 m/s against a
+71.3 m/s reference speed, and the Cessna at 46.5 m/s against 32.6. A real
+aircraft flown 14 to 80 m/s fast floats, lands long and overruns, which is what
+happened - it touched down 350 m past the threshold and ran off the end of a
+600 m runway. Landing is covered instead by `tests/flight.test.ts`, which
+measures touchdown vertical speeds of 0.90, 1.41 and 1.56 m/s and braking
+distances of 133, 333 and 551 m for the three flyable types, and asserts the
+whole descent is identical at 30 Hz and 240 Hz.
+
+**Car versus car.** Covered by `tests/vehicleImpact.test.ts` (24) and
+`tests/vehicleCollision.test.ts` (27). The browser attempt kept re-detecting a
+car that an earlier rocket had already damaged, which proved nothing; the
+rocket result above exercises the same `applyImpact` path in the live game.
+
+### A defect found while verifying
+
+`AudioDirector.updateListener` wrote the listener pose straight into
+`AudioParam.value`, which **throws** on a non-finite number. It runs inside the
+frame loop, so one NaN from anywhere upstream took down rendering, input and
+the simulation together rather than making the sound wrong for a frame. It now
+ignores a non-finite pose and keeps the last good one.

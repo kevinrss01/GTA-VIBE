@@ -1542,6 +1542,31 @@ async function boot(): Promise<void> {
       get traffic(): unknown {
         return traffic.stats;
       },
+      /**
+       * Vehicles near a point, with the fields that say whether one has been
+       * hit: where it is, which way it is facing, how bent it is, and whether
+       * it is still driving itself. Allocates, so it is for verification only
+       * and never for the frame loop.
+       */
+      vehiclesNear(x: number, z: number, radius = 30): unknown[] {
+        const found: unknown[] = [];
+        traffic.forEachNear(x, z, radius, (view) => {
+          found.push({
+            id: view.id,
+            kind: view.kind,
+            x: view.x,
+            y: view.y,
+            z: view.z,
+            yaw: view.yaw,
+            speed: view.speed,
+            control: view.control,
+            integrity: view.integrity,
+            damage: view.damage,
+            overturned: view.overturned,
+          });
+        });
+        return found;
+      },
       /** Live crowd state, for automated QA. */
       get crowd(): unknown {
         return pedestrians.stats;

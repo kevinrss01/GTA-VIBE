@@ -1944,12 +1944,20 @@ body.mb-map-open .mb-hud__vitals {
  * The Map tab is the one panel that wants all of the height it can get; every
  * other tab is text that flows. `.mb-pause__view` is the scroll container, so
  * the panel inside it is what has to stretch.
+ *
+ * `:not([hidden])` IS LOAD-BEARING, on both rules. Tab panels are hidden with
+ * the `hidden` attribute, which the user-agent stylesheet turns into
+ * `display: none` at the lowest possible specificity - so a bare
+ * `.mb-pause__panel-map { display: flex }` is a class selector that beats it,
+ * and the map was drawn on top of whichever tab the player had actually
+ * chosen. Found by TesterArmy: it selected Controls and reported the
+ * keybindings were behind the map.
  */
-.mb-pause__view:has(> .mb-pause__panel-map) {
+.mb-pause__view:has(> .mb-pause__panel-map:not([hidden])) {
   overflow: hidden;
 }
 
-.mb-pause__panel-map {
+.mb-pause__panel-map:not([hidden]) {
   display: flex;
   flex-direction: column;
   height: 100%;
