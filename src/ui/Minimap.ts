@@ -574,6 +574,48 @@ export class Minimap {
     ctx.restore();
   }
 
+  /**
+   * Draws the whole-city map into somebody else's canvas.
+   *
+   * The pause menu's Map tab needs the same picture the `M` overlay shows, and
+   * cannot simply borrow that overlay: it is a full-screen layer at z-index 30
+   * and the pause menu sits at 60, so it would be drawn behind the menu.
+   *
+   * This shares the cached static layer with the overlay - the city is
+   * rasterised once at start-up and never redrawn - so the cost is one
+   * `drawImage` plus the markers, whatever it is drawn into. The caller owns
+   * the canvas and its size; the aspect it should use is `mapAspect`.
+   */
+  drawInto(canvas: HTMLCanvasElement): void {
+    if (this.disposed) return;
+    const { width, height } = canvas;
+    if (width === 0 || height === 0) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    if (this.expandedCache.width !== width || this.expandedCache.height !== height) {
+      // `buildExpandedCache` reads the overlay canvas's own size, so the two
+      // are kept in step by sizing the overlay to match before rebuilding.
+      this.overlayCanvas.width = width;
+      this.overlayCanvas.height = height;
+      this.buildExpandedCache();
+    }
+    ctx.clearRect(0, 0, width, height);
+    ctx.drawImage(this.expandedCache, 0, 0);
+    const scale = width / this.bounds.width;
+    const point = worldToMap(this.playerX, this.playerZ, this.bounds, scale);
+    this.drawPlayer(ctx, point.x, point.y, this.dpr * 1.35, 30);
+    this.drawMarkers(
+      ctx,
+      (wx: number, wz: number) => worldToMap(wx, wz, this.bounds, scale),
+      this.dpr,
+    );
+  }
+
+  /** Width over depth of the whole-city map, for sizing a canvas to hold it. */
+  get mapAspect(): number {
+    return this.bounds.width / this.bounds.depth;
+  }
+
   private renderExpanded(): void {
     const ctx = this.overlayCtx;
     const { width, height } = this.overlayCanvas;

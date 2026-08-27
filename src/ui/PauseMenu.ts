@@ -360,6 +360,8 @@ export class PauseMenu {
     mission.append(this.buildMission());
 
     const map = this.section('map');
+    // The one tab that wants all of the panel's height rather than flowing.
+    map.classList.add('mb-pause__panel-map');
     this.mapPanel = document.createElement('div');
     this.mapPanel.className = 'mb-pause__map';
     this.mapEmpty = document.createElement('p');

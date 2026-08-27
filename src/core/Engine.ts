@@ -370,11 +370,25 @@ export class Engine {
    * stops, which makes every measurement read as "nothing moved". This lets a
    * test drive the real update path deterministically instead.
    */
-  stepOnce(dt: number): void {
-    if (this.disposed) return;
+  /**
+   * Runs one frame, and reports whether the world actually moved.
+   *
+   * A paused engine renders and returns false. That is the same rule the rAF
+   * loop follows, and it has to be: a harness that could step a paused world
+   * would be testing a path no player can reach, and could not tell a working
+   * pause from a broken one - which is the single thing it most needs to be
+   * able to check.
+   */
+  stepOnce(dt: number): boolean {
+    if (this.disposed) return false;
     this.renderer.info.reset();
+    if (this.paused) {
+      this.renderFrame();
+      return false;
+    }
     this.onUpdate?.(dt, (this.simTime += dt));
     this.renderFrame();
+    return true;
   }
 
   /**

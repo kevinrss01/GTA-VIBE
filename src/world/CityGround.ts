@@ -26,6 +26,7 @@ import {
   type DistrictId,
 } from './CityPlan';
 import { airportSurfaceAt } from './airport/plan';
+import { TERMINAL, inRect } from './airport/layout';
 import { groundElevation, landElevation, SEA_LEVEL, shorelineX, WORLD_BOUNDS } from './elevation';
 
 export type SurfaceId =
@@ -254,8 +255,21 @@ export class CityGround {
   }
 
   /** True where a building stands, i.e. where the player cannot walk outdoors. */
+  /**
+   * True where the player is under a roof.
+   *
+   * Parcels answer for the city. The terminal is not a parcel - it is authored
+   * by the airport rather than subdivided out of a block - so it has to be
+   * asked for separately, or standing in the middle of a 62 by 190 metre
+   * building reads as being outdoors. That is not cosmetic: `indoors` is what
+   * switches the interior ambience bed on and ducks the street and the sea.
+   *
+   * The margin has the same sense it does for a parcel: negative to shrink,
+   * which is how callers ask "well inside" rather than "touching the wall".
+   */
   isBuilt(x: number, z: number, margin = 0): boolean {
-    return this.parcelAt(x, z, margin) !== null;
+    if (this.parcelAt(x, z, margin) !== null) return true;
+    return inRect(TERMINAL, x, z, margin);
   }
 
   /**

@@ -461,6 +461,11 @@ async function boot(): Promise<void> {
     },
     onVolumeChange: (channel, value) => audio.setVolume(channel, value),
     onSensitivityChange: (radiansPerPixel) => controller.setSensitivity(radiansPerPixel),
+    // Drawn on demand rather than every frame: the world is frozen behind the
+    // menu, so the map cannot go out of date while it is open.
+    onTabChange: (tab) => {
+      if (tab === 'map') drawPauseMap();
+    },
     onResume: () => {
       pause.hide();
       setGamePaused(false);
@@ -482,6 +487,53 @@ async function boot(): Promise<void> {
   // the air. Passed in rather than imported by the menu, so the UI layer keeps
   // no dependency on the flight model.
   pause.setControlSections([{ title: 'In the air', hints: FLIGHT_CONTROLS }]);
+
+  /*
+   * The Map tab shows the same whole-city picture the `M` overlay does.
+   *
+   * It cannot borrow the overlay itself: that is a full-screen layer at
+   * z-index 30 and the pause menu is at 60, so it would be drawn behind the
+   * menu. Instead the minimap draws into a canvas the menu owns, sharing the
+   * static layer it rasterised once at start-up - so this costs one blit plus
+   * the markers, and only on the frame the tab is opened.
+   */
+  const pauseMap = document.createElement('canvas');
+  pauseMap.className = 'mb-pause__mapcanvas';
+  pause.mapPanel.append(pauseMap);
+  /*
+   * Painted whenever the tab actually HAS a box, not when it is asked for.
+   *
+   * `onTabChange` fires while the outgoing panel is still the laid-out one, so
+   * measuring there returns zero and the canvas is sized to nothing. Waiting a
+   * frame is not reliable either: a pane that is not compositing delivers no
+   * `requestAnimationFrame` at all, and the timer that backs it up can still
+   * beat the layout. A `ResizeObserver` fires exactly when the panel gets its
+   * size, which is the event this actually depends on - and it covers the
+   * window being resized with the map open for free.
+   */
+  const mapObserver = new ResizeObserver(() => paintPauseMap());
+  mapObserver.observe(pause.mapPanel);
+  const drawPauseMap = (): void => paintPauseMap();
+
+  function paintPauseMap(): void {
+    if (!pause.visible || pause.tab !== 'map') return;
+    const box = pause.mapPanel.getBoundingClientRect();
+    if (box.width < 8 || box.height < 8) return;
+    const ratio = Math.min(window.devicePixelRatio || 1, 2);
+    // Fit the city's own aspect inside whatever the tab gives us.
+    const aspect = minimap.mapAspect;
+    let cssWidth = box.width;
+    let cssHeight = cssWidth / aspect;
+    if (cssHeight > box.height) {
+      cssHeight = box.height;
+      cssWidth = cssHeight * aspect;
+    }
+    pauseMap.style.width = `${Math.round(cssWidth)}px`;
+    pauseMap.style.height = `${Math.round(cssHeight)}px`;
+    pauseMap.width = Math.max(1, Math.round(cssWidth * ratio));
+    pauseMap.height = Math.max(1, Math.round(cssHeight * ratio));
+    minimap.drawInto(pauseMap);
+  }
 
   document.body.appendChild(hud.element);
   document.body.appendChild(minimap.element);
@@ -855,6 +907,7 @@ async function boot(): Promise<void> {
     if (pause.visible) return;
     pause.show();
     setGamePaused(true);
+    if (pause.tab === 'map') drawPauseMap();
   };
 
   document.addEventListener('pointerlockchange', () => {
@@ -1228,6 +1281,7 @@ async function boot(): Promise<void> {
     policeAudio.dispose();
     damageFeedback.dispose();
     dialogue.dispose();
+    mapObserver.disconnect();
     mission.dispose();
     for (const person of missionCast) person.character.dispose();
     shop.dispose();
@@ -1411,8 +1465,17 @@ async function boot(): Promise<void> {
        * calls, which stops `requestAnimationFrame` and makes the whole game
        * look frozen. This runs the same update path the loop runs.
        */
-      step(frames = 60, dt = 1 / 60): void {
-        for (let i = 0; i < frames; i += 1) engine.stepOnce(dt);
+      /**
+       * Drives real frames outside `requestAnimationFrame`, and says how many
+       * of them the world actually advanced through. A backgrounded or
+       * non-compositing pane delivers no rAF at all, so this is the only way
+       * to measure the simulation from a browser harness - and the returned
+       * count is what makes a pause provable rather than merely plausible.
+       */
+      step(frames = 60, dt = 1 / 60): number {
+        let advanced = 0;
+        for (let i = 0; i < frames; i += 1) if (engine.stepOnce(dt)) advanced += 1;
+        return advanced;
       },
       /** Money, health, weapons and wanted level, for automated QA. */
       get player(): unknown {

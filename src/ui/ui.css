@@ -878,9 +878,21 @@ body.mb-map-open .mb-hud__readout {
  */
 .mb-pause__map {
   display: flex;
+  align-items: center;
   justify-content: center;
-  /* Whatever is dropped in here is sized by its owner, not by this panel. */
-  overflow: auto;
+  /*
+   * Fills the tab so the map can use the whole panel.
+   *
+   * Meridian Bay is now half as wide as it is deep - the airfield runs a long
+   * way south of the city - so a full-city map is a tall, narrow picture and
+   * is sized by its HEIGHT. Leaving this to shrink-wrap its contents gave the
+   * canvas 152 px to work with in a 400 px panel and drew a map nobody could
+   * read. Its owner still decides the aspect; this only says how much room
+   * there is.
+   */
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .mb-pause__map:empty {
@@ -1910,4 +1922,36 @@ body.mb-map-open .mb-hud__vitals {
   .mb-shop__fill {
     transition: none;
   }
+}
+
+/*
+ * The whole-city map inside the pause menu's Map tab.
+ *
+ * The canvas is sized in script to the city's own aspect, so the rule only has
+ * to centre it and stop it overflowing the tab.
+ */
+.mb-pause__mapcanvas {
+  display: block;
+  margin: 0 auto;
+  max-width: 100%;
+  max-height: 100%;
+  border: 1px solid var(--mb-line);
+  border-radius: var(--mb-radius);
+  background: var(--mb-panel-solid);
+}
+
+/*
+ * The Map tab is the one panel that wants all of the height it can get; every
+ * other tab is text that flows. `.mb-pause__view` is the scroll container, so
+ * the panel inside it is what has to stretch.
+ */
+.mb-pause__view:has(> .mb-pause__panel-map) {
+  overflow: hidden;
+}
+
+.mb-pause__panel-map {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
 }
