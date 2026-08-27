@@ -58,9 +58,14 @@ describe('the launcher', () => {
     }
   });
 
-  it('costs more than the player starts with', () => {
+  it('is the most expensive thing in the shop, and affordable from the start', () => {
+    const dearest = ALL_WEAPONS.reduce(
+      (best, id) => (WEAPONS[id].price > WEAPONS[best].price ? id : best),
+      ALL_WEAPONS[0] ?? 'pistol',
+    );
+    expect(dearest).toBe('launcher');
     const player = new PlayerState();
-    expect(player.canAfford(WEAPONS.launcher.price)).toBe(false);
+    expect(player.canAfford(WEAPONS.launcher.price)).toBe(true);
   });
 
   /*

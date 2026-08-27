@@ -140,8 +140,18 @@ export const WEAPONS: Readonly<Record<WeaponId, WeaponSpec>> = {
 
 export const ALL_WEAPONS: readonly WeaponId[] = ['pistol', 'smg', 'shotgun', 'rifle', 'launcher'];
 
-/** Enough to buy a sidearm and shells, not enough to buy the shop out. */
-export const STARTING_MONEY = 6500;
+/**
+ * Enough to walk out of Bellhouse Arms carrying everything, with change.
+ *
+ * The five weapons total 18,300 and one refill of every kind of ammunition is
+ * another 1,590, so this leaves about six and a half thousand for reloads -
+ * five spare rockets, or dozens of magazines for anything else.
+ *
+ * It used to be 6,500, which bought a sidearm and shells and made the carbine
+ * and the launcher things you had to come back for. That was a deliberate
+ * shape and the player asked for it to go: they want to buy the guns.
+ */
+export const STARTING_MONEY = 25_000;
 
 /** Rounds one ammunition purchase buys, which is a magazine unless stated. */
 export function ammoBundleFor(spec: WeaponSpec): number {

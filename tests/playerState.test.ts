@@ -27,10 +27,22 @@ describe('player economy', () => {
     for (const id of ALL_WEAPONS) expect(p.owns(id)).toBe(false);
   });
 
-  it('can afford the cheapest weapon but not the whole shop', () => {
-    const total = ALL_WEAPONS.reduce((sum, id) => sum + WEAPONS[id].price, 0);
-    expect(STARTING_MONEY).toBeGreaterThan(WEAPONS.pistol.price);
-    expect(STARTING_MONEY).toBeLessThan(total);
+  /*
+   * The player starts able to buy the whole armoury and still have money for
+   * ammunition. This used to be the opposite - enough for a sidearm and
+   * shells, with the carbine and the launcher out of reach - and the change
+   * was asked for, so it is pinned here rather than left to drift back.
+   */
+  it('can afford the whole shop, and ammunition afterwards', () => {
+    const guns = ALL_WEAPONS.reduce((sum, id) => sum + WEAPONS[id].price, 0);
+    const refill = ALL_WEAPONS.reduce((sum, id) => sum + WEAPONS[id].ammoPrice, 0);
+    expect(STARTING_MONEY).toBeGreaterThan(guns + refill);
+
+    // Not merely on paper: buy every one of them through the real economy.
+    const p = new PlayerState();
+    for (const id of ALL_WEAPONS) expect(p.buyWeapon(id), id).toBe(true);
+    for (const id of ALL_WEAPONS) expect(p.buyAmmo(id), id).toBe(true);
+    expect(p.money).toBeGreaterThan(0);
   });
 
   it('buys a weapon once, with a magazine, and equips the first one', () => {
