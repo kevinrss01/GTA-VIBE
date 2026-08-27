@@ -80,6 +80,13 @@ const TURN_RATE = 0.55;
  */
 const DISPLAY_YAW_OFFSET = -Math.PI / 2 + 0.45;
 
+/**
+ * How much of a long weapon's wasted frame to give back, per unit of aspect
+ * ratio past a pistol's, and the ceiling on it.
+ */
+const ELONGATION_GAIN = 0.16;
+const MAX_ELONGATION_GAIN = 1.55;
+
 interface Entry {
   readonly url: string;
   /** Rotation that lays the model nose-along -Z before the turntable swing. */
@@ -382,7 +389,20 @@ export class WeaponPreview {
     // 1.0 is the radius the camera at z = 3 with a 28-degree field frames with
     // a comfortable margin; anything longer than it is wide still fits because
     // the sphere, not the length, is what is normalised.
-    const scale = sphere.radius > 1e-5 ? 1.15 / sphere.radius : 1;
+    //
+    // A bounding sphere is the right fit for a compact object and a wasteful
+    // one for a long thin object: the launch tube's sphere is set by its
+    // length, so the pistol fills the case and the launcher sat in the middle
+    // of it at a third the size. `ELONGATION_GAIN` gives back a share of that
+    // for the elongated ones only - the pistol's aspect is 1.4 and its frame
+    // is unchanged to within four per cent, while a 4.6:1 tube is drawn half
+    // as large again. Capped, because at some point the turntable would swing
+    // it out of shot.
+    const extent = box.getSize(new Vector3());
+    const dimensions = [extent.x, extent.y, extent.z].sort((a, b) => b - a);
+    const aspect = (dimensions[1] ?? 0) > 1e-5 ? (dimensions[0] ?? 0) / (dimensions[1] ?? 1) : 1;
+    const gain = Math.min(MAX_ELONGATION_GAIN, 1 + Math.max(0, aspect - 1.4) * ELONGATION_GAIN);
+    const scale = sphere.radius > 1e-5 ? (1.15 * gain) / sphere.radius : 1;
     inner.scale.setScalar(scale);
     inner.updateMatrixWorld(true);
 

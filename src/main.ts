@@ -859,15 +859,6 @@ async function boot(): Promise<void> {
     for (const chunk of chunks) chunk.dispose();
   });
 
-  // TEMPORARY performance-investigation hook. Remove before finishing.
-  (window as unknown as Record<string, unknown>).__dev = {
-    scene: engine.scene,
-    renderer: engine.renderer,
-    camera: engine.camera,
-    lighting,
-    chunks,
-  };
-
   // Expose a small read-only handle so automated QA can assert on real state
   // instead of scraping pixels, and can drive the camera to a known vantage
   // point without depending on synthetic key events being delivered.
