@@ -394,3 +394,65 @@ describe('what the traffic layer is offered so it can brake', () => {
     }
   });
 });
+
+/*
+ * An explosion is not a very large bullet.
+ *
+ * `CombatSystem.detonate` resolves the DAMAGE first, and a civilian it kills is
+ * taken down through `downAt` with no throw at all - correct for a bullet, and
+ * wrong for the middle of a fireball. The blast impulse arrives afterwards and
+ * has to reach a body that is already on the ground, or everybody an explosion
+ * kills simply folds up where they stood.
+ */
+describe('a blast', () => {
+  /**
+   * `blastAt` searches the crowd's spatial hash, which `update` rebuilds, so a
+   * pedestrian placed by hand has to be indexed before it can be found.
+   */
+  const settle = (crowd: Crowd, px: number, pz: number): void => {
+    crowd.update(1 / 240, { x: px, y: 0, z: pz, time: 0 });
+  };
+
+  it('throws everybody inside it away from the seat of it', () => {
+    const { crowd, ped, px, pz } = stage();
+    settle(crowd, px, pz);
+    const moved = crowd.blastAt(ped.x - 2, ped.z, 8);
+    expect(moved).toBeGreaterThan(0);
+    expect(ped.state).toBe('down');
+    // Thrown outwards: the blast was to the -X side, so the body goes +X.
+    expect(ped.vx).toBeGreaterThan(0.5);
+  });
+
+  it('still throws a body the damage already put on the ground', () => {
+    const { crowd, ped, px, pz } = stage();
+    settle(crowd, px, pz);
+    // What a lethal hit does: down, fatal, and completely still.
+    crowd.knockDown(ped, -Math.sin(ped.heading), -Math.cos(ped.heading), 0, true);
+    expect(ped.state).toBe('down');
+    expect(Math.hypot(ped.vx, ped.vz)).toBeLessThan(1e-6);
+
+    crowd.blastAt(ped.x - 2, ped.z, 8);
+    expect(Math.hypot(ped.vx, ped.vz)).toBeGreaterThan(0.5);
+    // ...and it stays dead. A blast moves a corpse; it does not revive one.
+    expect(ped.state).toBe('down');
+    expect(ped.fatal).toBe(true);
+  });
+
+  it('does not re-topple a body for an ordinary second bullet', () => {
+    const { crowd, ped } = stage();
+    crowd.knockDown(ped, 1, 0, 0, false);
+    const sign = ped.fallSign;
+    crowd.knockDown(ped, -1, 0, 9, true);
+    // Unchanged: no new direction, no new throw, and not upgraded to fatal.
+    expect(ped.fallSign).toBe(sign);
+    expect(ped.fatal).toBe(false);
+    expect(Math.hypot(ped.vx, ped.vz)).toBeLessThan(1e-6);
+  });
+
+  it('leaves anybody outside the radius standing', () => {
+    const { crowd, ped, px, pz } = stage();
+    settle(crowd, px, pz);
+    crowd.blastAt(ped.x + 40, ped.z, 8);
+    expect(ped.state).not.toBe('down');
+  });
+});

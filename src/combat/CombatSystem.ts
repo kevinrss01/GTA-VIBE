@@ -278,6 +278,17 @@ export class CombatSystem {
   private recoilPitch = 0;
   private recoilYaw = 0;
   private dryClick = 0;
+  /**
+   * Where the player was on the last frame.
+   *
+   * Latched because a blast has to be measured from the PLAYER and the camera
+   * is not always where they are: the driving layer's camera is a chase boom
+   * 6.6 m behind the car, so a rocket that landed on the bonnet would have
+   * measured six metres away and left the driver unhurt.
+   */
+  private playerX = 0;
+  private playerY = 0;
+  private playerZ = 0;
   private paused = false;
   private disposed = false;
 
@@ -515,6 +526,9 @@ export class CombatSystem {
   update(dt: number, ctx: CombatContext): void {
     if (this.disposed) return;
 
+    this.playerX = ctx.playerX;
+    this.playerY = ctx.playerY;
+    this.playerZ = ctx.playerZ;
     this.witnesses?.refresh(dt);
     this.armoury.update(dt);
     if (this.dryClick > 0) this.dryClick = Math.max(0, this.dryClick - dt);
@@ -1022,10 +1036,13 @@ export class CombatSystem {
     this.counters.hits += civiliansHurt + civiliansKilled + officersHurt + officersKilled;
 
     // The player is not immune to their own rocket. Standing next to what you
-    // just fired at is a decision with a consequence, not a free shot.
-    const camera = this.options.camera;
-    const self = Math.hypot(camera.position.x - x, camera.position.y - 1 - y, camera.position.z - z);
-    if (self < radius && player.alive) player.hurt(peak * 0.55 * blastFalloff(self / radius));
+    // just fired at is a decision with a consequence, not a free shot. Measured
+    // from where the PLAYER is - see `playerX` - and to the middle of them,
+    // the same way everybody else in the radius is measured.
+    const self = Math.hypot(this.playerX - x, this.playerY + 0.9 - y, this.playerZ - z);
+    if (self < radius && player.alive) {
+      player.hurt(peak * 0.55 * blastFalloff(self / radius), x, z);
+    }
 
     this.options.onExplosion?.(x, y, z, radius, self);
   }

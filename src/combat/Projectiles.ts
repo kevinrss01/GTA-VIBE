@@ -232,16 +232,35 @@ export class Projectiles {
         const dirX = rocket.vx / speed;
         const dirY = rocket.vy / speed;
         const dirZ = rocket.vz / speed;
-        // The whole of the step is tested, every step, once the fuse is armed.
-        // Before that nothing is - see `ARMING_DISTANCE`.
-        if (rocket.travelled >= ARMING_DISTANCE) {
-          const hit = this.options.probe(rocket.x, rocket.y, rocket.z, dirX, dirY, dirZ, step);
-          if (hit >= 0 && hit < step) {
+        /*
+         * Everything past the arming distance is tested, and nothing before
+         * it, with no gap between the two.
+         *
+         * `from` is how much of THIS step is still inside the fuse. Testing
+         * the whole step only once `travelled` has already passed the
+         * threshold sounds equivalent and is not: at 46 m/s a step is 0.77 m,
+         * so the rocket clears 0.9 m two steps in and the first probe would
+         * start at 1.54 m - leaving [0.9, 1.54] crossed and never looked at.
+         */
+        const from = Math.max(0, ARMING_DISTANCE - rocket.travelled);
+        if (from < step) {
+          const reach = step - from;
+          const hit = this.options.probe(
+            rocket.x + dirX * from,
+            rocket.y + dirY * from,
+            rocket.z + dirZ * from,
+            dirX,
+            dirY,
+            dirZ,
+            reach,
+          );
+          if (hit >= 0 && hit < reach) {
+            const at = from + hit;
             this.detonate(
               rocket,
-              rocket.x + dirX * hit,
-              rocket.y + dirY * hit,
-              rocket.z + dirZ * hit,
+              rocket.x + dirX * at,
+              rocket.y + dirY * at,
+              rocket.z + dirZ * at,
             );
             continue;
           }

@@ -938,8 +938,33 @@ export class Crowd {
    * arrives here through `PedestrianSystem.downAt`, which is the hook
    * `CrowdTargets` has been waiting for.
    */
-  knockDown(ped: Pedestrian, dirX: number, dirZ: number, speed: number, fatal: boolean): void {
-    if (!ped.active || ped.state === 'down') return;
+  /**
+   * Puts somebody on the ground, thrown the way the blow came from.
+   *
+   * `again` re-throws a body that is ALREADY down, which only a blast does: a
+   * civilian an explosion killed is removed through `downAt` first, so by the
+   * time the shockwave reaches them they are lying still, and without this
+   * they collapse like a bullet victim in the middle of a fireball. Nothing
+   * else may use it - a second bullet must not re-topple a corpse.
+   */
+  knockDown(
+    ped: Pedestrian,
+    dirX: number,
+    dirZ: number,
+    speed: number,
+    fatal: boolean,
+    again = false,
+  ): void {
+    if (!ped.active) return;
+    if (ped.state === 'down' && !again) return;
+    // A body already on the ground keeps whatever killed it; a blast only
+    // moves it.
+    if (ped.state === 'down') {
+      const thrownAgain = Math.min(THROW_MAX, speed * THROW_SHARE);
+      ped.vx = dirX * thrownAgain;
+      ped.vz = dirZ * thrownAgain;
+      return;
+    }
     ped.state = 'down';
     ped.downFor = 0;
     ped.fatal = fatal;
@@ -1169,7 +1194,8 @@ export class Crowd {
         while (other >= 0) {
           const next = this.cellNext[other] ?? -1;
           const ped = this.peds[other];
-          if (ped && ped.active && ped.state !== 'down') {
+          // Deliberately NOT skipping the down: see `knockDown`'s `again`.
+          if (ped && ped.active) {
             const dx = ped.x - x;
             const dz = ped.z - z;
             const d2 = dx * dx + dz * dz;
@@ -1181,7 +1207,7 @@ export class Crowd {
               const length = distance > 0.05 ? distance : 1;
               const dirX = distance > 0.05 ? dx / length : -Math.sin(ped.heading);
               const dirZ = distance > 0.05 ? dz / length : -Math.cos(ped.heading);
-              this.knockDown(ped, dirX, dirZ, 5 + (1 - share) * 9, share <= lethalShare);
+              this.knockDown(ped, dirX, dirZ, 5 + (1 - share) * 9, share <= lethalShare, true);
               count += 1;
             }
           }

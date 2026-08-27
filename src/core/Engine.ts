@@ -349,7 +349,7 @@ export class Engine {
    */
   private renderFrame(): void {
     this.renderer.render(this.scene, this.camera);
-    if (this.overlayScene.children.length <= this.overlayFixtures) return;
+    if (!this.overlayHasContent()) return;
     this.overlayCamera.position.copy(this.camera.position);
     this.overlayCamera.quaternion.copy(this.camera.quaternion);
     // The lights hang off the camera, so its world matrix has to be current
@@ -363,6 +363,28 @@ export class Engine {
   }
 
   private stepClock = 0;
+
+  /**
+   * True when the overlay has something VISIBLE in it.
+   *
+   * Not just "something in it": the viewmodel group is added once and stays
+   * for the life of the session, and it is hidden for most of it - while
+   * driving, while dead, while holstered, and until its model has downloaded.
+   * Counting children would have run a depth clear and a second scene
+   * submission every frame of a playthrough where nobody ever bought a gun.
+   *
+   * The loop is over the scene's DIRECT children only, which is three or four
+   * objects, and it stops at the first visible one.
+   */
+  private overlayHasContent(): boolean {
+    const children = this.overlayScene.children;
+    if (children.length <= this.overlayFixtures) return false;
+    for (const child of children) {
+      if (child === this.overlayCamera) continue;
+      if (child.visible) return true;
+    }
+    return false;
+  }
 
   private collectStats(frameMs: number, rawDelta: number): void {
     this.frameTimes.push(rawDelta);

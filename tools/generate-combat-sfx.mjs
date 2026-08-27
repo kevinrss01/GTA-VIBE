@@ -2,10 +2,10 @@
 /**
  * Generates the combat sound effects with the ElevenLabs sound-generation API.
  *
- * LOCAL TOOLING ONLY. This never ships: it reads `ELEVENLABS_API_KEY` from the
- * environment (loaded from the untracked `.env`), writes MP3s into
- * `public/audio/`, and prints the measured properties the audio manifest needs.
- * The key is never written to a file, a log line or an output artefact.
+ * LOCAL TOOLING ONLY. This never ships: it takes `ELEVENLABS_API_KEY` from the
+ * environment, falling back to the repository's untracked `.env`, writes MP3s
+ * into `public/audio/`, and prints the measured properties the audio manifest
+ * needs. The key is never written to a file, a log line or an output artefact.
  *
  * Why the REST API rather than the ElevenLabs MCP: the MCP's `sfx` node
  * generates onto a shared editing canvas in variation sets, which is the wrong
@@ -19,7 +19,7 @@
  * Existing files are skipped unless named explicitly, so a rerun costs nothing.
  */
 
-import { mkdir, writeFile, access } from 'node:fs/promises';
+import { mkdir, writeFile, access, readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -305,7 +305,42 @@ async function generate(clip, key) {
   return path;
 }
 
+/**
+ * Reads the repository's untracked `.env` into `process.env`.
+ *
+ * `AGENTS.md` puts every key in that file and nowhere else, so a tool whose
+ * documented invocation is a bare `node tools/...` has to load it or the
+ * documented invocation does not work. An already-exported value always wins,
+ * so `ELEVENLABS_API_KEY=... node tools/...` still overrides the file, and
+ * nothing here ever prints a value.
+ */
+async function loadDotEnv() {
+  let text;
+  try {
+    text = await readFile(join(ROOT, '.env'), 'utf8');
+  } catch {
+    return;
+  }
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq <= 0) continue;
+    const name = trimmed.slice(0, eq).trim();
+    if (process.env[name] !== undefined) continue;
+    let value = trimmed.slice(eq + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    process.env[name] = value;
+  }
+}
+
 async function main() {
+  await loadDotEnv();
   const key = process.env.ELEVENLABS_API_KEY ?? process.env.ELEVEN_LABS_API_KEY;
   if (!key) throw new Error('ELEVENLABS_API_KEY is not set');
 

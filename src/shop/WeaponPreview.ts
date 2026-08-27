@@ -381,6 +381,23 @@ export class WeaponPreview {
     const holder = new Group();
     const inner = new Group();
     inner.add(scene);
+
+    /*
+     * Elongation is measured BEFORE the display yaw is applied, and that
+     * ordering is the whole of it.
+     *
+     * The three-quarter view turns the weapon 26 degrees off broadside, so an
+     * axis-aligned box taken after the turn spreads the length across two axes
+     * and the second-largest number is another projection of the SAME length
+     * rather than the weapon's thickness. The shipped 4.6:1 launcher measures
+     * 1.6:1 that way and gets essentially no correction at all.
+     */
+    inner.updateMatrixWorld(true);
+    const upright = new Box3().setFromObject(inner);
+    const extent = upright.getSize(new Vector3());
+    const dimensions = [extent.x, extent.y, extent.z].sort((a, b) => b - a);
+    const aspect = (dimensions[1] ?? 0) > 1e-5 ? (dimensions[0] ?? 0) / (dimensions[1] ?? 1) : 1;
+
     inner.rotation.set(0, yaw + DISPLAY_YAW_OFFSET, 0, 'YXZ');
     inner.updateMatrixWorld(true);
 
@@ -397,10 +414,7 @@ export class WeaponPreview {
     // for the elongated ones only - the pistol's aspect is 1.4 and its frame
     // is unchanged to within four per cent, while a 4.6:1 tube is drawn half
     // as large again. Capped, because at some point the turntable would swing
-    // it out of shot.
-    const extent = box.getSize(new Vector3());
-    const dimensions = [extent.x, extent.y, extent.z].sort((a, b) => b - a);
-    const aspect = (dimensions[1] ?? 0) > 1e-5 ? (dimensions[0] ?? 0) / (dimensions[1] ?? 1) : 1;
+    // it out of shot. `aspect` is measured above, before the display yaw.
     const gain = Math.min(MAX_ELONGATION_GAIN, 1 + Math.max(0, aspect - 1.4) * ELONGATION_GAIN);
     const scale = sphere.radius > 1e-5 ? (1.15 * gain) / sphere.radius : 1;
     inner.scale.setScalar(scale);
