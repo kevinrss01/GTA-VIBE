@@ -62,6 +62,33 @@ payout are covered by `tests/mission.test.ts`, which plays the whole job in
 milliseconds and does not depend on an agent successfully driving a car across
 two districts.
 
+## What the runs established, and where they stopped
+
+Run against the production preview, headed:
+
+| Test | Steps passed | Where it stopped |
+| --- | --- | --- |
+| Baseline smoke | 7 of 8 | Per-step tool-call budget, walking to a car |
+| Last Call | 4 of 5 | Per-step tool-call budget, walking to the club |
+
+Both reached their assertions and both ran out of budget on **traversal**, not on
+anything the game did. The passing steps are worth having: daylight, cash,
+`Music: Off`, walking, cars on the road, *"Multiple pedestrians are visible
+walking on the pavements"*, the `GTA Vibe` title and tab title, and the opening
+objective card with its exact copy. The runner also confirmed it had seen
+*"Press E to drive the van"* and pressed E before the budget ran out.
+
+The steps were then split so each traversal has its own budget — one short move
+per step, and the key press that follows it in a step of its own. That is the
+skill's own "one clear job per step" rule, not a weakened assertion: every
+assertion is unchanged.
+
+**These runs drive a separate Chrome.** They compete with the dev server for the
+machine and are slow — the two-test group took thirteen minutes. Detailed
+verification of a change is faster and more precise through the in-app browser,
+driving the game directly and reading the real numbers out of it; TesterArmy is
+for the durable regression pass, not for checking a change you just made.
+
 ## Project memories
 
 Four memories are saved on the project, because the default assumptions of a web

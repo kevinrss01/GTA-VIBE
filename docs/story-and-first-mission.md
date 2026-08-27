@@ -246,5 +246,16 @@ Played end to end on the dev server at 780×480, with screenshots at each step:
    **LAST CALL — PAID, $7,500 from Sable Ruiz**, wallet $25,000 → $32,500,
    stars cleared.
 
-Gate at the time of writing: 563 tests pass, `tsc --noEmit` clean, ESLint 0
+And the two failure paths, after the cross-agent review found them:
+
+9. Killed during Sable's last line: the voice and subtitle stop, the banner
+   stays **WASTED**, the wallet stays at $25,000 — the delivery is *not* paid —
+   and the objective rewinds to *GET THE BOX BACK TO THE VIBE*. After
+   respawning at the hospital the bar offers *Press E to hand over the takings*
+   again and the job pays properly.
+10. Walking into the bar stops at its face along its whole 4.2 m length
+    (measured: blocked at z = 17.0 at both x = −133.2 and x = −134.9) and walks
+    clear past its end (z = 18.84 at x = −129.0).
+
+Gate at the time of writing: 571 tests pass, `tsc --noEmit` clean, ESLint 0
 errors, production build succeeds.
