@@ -1,0 +1,21 @@
+<!doctype html>
+<!--
+  TEMPORARY verification page for the combat, wanted and police layers.
+  Delete together with src/combat/__harness.ts once main.ts carries the wiring.
+  It is not an entry point of the production build; `vite build` uses index.html.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Meridian Bay - combat harness</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #0b0d10; overflow: hidden; }
+      #viewport { display: block; width: 100vw; height: 100vh; }
+    </style>
+  </head>
+  <body>
+    <canvas id="viewport"></canvas>
+    <script type="module" src="/src/combat/__harness.ts"></script>
+  </body>
+</html>

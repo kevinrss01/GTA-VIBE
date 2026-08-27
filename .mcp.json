@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "tripo": {
+      "command": "bash",
+      "args": [".agents/bin/tripo-mcp.sh"],
+      "env": {}
+    }
+  }
+}

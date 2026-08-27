@@ -1,0 +1,73 @@
+---
+alwaysApply: false
+---
+# Copyfy Prompt Engineering Rules
+
+Use this file as the source of truth when creating or editing prompts.
+
+## 1) Canonical References
+
+MUST:
+- Treat `src/lib/services/ai-gateway/prompts` as the canonical reference for prompt structure, naming, and composition style.
+- Keep prompts in dedicated prompt files instead of burying long prompt strings inside orchestration code.
+- Follow the existing prompt-folder pattern: typed input, small reusable helpers/constants, and `buildXPrompt()` functions.
+
+## 2) Prompt Construction Rules
+
+MUST:
+- Start with a precise role and a single objective.
+- Prefer simple, positive instructions over long lists of constraints.
+- Be explicit about the expected output, success criteria, scope, and allowed evidence.
+- Use variables and typed inputs for dynamic values instead of hardcoding request-specific content.
+- Keep prompts concise, direct, and easy to scan.
+
+SHOULD:
+- Add examples, schemas, or canonical labels when output shape matters.
+- Reuse shared helpers such as `joinSections`, `toJsonBlock`, `toTextBlock`, or shared output rules when the prompt family repeats the same structure.
+
+## 3) Preferred Section Order
+
+Mirror the sectioned style already used in `src/lib/services/ai-gateway/prompts` whenever it fits the task:
+- `ROLE`
+- `OBJECTIVE`
+- `CONTEXT` or source guidance
+- `DECISION RULES` or `ANALYSIS RULES`
+- `OUTPUT CONTRACT`
+- `OUTPUT RULES`
+- `INPUTS`
+
+Example pattern:
+- `ROLE:`
+- `OBJECTIVE:`
+- `OUTPUT CONTRACT: Return exactly this JSON shape`
+- `OUTPUT RULES: Return ONLY valid JSON`
+- `INPUTS:`
+
+## 4) Technique Selection
+
+MUST:
+- Use role, system, and contextual prompting by default.
+- Use few-shot examples when the model needs help matching a structure, format, edge case, or classification pattern.
+- Mix class order in few-shot classification examples instead of repeating the same class sequence.
+- Use step-back, Chain of Thought, self-consistency, or ReAct only when the task genuinely needs deeper reasoning or tool use.
+
+SHOULD:
+- Start with zero-shot or a strict schema first, then add few-shot examples only if reliability is still weak.
+- Keep reasoning internal unless the product requirement explicitly needs visible reasoning steps.
+
+## 5) Output and Reliability Rules
+
+MUST:
+- For structured tasks, define the exact output contract and say whether empty or missing evidence should return `null`, `[]`, or an empty string.
+- For extraction, classification, or analysis tasks, prefer structured outputs such as JSON.
+- For evidence-based tasks, instruct the model to stay conservative, separate observation from inference, and never invent unsupported claims.
+- If the prompt depends on formatting compliance, explicitly forbid markdown fences and extra commentary.
+
+## 6) Model Configuration and Iteration
+
+MUST:
+- Keep deterministic tasks like extraction, classification, ranking, and validation biased toward low-temperature behavior.
+- If Chain of Thought is intentionally used for a single correct answer, prefer temperature `0`.
+- Control output length both through model settings and explicit prompt instructions when brevity matters.
+- Re-test prompts when model versions, sampling settings, or upstream context change.
+- Document important prompt attempts, assumptions, and settings outside the prompt when behavior is being tuned over time.

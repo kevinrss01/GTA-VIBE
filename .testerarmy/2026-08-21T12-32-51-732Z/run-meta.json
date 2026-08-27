@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "runId": "2026-08-21T12-32-51-732Z",
+  "pid": 17775,
+  "startedAt": "2026-08-21T12:32:51.954Z",
+  "prompt": "Test: Meridian Bay living city smoke (port 4183)\n\nMeridian Bay ONLY. Target host is localhost:4183. Do not navigate to any other port or project. Covers the living-city upgrade: bright daylight, music off by default, arrow-key walking, pedestrians, traffic, driving a car, and entering a building.",
+  "targetUrl": "http://localhost:4183/",
+  "runtimeMode": "gui",
+  "browser": "chrome",
+  "finishedAt": "2026-08-21T12:34:22.723Z"
+}

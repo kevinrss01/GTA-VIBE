@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "runId": "2026-08-17T22-45-06-671Z",
+  "pid": 20577,
+  "startedAt": "2026-08-17T22:45:06.921Z",
+  "prompt": "Test: Meridian Bay (port 4183) first-person smoke\n\nMeridian Bay ONLY. Target host is localhost:4183. Do not navigate to any other port. Checks load, music off by default, arrow-key movement, mouse look, map, grounding and responsiveness.",
+  "targetUrl": "http://localhost:4183/",
+  "runtimeMode": "gui",
+  "browser": "chrome",
+  "finishedAt": "2026-08-17T22:50:07.418Z"
+}

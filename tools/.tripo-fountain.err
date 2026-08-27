@@ -1,0 +1,28 @@
+model: v3.1-20260211 (explicit --model)
+task created 7c839f4b-861b-4328-aa4b-376828514dfe (@ornate-public-square-fountain-ci)
+text_to_model · queued
+text_to_model · running 3% · 7c839f4b
+text_to_model · running 5% · 7c839f4b
+text_to_model · running 7% · 7c839f4b
+text_to_model · running 11% · 7c839f4b
+text_to_model · running 17% · 7c839f4b
+text_to_model · running 25% · 7c839f4b
+text_to_model · running 37% · 7c839f4b
+text_to_model · running 48% · 7c839f4b
+text_to_model · running 59% · 7c839f4b
+text_to_model · running 70% · 7c839f4b
+text_to_model · running 81% · 7c839f4b
+text_to_model · running 92% · 7c839f4b
+text_to_model · running 99% · 7c839f4b
+text_to_model · running 99% · 7c839f4b
+text_to_model · success 100% · 7c839f4b
+✓ text_to_model · 7c839f4b-861b-4328-aa4b-376828514dfe · 30 credits
+task created 2f7dd180-be40-411c-b2c6-3f956a7e4d8b (@ornate-public-square-fountain-ci-2)
+convert_model · queued
+convert_model · running 31% · 2f7dd180
+convert_model · running 58% · 2f7dd180
+convert_model · running 99% · 2f7dd180
+convert_model · success 100% · 2f7dd180
+✓ convert_model · 2f7dd180-be40-411c-b2c6-3f956a7e4d8b · 5 credits
+downloading artifacts…
+✓ artifacts saved to /Users/kevin/Documents/coding_local/gta-6-claude/tripo-out/ornate-public-square-fountain-ci-2-2f7dd180

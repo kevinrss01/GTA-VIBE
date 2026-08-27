@@ -1,0 +1,26 @@
+task created 3a8699d1-0400-489e-bba0-250bdfe5e552 (@model-3)
+import_model · queued
+import_model · running 36% · 3a8699d1
+import_model · running 68% · 3a8699d1
+import_model · running 99% · 3a8699d1
+import_model · running 99% · 3a8699d1
+import_model · success 100% · 3a8699d1
+✓ import_model · 3a8699d1-0400-489e-bba0-250bdfe5e552 · 0 credits
+task created 8f38d9ab-6b64-46b4-b326-7ecf49d47c47 (@model-glb-decimate-3)
+highpoly_to_lowpoly · queued
+highpoly_to_lowpoly · running 5% · 8f38d9ab
+highpoly_to_lowpoly · running 9% · 8f38d9ab
+highpoly_to_lowpoly · running 14% · 8f38d9ab
+highpoly_to_lowpoly · running 22% · 8f38d9ab
+highpoly_to_lowpoly · running 33% · 8f38d9ab
+highpoly_to_lowpoly · running 50% · 8f38d9ab
+highpoly_to_lowpoly · running 72% · 8f38d9ab
+highpoly_to_lowpoly · running 95% · 8f38d9ab
+highpoly_to_lowpoly · running 99% · 8f38d9ab
+highpoly_to_lowpoly · running 99% · 8f38d9ab
+highpoly_to_lowpoly · running 99% · 8f38d9ab
+highpoly_to_lowpoly · running 99% · 8f38d9ab
+highpoly_to_lowpoly · success 100% · 8f38d9ab
+✓ highpoly_to_lowpoly · 8f38d9ab-6b64-46b4-b326-7ecf49d47c47 · 30 credits
+downloading artifacts…
+✓ artifacts saved to /Users/kevin/Documents/coding_local/gta-6-claude/tripo-out/model-glb-decimate-3-8f38d9ab

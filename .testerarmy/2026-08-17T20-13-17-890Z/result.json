@@ -1,0 +1,30 @@
+{
+  "featureName": "localhost",
+  "result": "FAILED",
+  "description": "The application failed to load, displaying an alert \"Meridian Bay could not start: M is not a function\". The expected button \"Click to explore Meridian Bay\" did not appear.",
+  "issues": [
+    {
+      "type": "issue",
+      "name": "Application fails to load with TypeError \"M is not a function\"",
+      "description": "Expected: The application should load successfully and display a button labeled \"Click to explore Meridian Bay\". Actual: An alert \"Meridian Bay could not start: M is not a function\" appeared on the screen and the application failed to load. Console logs show \"THREE.WebGLRenderer: A WebGL context could not be created\" followed by a TypeError.",
+      "url": "http://localhost:4183/",
+      "severity": 5,
+      "category": "functional",
+      "reproductionSteps": [
+        "Navigate to http://localhost:4183/",
+        "Wait for the application to load."
+      ],
+      "expectedBehavior": "The application should load successfully and display a button labeled \"Click to explore Meridian Bay\".",
+      "actualBehavior": "An alert \"Meridian Bay could not start: M is not a function\" appeared on the screen and the application failed to load. Console logs show \"THREE.WebGLRenderer: A WebGL context could not be created\" followed by a TypeError."
+    }
+  ],
+  "screenshots": [],
+  "steps": [
+    {
+      "stepIndex": 0,
+      "title": "",
+      "status": "failed",
+      "summary": "The application failed to load, displaying an alert \"Meridian Bay could not start: M is not a function\". The expected button \"Click to explore Meridian Bay\" did not appear."
+    }
+  ]
+}

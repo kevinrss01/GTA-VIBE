@@ -1,0 +1,40 @@
+model: v3.1-20260211 (explicit --model)
+task created b89ef540-8583-4ea2-bbab-0f47f82957bc (@ornate-cast-iron-city-street-lam)
+text_to_model · queued
+text_to_model · running 3% · b89ef540
+text_to_model · running 5% · b89ef540
+text_to_model · running 7% · b89ef540
+text_to_model · running 11% · b89ef540
+text_to_model · running 17% · b89ef540
+text_to_model · running 26% · b89ef540
+text_to_model · running 38% · b89ef540
+text_to_model · running 49% · b89ef540
+text_to_model · running 60% · b89ef540
+text_to_model · running 72% · b89ef540
+text_to_model · success 100% · b89ef540
+✓ text_to_model · b89ef540-8583-4ea2-bbab-0f47f82957bc · 20 credits
+task created 904b347e-a956-4a2f-8a27-df40a5a7940b (@ornate-cast-iron-city-street-lam-2)
+highpoly_to_lowpoly · queued
+highpoly_to_lowpoly · running 12% · 904b347e
+highpoly_to_lowpoly · running 20% · 904b347e
+highpoly_to_lowpoly · running 33% · 904b347e
+highpoly_to_lowpoly · running 52% · 904b347e
+highpoly_to_lowpoly · running 80% · 904b347e
+highpoly_to_lowpoly · running 99% · 904b347e
+highpoly_to_lowpoly · running 99% · 904b347e
+highpoly_to_lowpoly · running 99% · 904b347e
+highpoly_to_lowpoly · running 99% · 904b347e
+highpoly_to_lowpoly · running 99% · 904b347e
+highpoly_to_lowpoly · running 99% · 904b347e
+highpoly_to_lowpoly · running 99% · 904b347e
+highpoly_to_lowpoly · running 99% · 904b347e
+highpoly_to_lowpoly · running 99% · 904b347e
+highpoly_to_lowpoly · running 99% · 904b347e
+highpoly_to_lowpoly · success 100% · 904b347e
+✓ highpoly_to_lowpoly · 904b347e-a956-4a2f-8a27-df40a5a7940b · 30 credits
+task created 124bdc34-5750-4d34-81e5-46e1d823c11b (@ornate-cast-iron-city-street-lam-3)
+convert_model · queued
+convert_model · success 100% · 124bdc34
+✓ convert_model · 124bdc34-5750-4d34-81e5-46e1d823c11b · 5 credits
+downloading artifacts…
+✓ artifacts saved to /Users/kevin/Documents/coding_local/gta-6-claude/tripo-out/ornate-cast-iron-city-street-lam-3-124bdc34

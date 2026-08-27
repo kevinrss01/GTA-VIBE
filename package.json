@@ -1,0 +1,32 @@
+{
+  "name": "meridian-bay",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Meridian Bay - an original first-person open-world city built with Three.js.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --port 4183 --strictPort",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint . --ext .ts,.mts,.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "three": "^0.181.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.181.0",
+    "@typescript-eslint/eslint-plugin": "^8.20.0",
+    "@typescript-eslint/parser": "^8.20.0",
+    "eslint": "^8.57.1",
+    "typescript": "^5.7.3",
+    "vite": "^6.0.7",
+    "vitest": "^2.1.8"
+  },
+  "allowScripts": {
+    "esbuild@0.25.12": true,
+    "esbuild@0.21.5": true
+  }
+}

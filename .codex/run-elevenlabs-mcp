@@ -1,0 +1,29 @@
+#!/bin/zsh
+
+set -euo pipefail
+
+readonly project_dir="${0:A:h:h}"
+readonly env_file="$project_dir/.env"
+
+if [[ ! -r "$env_file" ]]; then
+  print -u2 "ElevenLabs MCP: missing readable .env file at $env_file"
+  exit 1
+fi
+
+source "$env_file"
+
+if [[ -z "${ELEVENLABS_API_KEY:-}" && -z "${ELEVEN_LABS_API_KEY:-}" ]]; then
+  print -u2 "ElevenLabs MCP: ELEVENLABS_API_KEY is missing from $env_file"
+  exit 1
+fi
+
+if [[ -z "${ELEVENLABS_API_KEY:-}" ]]; then
+  export ELEVENLABS_API_KEY="$ELEVEN_LABS_API_KEY"
+fi
+unset ELEVEN_LABS_API_KEY
+
+# Keep all MCP file reads and generated audio inside this workspace.
+export ELEVENLABS_MCP_BASE_PATH="$project_dir"
+export ELEVENLABS_MCP_OUTPUT_MODE="files"
+
+exec /Users/kevin/.local/bin/uvx elevenlabs-mcp

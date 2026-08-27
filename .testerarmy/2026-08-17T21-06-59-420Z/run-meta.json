@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "runId": "2026-08-17T21-06-59-420Z",
+  "pid": 28041,
+  "startedAt": "2026-08-17T21:06:59.627Z",
+  "prompt": "Test: Verano Bay V2 first-person city smoke\n\nLoads Verano Bay, checks sound is off by default, walks the denser downtown streets, spots pedestrians, opens the map, enters a building interior, then finds a parked car, drives it, and gets out. Sound must stay OFF until the player switches it on.",
+  "targetUrl": "http://localhost:4183/",
+  "runtimeMode": "gui",
+  "browser": "chrome",
+  "finishedAt": "2026-08-17T21:10:22.096Z"
+}

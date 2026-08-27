@@ -1,0 +1,7 @@
+task created 0628e656-aecd-44c4-b257-ad3983c0b2b7 (@model-4)
+import_model · queued
+import_model · running 38% · 0628e656
+import_model · running 66% · 0628e656
+import_model · success 100% · 0628e656
+✓ import_model · 0628e656-aecd-44c4-b257-ad3983c0b2b7 · 0 credits
+✗ unsupported format "GLB" (GLTF/USDZ/FBX/OBJ/STL/3MF)

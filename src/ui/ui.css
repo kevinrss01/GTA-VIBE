@@ -1,0 +1,1066 @@
+/*
+ * Meridian Bay interface.
+ *
+ * One stylesheet for every screen layer, imported by the modules that need it
+ * so Vite bundles it with the app. The rules are dark, low contrast and quiet
+ * on purpose: the city is the picture and the interface is a caption.
+ *
+ * STACKING. Each layer is appended to <body> by the application and is a fixed
+ * layer, i.e. its own stacking context, so the order between them is set here
+ * once and nowhere else:
+ *   minimap 30  <  hud 40  <  pause 60  <  loading 80
+ *
+ * POINTER EVENTS. Every layer is click-through by default; only real controls
+ * take pointer events back, so the canvas keeps its clicks and its pointer lock.
+ */
+
+:root {
+  --mb-font: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+    sans-serif;
+  --mb-ink: #c3ccd3;
+  --mb-ink-bright: #e7edf1;
+  --mb-ink-dim: #8a949c;
+  --mb-panel: rgba(11, 15, 18, 0.72);
+  --mb-panel-solid: #0b0f12;
+  --mb-line: rgba(198, 214, 224, 0.12);
+  --mb-line-strong: rgba(198, 214, 224, 0.24);
+  --mb-accent: #c8a06a;
+  --mb-radius: 3px;
+  --mb-gap: 22px;
+  --mb-edge-x: calc(var(--mb-gap) + env(safe-area-inset-right, 0px));
+  --mb-edge-y: calc(var(--mb-gap) + env(safe-area-inset-bottom, 0px));
+}
+
+/* --------------------------------------------------------------------- */
+/* Shared primitives                                                      */
+/* --------------------------------------------------------------------- */
+
+.mb-hud,
+.mb-minimap-layer,
+.mb-loading,
+.mb-pause {
+  font-family: var(--mb-font);
+  font-synthesis: none;
+  -webkit-font-smoothing: antialiased;
+  color: var(--mb-ink);
+}
+
+.mb-button {
+  pointer-events: auto;
+  appearance: none;
+  margin: 0;
+  padding: 8px 14px;
+  border: 1px solid var(--mb-line-strong);
+  border-radius: var(--mb-radius);
+  background: var(--mb-panel);
+  color: var(--mb-ink);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: border-color 140ms ease, color 140ms ease, background-color 140ms ease;
+}
+
+.mb-button:hover {
+  border-color: rgba(198, 214, 224, 0.4);
+  color: var(--mb-ink-bright);
+}
+
+.mb-button:focus-visible {
+  outline: 1px solid var(--mb-accent);
+  outline-offset: 2px;
+}
+
+.mb-button--ghost {
+  background: rgba(9, 12, 15, 0.58);
+  border-color: var(--mb-line);
+}
+
+/*
+ * The music control states its own state in words. It must read exactly
+ * "Music: Off" / "Music: On" on screen as well as in the DOM, so this is the
+ * one label the uppercase treatment is kept away from.
+ */
+.mb-button--stateful {
+  text-transform: none;
+  letter-spacing: 0.06em;
+  font-size: 12px;
+}
+
+.mb-button--primary {
+  border-color: rgba(200, 160, 106, 0.5);
+  color: var(--mb-ink-bright);
+}
+
+.mb-button--primary:hover {
+  border-color: var(--mb-accent);
+}
+
+/* --------------------------------------------------------------------- */
+/* HUD                                                                    */
+/* --------------------------------------------------------------------- */
+
+.mb-hud {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  pointer-events: none;
+  user-select: none;
+}
+
+.mb-hud__crosshair {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 3px;
+  height: 3px;
+  margin: -1.5px 0 0 -1.5px;
+  border-radius: 50%;
+  background: rgba(231, 237, 241, 0.62);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45);
+  opacity: 0;
+  transition: opacity 200ms ease;
+  z-index: 1;
+}
+
+.mb-hud.is-playing .mb-hud__crosshair {
+  opacity: 1;
+}
+
+.mb-hud__readout {
+  position: absolute;
+  top: var(--mb-gap);
+  left: calc(var(--mb-gap) + env(safe-area-inset-left, 0px));
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  /* The sky can be pale, so every unpanelled label carries its own shadow. */
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9), 0 0 12px rgba(0, 0, 0, 0.55);
+}
+
+.mb-hud__district {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--mb-ink-bright);
+}
+
+.mb-hud__street {
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  color: var(--mb-ink);
+}
+
+.mb-hud__street:empty {
+  display: none;
+}
+
+.mb-hud__corner {
+  position: absolute;
+  top: var(--mb-gap);
+  right: var(--mb-edge-x);
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+/*
+ * The wallet. Larger than the rest of the HUD chrome on purpose: it is read at
+ * a glance mid-stride, where everything else here is looked up deliberately.
+ */
+.mb-hud__money {
+  margin: 0;
+  font-size: 21px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  font-variant-numeric: tabular-nums;
+  color: var(--mb-accent);
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9), 0 0 12px rgba(0, 0, 0, 0.6);
+  line-height: 1.1;
+}
+
+.mb-hud__money[hidden] {
+  display: none;
+}
+
+.mb-stats {
+  min-width: 132px;
+  padding: 9px 11px;
+  border: 1px solid var(--mb-line);
+  border-radius: var(--mb-radius);
+  background: var(--mb-panel);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  font-variant-numeric: tabular-nums;
+}
+
+.mb-stats[hidden] {
+  display: none;
+}
+
+.mb-stats__row {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  line-height: 1.7;
+}
+
+.mb-stats__label {
+  color: var(--mb-ink-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  font-size: 10px;
+}
+
+.mb-stats__value {
+  color: var(--mb-ink);
+}
+
+.mb-hud__prompt {
+  position: absolute;
+  left: 50%;
+  top: 63%;
+  z-index: 1;
+  transform: translateX(-50%);
+  padding: 7px 14px;
+  border: 1px solid var(--mb-line);
+  border-radius: var(--mb-radius);
+  background: var(--mb-panel);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--mb-ink-bright);
+  white-space: nowrap;
+  opacity: 0;
+  transition: opacity 160ms ease;
+}
+
+.mb-hud__prompt.is-visible {
+  opacity: 1;
+}
+
+.mb-hud__hint {
+  position: absolute;
+  left: calc(var(--mb-gap) + env(safe-area-inset-left, 0px));
+  bottom: var(--mb-edge-y);
+  z-index: 1;
+  display: grid;
+  gap: 3px;
+  font-size: 11px;
+  opacity: 0;
+  transition: opacity 420ms ease;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9), 0 0 12px rgba(0, 0, 0, 0.55);
+}
+
+.mb-hud__hint.is-visible {
+  opacity: 1;
+}
+
+.mb-hud__hint p {
+  display: flex;
+  gap: 10px;
+  margin: 0;
+  line-height: 1.55;
+}
+
+.mb-hud__keys {
+  min-width: 128px;
+  color: var(--mb-ink);
+  letter-spacing: 0.08em;
+}
+
+.mb-hud__action {
+  color: var(--mb-ink-dim);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  font-size: 10px;
+  align-self: center;
+}
+
+/* The expanded map owns the screen; quieten the chrome that would sit on it. */
+body.mb-map-open .mb-hud__money,
+body.mb-map-open .mb-hud__hint,
+body.mb-map-open .mb-hud__prompt,
+body.mb-map-open .mb-hud__crosshair,
+body.mb-map-open .mb-hud__readout {
+  opacity: 0;
+}
+
+/* --------------------------------------------------------------------- */
+/* Minimap                                                                */
+/* --------------------------------------------------------------------- */
+
+.mb-minimap-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  pointer-events: none;
+  user-select: none;
+}
+
+.mb-minimap {
+  position: absolute;
+  right: var(--mb-edge-x);
+  bottom: var(--mb-edge-y);
+  width: var(--mb-minimap-size, 190px);
+  height: var(--mb-minimap-size, 190px);
+  opacity: 1;
+  transition: opacity 160ms ease;
+}
+
+.mb-minimap-layer.is-expanded .mb-minimap {
+  opacity: 0;
+}
+
+.mb-minimap__canvas {
+  display: block;
+  border-radius: 50%;
+  background: #090c0f;
+}
+
+/* Bezel: a hairline ring and a soft inner shade, no chrome-plated dial. */
+.mb-minimap__frame {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 1px solid rgba(198, 214, 224, 0.18);
+  box-shadow:
+    inset 0 0 22px rgba(0, 0, 0, 0.62),
+    0 2px 14px rgba(0, 0, 0, 0.45);
+}
+
+.mb-minimap__north {
+  position: absolute;
+  top: -7px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 1px 5px;
+  border-radius: 2px;
+  background: var(--mb-panel-solid);
+  border: 1px solid var(--mb-line);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  color: var(--mb-ink-dim);
+  line-height: 1.4;
+}
+
+.mb-map {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(6, 9, 11, 0.74);
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 180ms ease, visibility 0s linear 180ms;
+}
+
+.mb-minimap-layer.is-expanded .mb-map {
+  opacity: 1;
+  visibility: visible;
+  transition: opacity 180ms ease, visibility 0s;
+}
+
+.mb-map__sheet {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.mb-map__canvas {
+  display: block;
+  border: 1px solid var(--mb-line);
+  border-radius: var(--mb-radius);
+  background: #090c0f;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.55);
+}
+
+.mb-map__caption {
+  margin: 0;
+  font-size: 10px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--mb-ink-dim);
+}
+
+/* --------------------------------------------------------------------- */
+/* Pause menu                                                             */
+/* --------------------------------------------------------------------- */
+
+.mb-pause {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(5, 7, 9, 0.78);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 180ms ease, visibility 0s linear 180ms;
+}
+
+.mb-pause.is-open {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transition: opacity 180ms ease, visibility 0s;
+}
+
+.mb-pause__panel {
+  width: min(460px, 100%);
+  padding: 30px 32px 28px;
+  border: 1px solid var(--mb-line);
+  border-radius: var(--mb-radius);
+  background: rgba(10, 13, 16, 0.94);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.6);
+}
+
+.mb-pause__eyebrow {
+  margin: 0 0 10px;
+  font-size: 10px;
+  letter-spacing: 0.32em;
+  text-transform: uppercase;
+  color: var(--mb-ink-dim);
+}
+
+.mb-pause__title {
+  margin: 0 0 12px;
+  font-size: 26px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  color: var(--mb-ink-bright);
+}
+
+.mb-pause__blurb {
+  margin: 0 0 22px;
+  max-width: 44ch;
+  font-size: 12px;
+  line-height: 1.75;
+  color: var(--mb-ink-dim);
+}
+
+.mb-pause__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 24px;
+}
+
+.mb-pause__group {
+  margin: 0 0 20px;
+  padding: 0;
+  border: 0;
+}
+
+.mb-pause__group:last-child {
+  margin-bottom: 0;
+}
+
+.mb-pause__legend {
+  margin: 0 0 10px;
+  padding: 0;
+  font-size: 10px;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  color: var(--mb-ink-dim);
+}
+
+.mb-segmented {
+  display: inline-flex;
+  border: 1px solid var(--mb-line-strong);
+  border-radius: var(--mb-radius);
+  overflow: hidden;
+}
+
+.mb-segmented__input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.mb-segmented__label {
+  pointer-events: auto;
+  padding: 7px 18px;
+  border-left: 1px solid var(--mb-line);
+  font-size: 11px;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--mb-ink-dim);
+  cursor: pointer;
+  transition: color 140ms ease, background-color 140ms ease;
+}
+
+.mb-segmented__label:first-of-type,
+.mb-segmented__input:first-child + .mb-segmented__label {
+  border-left: 0;
+}
+
+.mb-segmented__label:hover {
+  color: var(--mb-ink);
+}
+
+.mb-segmented__input:checked + .mb-segmented__label {
+  background: rgba(198, 214, 224, 0.1);
+  color: var(--mb-ink-bright);
+}
+
+.mb-segmented__input:focus-visible + .mb-segmented__label {
+  outline: 1px solid var(--mb-accent);
+  outline-offset: -1px;
+}
+
+.mb-keylist {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 5px 18px;
+  margin: 0;
+  font-size: 11px;
+}
+
+.mb-keylist dt {
+  color: var(--mb-ink);
+  letter-spacing: 0.08em;
+}
+
+.mb-keylist dd {
+  margin: 0;
+  color: var(--mb-ink-dim);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  align-self: center;
+}
+
+/* --------------------------------------------------------------------- */
+/* Gun shop counter                                                       */
+/* --------------------------------------------------------------------- */
+
+/*
+ * Layer 50: over the HUD and the map, under the pause menu. Pausing on top of
+ * an open shop must still put the pause menu in front.
+ */
+.mb-shop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(5, 7, 9, 0.78);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  font-family: var(--mb-font);
+  font-synthesis: none;
+  -webkit-font-smoothing: antialiased;
+  color: var(--mb-ink);
+  transition: opacity 180ms ease, visibility 0s linear 180ms;
+}
+
+.mb-shop.is-open {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transition: opacity 180ms ease, visibility 0s;
+}
+
+.mb-shop__panel {
+  width: min(640px, 100%);
+  max-height: min(88vh, 760px);
+  overflow-y: auto;
+  padding: 26px 30px 24px;
+  border: 1px solid var(--mb-line);
+  border-radius: var(--mb-radius);
+  background: rgba(10, 13, 16, 0.94);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.6);
+}
+
+.mb-shop__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  padding-bottom: 18px;
+}
+
+.mb-shop__eyebrow {
+  margin: 0 0 6px;
+  font-size: 10px;
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+  color: var(--mb-ink-dim);
+}
+
+.mb-shop__title {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  color: var(--mb-ink-bright);
+}
+
+.mb-shop__purse {
+  text-align: right;
+  flex: none;
+}
+
+.mb-shop__wallet {
+  margin: 0;
+  font-size: 24px;
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  font-variant-numeric: tabular-nums;
+  color: var(--mb-accent);
+}
+
+.mb-shop__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 14px 0;
+  border-top: 1px solid var(--mb-line);
+}
+
+.mb-shop__detail {
+  min-width: 0;
+}
+
+.mb-shop__name {
+  margin: 0 0 5px;
+  font-size: 14px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--mb-ink-dim);
+}
+
+.mb-shop__row.is-owned .mb-shop__name {
+  color: var(--mb-ink-bright);
+}
+
+.mb-shop__spec {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.6;
+  letter-spacing: 0.04em;
+  color: var(--mb-ink);
+}
+
+.mb-shop__held {
+  margin: 4px 0 0;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--mb-ink-dim);
+}
+
+.mb-shop__held.is-live {
+  color: var(--mb-accent);
+}
+
+.mb-shop__actions {
+  display: flex;
+  flex: none;
+  gap: 8px;
+}
+
+.mb-shop__action {
+  min-width: 96px;
+  font-variant-numeric: tabular-nums;
+  text-transform: none;
+  letter-spacing: 0.06em;
+  font-size: 12px;
+}
+
+/* Priced out rather than unavailable: the number still has to be readable. */
+.mb-shop__action.is-unaffordable {
+  color: rgba(198, 214, 224, 0.34);
+}
+
+.mb-shop__action:disabled {
+  cursor: default;
+  border-color: rgba(198, 214, 224, 0.08);
+  color: rgba(198, 214, 224, 0.3);
+}
+
+.mb-shop__action:disabled:hover {
+  border-color: rgba(198, 214, 224, 0.08);
+  color: rgba(198, 214, 224, 0.3);
+}
+
+.mb-shop__status {
+  margin: 14px 0 0;
+  min-height: 15px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: var(--mb-accent);
+  opacity: 0;
+  transition: opacity 160ms ease;
+}
+
+.mb-shop__status.is-visible {
+  opacity: 1;
+}
+
+.mb-shop__foot {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 20px;
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--mb-line);
+}
+
+@media (max-width: 560px) {
+  .mb-shop__row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .mb-shop__actions {
+    justify-content: flex-start;
+  }
+}
+
+/* --------------------------------------------------------------------- */
+/* Loading screen                                                         */
+/* --------------------------------------------------------------------- */
+
+.mb-loading {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: #070a0c;
+  opacity: 1;
+  transition: opacity 420ms ease;
+}
+
+.mb-loading.is-hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.mb-loading[hidden] {
+  display: none;
+}
+
+.mb-loading__panel {
+  width: min(420px, 100%);
+  text-align: left;
+}
+
+.mb-loading__eyebrow {
+  margin: 0 0 10px;
+  font-size: 10px;
+  letter-spacing: 0.34em;
+  text-transform: uppercase;
+  color: var(--mb-ink-dim);
+}
+
+.mb-loading__title {
+  margin: 0 0 26px;
+  font-size: 30px;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  color: var(--mb-ink-bright);
+}
+
+.mb-loading__track {
+  height: 2px;
+  background: rgba(198, 214, 224, 0.12);
+  overflow: hidden;
+}
+
+.mb-loading__bar {
+  width: 0%;
+  height: 100%;
+  background: var(--mb-accent);
+  transition: width 220ms ease;
+}
+
+.mb-loading__label {
+  margin: 12px 0 0;
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--mb-ink-dim);
+  min-height: 14px;
+}
+
+.mb-loading__gate {
+  margin-top: 30px;
+  height: 38px;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 260ms ease;
+}
+
+.mb-loading.is-ready .mb-loading__gate {
+  opacity: 1;
+  visibility: visible;
+}
+
+.mb-loading__start {
+  padding: 11px 20px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mb-button,
+  .mb-hud__prompt,
+  .mb-hud__hint,
+  .mb-hud__crosshair,
+  .mb-map,
+  .mb-minimap,
+  .mb-pause,
+  .mb-shop,
+  .mb-shop__status,
+  .mb-loading,
+  .mb-loading__bar,
+  .mb-loading__gate,
+  .mb-segmented__label {
+    transition-duration: 1ms;
+  }
+}
+
+/* -- volume sliders ------------------------------------------------------- */
+
+.mb-slider {
+  display: grid;
+  grid-template-columns: 1fr 130px 44px;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 10px;
+}
+
+.mb-slider:last-child {
+  margin-bottom: 0;
+}
+
+.mb-slider__label {
+  font-size: 13px;
+  letter-spacing: 0.01em;
+  color: rgba(226, 214, 199, 0.78);
+}
+
+.mb-slider__value {
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  text-align: right;
+  color: rgba(226, 214, 199, 0.55);
+}
+
+.mb-slider__input {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(226, 214, 199, 0.2);
+  outline: none;
+  cursor: pointer;
+}
+
+.mb-slider__input::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border: 0;
+  border-radius: 50%;
+  background: #e2d6c7;
+  cursor: pointer;
+}
+
+.mb-slider__input::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border: 0;
+  border-radius: 50%;
+  background: #e2d6c7;
+  cursor: pointer;
+}
+
+.mb-slider__input:focus-visible {
+  box-shadow: 0 0 0 2px rgba(226, 214, 199, 0.45);
+}
+
+@media (max-width: 520px) {
+  .mb-slider {
+    grid-template-columns: 1fr 90px 40px;
+    gap: 8px;
+  }
+}
+
+/* --------------------------------------------------------------------- */
+/* Wanted level, vitals and the respawn banner (combat layer)            */
+/* --------------------------------------------------------------------- */
+
+/*
+ * Added by the combat and police layer. Everything here is inert until the
+ * application calls `setWanted`, `setHealth`, `setWeapon` or `setBanner`, so a
+ * build without those wired in looks exactly as it did before.
+ *
+ * The wanted stars join the existing top-right stack; health and the loaded
+ * weapon sit bottom left above the control hint, where the minimap does not
+ * reach. Both keep the HUD's rule of being a caption rather than a dashboard.
+ */
+
+.mb-hud__wanted {
+  display: flex;
+  gap: 3px;
+  font-size: 15px;
+  line-height: 1;
+  /* Tabular so the row does not shift as stars light up. */
+  font-variant-numeric: tabular-nums;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9), 0 0 12px rgba(0, 0, 0, 0.55);
+}
+
+.mb-hud__wanted[hidden] {
+  display: none;
+}
+
+.mb-hud__star {
+  color: rgba(198, 214, 224, 0.18);
+  transition: color 180ms ease, text-shadow 180ms ease;
+}
+
+.mb-hud__star.is-lit {
+  color: var(--mb-accent);
+  text-shadow: 0 0 10px rgba(200, 160, 106, 0.55);
+}
+
+.mb-hud__vitals {
+  position: absolute;
+  left: calc(var(--mb-gap) + env(safe-area-inset-left, 0px));
+  bottom: calc(var(--mb-edge-y) + 92px);
+  z-index: 1;
+  display: grid;
+  gap: 6px;
+  min-width: 168px;
+}
+
+.mb-hud__vitals[hidden] {
+  display: none;
+}
+
+.mb-hud__health {
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(9, 12, 15, 0.72);
+  box-shadow: inset 0 0 0 1px var(--mb-line);
+  overflow: hidden;
+}
+
+.mb-hud__health-fill {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: #9fb6b0;
+  transition: width 160ms ease, background-color 220ms ease;
+}
+
+/* A quarter of a bar left is the moment an officer stops shooting and starts
+ * reaching for cuffs, so it is worth saying out loud. */
+.mb-hud__health-fill.is-critical {
+  background: #c4553f;
+}
+
+.mb-hud__weapon {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  margin: 0;
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--mb-ink-dim);
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9), 0 0 12px rgba(0, 0, 0, 0.55);
+}
+
+.mb-hud__weapon-name {
+  color: var(--mb-ink);
+}
+
+.mb-hud__ammo {
+  font-variant-numeric: tabular-nums;
+}
+
+.mb-hud__ammo.is-empty {
+  color: #c4553f;
+}
+
+.mb-hud__banner {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  gap: 10px;
+  background: rgba(6, 8, 10, 0.62);
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 260ms ease, visibility 0s linear 260ms;
+}
+
+.mb-hud__banner.is-visible {
+  opacity: 1;
+  visibility: visible;
+  transition: opacity 220ms ease, visibility 0s;
+}
+
+.mb-hud__banner-title {
+  margin: 0;
+  font-size: 34px;
+  font-weight: 600;
+  letter-spacing: 0.32em;
+  text-indent: 0.32em;
+  text-transform: uppercase;
+  color: var(--mb-ink-bright);
+}
+
+.mb-hud__banner-detail {
+  margin: 0;
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--mb-ink-dim);
+}
+
+/* The expanded map owns the screen; the vitals go with the rest of the chrome. */
+body.mb-map-open .mb-hud__vitals {
+  opacity: 0;
+}
+
+@media (max-width: 720px) {
+  .mb-hud__vitals {
+    bottom: calc(var(--mb-edge-y) + 70px);
+    min-width: 140px;
+  }
+
+  .mb-hud__banner-title {
+    font-size: 24px;
+  }
+}

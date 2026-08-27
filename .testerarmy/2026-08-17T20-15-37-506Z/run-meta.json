@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "runId": "2026-08-17T20-15-37-506Z",
+  "pid": 28888,
+  "startedAt": "2026-08-17T20:15:38.159Z",
+  "prompt": "Test: Meridian Bay first-person city smoke\n\nLoads Meridian Bay, checks music is off by default, walks the streets with the arrow keys, looks around with the mouse, enters a building, opens the map, and confirms the city is correctly grounded. Music must stay OFF until the player switches it on.",
+  "targetUrl": "http://localhost:4183/",
+  "runtimeMode": "headless",
+  "browser": "chrome",
+  "finishedAt": "2026-08-17T20:16:37.883Z"
+}

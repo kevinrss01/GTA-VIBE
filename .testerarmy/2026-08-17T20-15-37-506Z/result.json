@@ -1,0 +1,30 @@
+{
+  "featureName": "localhost",
+  "result": "FAILED",
+  "description": "The page failed to load the application and instead displayed a WebGL compatibility error: 'Meridian Bay needs WebGL, and this browser cannot provide it.' No 'Click to explore Meridian Bay' button was found.",
+  "issues": [
+    {
+      "type": "issue",
+      "name": "WebGL Compatibility Error - Application Fails to Load",
+      "description": "Expected: The page should load and display a button labelled 'Click to explore Meridian Bay'. Actual: The page shows an alert message 'Meridian Bay needs WebGL, and this browser cannot provide it. This browser could not create a WebGL context. Try a browser with hardware acceleration enabled.' and no other content is visible.",
+      "url": "http://localhost:4183/",
+      "severity": 5,
+      "category": "functional",
+      "reproductionSteps": [
+        "Navigate to the application URL.",
+        "Observe the error message regarding WebGL."
+      ],
+      "expectedBehavior": "The page should load and display a button labelled 'Click to explore Meridian Bay'.",
+      "actualBehavior": "The page shows an alert message 'Meridian Bay needs WebGL, and this browser cannot provide it. This browser could not create a WebGL context. Try a browser with hardware acceleration enabled.' and no other content is visible."
+    }
+  ],
+  "screenshots": [],
+  "steps": [
+    {
+      "stepIndex": 0,
+      "title": "",
+      "status": "failed",
+      "summary": "The page failed to load the application and instead displayed a WebGL compatibility error: 'Meridian Bay needs WebGL, and this browser cannot provide it.' No 'Click to explore Meridian Bay' button was found."
+    }
+  ]
+}

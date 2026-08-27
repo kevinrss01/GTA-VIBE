@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "runId": "2026-08-23T10-50-43-566Z",
+  "pid": 31032,
+  "startedAt": "2026-08-23T10:50:44.654Z",
+  "prompt": "Meridian Bay generated-vehicle fleet check (port 4183).\n\nMeridian Bay ONLY. The target host is localhost:4183. Do not navigate to any other port, site or project.\n\nSteps:\n1. Navigate to exactly http://localhost:4183/ and wait until the loading screen finishes and a button labelled 'Click to explore Meridian Bay' is visible.\n2. Click that button to enter the city.\n3. Walk forward with the arrow keys or W until you are standing beside the carriageway.\n4. Assert the on-screen HUD shows a district and street name as readable text.\n5. Walk along the kerb until the interaction prompt about driving a vehicle appears, for example 'Press E to drive the taxi'.\n6. Assert that prompt is visible and names a vehicle.\n\nDo not attempt any purely visual or VLM-based assertion: this project's 3D canvas is known to break TesterArmy's vision tools. Judge every step from readable page text only.",
+  "targetUrl": "http://localhost:4183/",
+  "runtimeMode": "gui",
+  "browser": "chrome",
+  "finishedAt": "2026-08-23T10:55:45.790Z"
+}

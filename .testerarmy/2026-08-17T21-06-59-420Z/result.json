@@ -1,0 +1,44 @@
+{
+  "featureName": "localhost",
+  "result": "FAILED",
+  "description": "The browser page and context crashed repeatedly when attempting to interact with the \"Click to enter\" button. After several attempts, the browser context was closed and I was unable to reopen the page or navigate back to the target URL. This appears to be a major stability issue with the application or its interaction with the automation environment, possibly related to the WebGL/3D engine.",
+  "issues": [],
+  "screenshots": [],
+  "steps": [
+    {
+      "stepIndex": 0,
+      "title": "",
+      "status": "passed",
+      "summary": "Navigated to http://127.0.0.1:4173/?nolock=1 and verified the 'Click to enter' button is present and the 'Ready' status is displayed, indicating loading is complete.",
+      "reusableActionTrace": {
+        "version": 1,
+        "stepKey": "0:act:navigate to exactly this url: http://127.0.0.1:4173/?nolock=1 (keep the ?nolock=1 query parameter — it disables pointer lock for automation). wait unti...",
+        "stepTitle": "Navigate to exactly this URL: http://127.0.0.1:4173/?nolock=1 (keep the ?nolock=1 query parameter — it disables pointer lock for automation). Wait until loading finishes and the button labelled 'Cl...",
+        "stepType": "act",
+        "actions": [
+          {
+            "order": 0,
+            "toolName": "ui_navigate",
+            "summary": "Navigate to http://127.0.0.1:4173/",
+            "input": {
+              "url": "http://127.0.0.1:4173/"
+            }
+          }
+        ],
+        "confidence": "medium"
+      }
+    },
+    {
+      "stepIndex": 1,
+      "title": "",
+      "status": "passed",
+      "summary": "Verified that the start screen shows the title 'VERANO BAY' and no visible error messages are present on the page."
+    },
+    {
+      "stepIndex": 2,
+      "title": "",
+      "status": "failed",
+      "summary": "The browser page and context crashed repeatedly when attempting to interact with the \"Click to enter\" button. After several attempts, the browser context was closed and I was unable to reopen the page or navigate back to the target URL. This appears to be a major stability issue with the application or its interaction with the automation environment, possibly related to the WebGL/3D engine."
+    }
+  ]
+}

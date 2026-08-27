@@ -1,0 +1,301 @@
+{
+  "featureName": "localhost",
+  "result": "FAILED",
+  "description": "5/6 steps passed, 0 failed.",
+  "issues": [],
+  "screenshots": [],
+  "steps": [
+    {
+      "stepIndex": 0,
+      "title": "",
+      "status": "passed",
+      "summary": "Navigated to http://localhost:4183/, waited for the shaders to compile, and verified the \"Click to explore Meridian Bay\" button appeared.",
+      "reusableActionTrace": {
+        "version": 1,
+        "stepKey": "0:act:navigate to exactly http://localhost:4183/ and wait until the loading screen finishes and a button labelled 'click to explore meridian bay' is visible.",
+        "stepTitle": "Navigate to exactly http://localhost:4183/ and wait until the loading screen finishes and a button labelled 'Click to explore Meridian Bay' is visible.",
+        "stepType": "act",
+        "actions": [
+          {
+            "order": 0,
+            "toolName": "ui_navigate",
+            "summary": "Navigate to http://localhost:4183/",
+            "input": {
+              "url": "http://localhost:4183/"
+            }
+          },
+          {
+            "order": 1,
+            "toolName": "wait_for_task",
+            "summary": "Wait for the slow async task to make progress"
+          }
+        ],
+        "confidence": "medium"
+      }
+    },
+    {
+      "stepIndex": 1,
+      "title": "",
+      "status": "passed",
+      "summary": "Clicked the 'Click to explore Meridian Bay' button. The menu vanished and the city HUD appeared, showing 'Harbourside Harbour Walk'.",
+      "reusableActionTrace": {
+        "version": 1,
+        "stepKey": "1:act:click that button to enter the city.",
+        "stepTitle": "Click that button to enter the city.",
+        "stepType": "act",
+        "actions": [
+          {
+            "order": 0,
+            "toolName": "ui_click",
+            "summary": "Click button \"Click to explore Meridian Bay\"",
+            "target": {
+              "kind": "role",
+              "role": "button",
+              "name": "Click to explore Meridian Bay",
+              "selector": "getByRole('button', { name: \"Click to explore Meridian Bay\", exact: true })"
+            }
+          }
+        ],
+        "confidence": "medium"
+      }
+    },
+    {
+      "stepIndex": 2,
+      "title": "",
+      "status": "passed",
+      "summary": "Walked forward using the 'W' key until standing beside the carriageway. The interaction prompt \"Press E to drive the coupe\" appeared, confirming proximity to the street.",
+      "reusableActionTrace": {
+        "version": 1,
+        "stepKey": "2:act:walk forward with the arrow keys or w until you are standing beside the carriageway.",
+        "stepTitle": "Walk forward with the arrow keys or W until you are standing beside the carriageway.",
+        "stepType": "act",
+        "actions": [
+          {
+            "order": 0,
+            "toolName": "scene_understand",
+            "summary": "Use visual scene understanding"
+          },
+          {
+            "order": 1,
+            "toolName": "ui_press",
+            "summary": "Press w",
+            "input": {
+              "key": "w"
+            }
+          },
+          {
+            "order": 2,
+            "toolName": "ui_press",
+            "summary": "Press w",
+            "input": {
+              "key": "w"
+            }
+          },
+          {
+            "order": 3,
+            "toolName": "ui_press",
+            "summary": "Press w",
+            "input": {
+              "key": "w"
+            }
+          },
+          {
+            "order": 4,
+            "toolName": "scene_understand",
+            "summary": "Use visual scene understanding"
+          },
+          {
+            "order": 5,
+            "toolName": "ui_press",
+            "summary": "Press w",
+            "input": {
+              "key": "w"
+            }
+          }
+        ],
+        "confidence": "medium"
+      }
+    },
+    {
+      "stepIndex": 3,
+      "title": "",
+      "status": "passed",
+      "summary": "Verified that the on-screen HUD displays 'Harbourside Harbour Walk', representing the district and street name as readable text."
+    },
+    {
+      "stepIndex": 4,
+      "title": "",
+      "status": "passed",
+      "summary": "Walked along the kerb using the 'A' and 'D' keys until a driving interaction prompt appeared. The prompt \"Press E to drive the van\" was observed in the page changes.",
+      "reusableActionTrace": {
+        "version": 1,
+        "stepKey": "4:act:walk along the kerb until the interaction prompt about driving a vehicle appears, for example 'press e to drive the taxi'.",
+        "stepTitle": "Walk along the kerb until the interaction prompt about driving a vehicle appears, for example 'Press E to drive the taxi'.",
+        "stepType": "act",
+        "actions": [
+          {
+            "order": 0,
+            "toolName": "ui_press",
+            "summary": "Press w",
+            "input": {
+              "key": "w"
+            }
+          },
+          {
+            "order": 1,
+            "toolName": "ui_press",
+            "summary": "Press d",
+            "input": {
+              "key": "d"
+            }
+          },
+          {
+            "order": 2,
+            "toolName": "ui_press",
+            "summary": "Press d",
+            "input": {
+              "key": "d"
+            }
+          },
+          {
+            "order": 3,
+            "toolName": "ui_press",
+            "summary": "Press d",
+            "input": {
+              "key": "d"
+            }
+          },
+          {
+            "order": 4,
+            "toolName": "ui_press",
+            "summary": "Press w",
+            "input": {
+              "key": "w"
+            }
+          },
+          {
+            "order": 5,
+            "toolName": "ui_press",
+            "summary": "Press w",
+            "input": {
+              "key": "w"
+            }
+          },
+          {
+            "order": 6,
+            "toolName": "ui_press",
+            "summary": "Press w",
+            "input": {
+              "key": "w"
+            }
+          },
+          {
+            "order": 7,
+            "toolName": "ui_press",
+            "summary": "Press s",
+            "input": {
+              "key": "s"
+            }
+          },
+          {
+            "order": 8,
+            "toolName": "ui_press",
+            "summary": "Press s",
+            "input": {
+              "key": "s"
+            }
+          },
+          {
+            "order": 9,
+            "toolName": "ui_press",
+            "summary": "Press s",
+            "input": {
+              "key": "s"
+            }
+          },
+          {
+            "order": 10,
+            "toolName": "ui_press",
+            "summary": "Press a",
+            "input": {
+              "key": "a"
+            }
+          },
+          {
+            "order": 11,
+            "toolName": "ui_press",
+            "summary": "Press a",
+            "input": {
+              "key": "a"
+            }
+          },
+          {
+            "order": 12,
+            "toolName": "ui_press",
+            "summary": "Press d",
+            "input": {
+              "key": "d"
+            }
+          },
+          {
+            "order": 13,
+            "toolName": "ui_press",
+            "summary": "Press d",
+            "input": {
+              "key": "d"
+            }
+          },
+          {
+            "order": 14,
+            "toolName": "ui_press",
+            "summary": "Press d",
+            "input": {
+              "key": "d"
+            }
+          },
+          {
+            "order": 15,
+            "toolName": "ui_press",
+            "summary": "Press w",
+            "input": {
+              "key": "w"
+            }
+          },
+          {
+            "order": 16,
+            "toolName": "ui_press",
+            "summary": "Press d",
+            "input": {
+              "key": "d"
+            }
+          },
+          {
+            "order": 17,
+            "toolName": "ui_press",
+            "summary": "Press d",
+            "input": {
+              "key": "d"
+            }
+          },
+          {
+            "order": 18,
+            "toolName": "ui_press",
+            "summary": "Press a",
+            "input": {
+              "key": "a"
+            }
+          },
+          {
+            "order": 19,
+            "toolName": "ui_press",
+            "summary": "Press a",
+            "input": {
+              "key": "a"
+            }
+          }
+        ],
+        "confidence": "medium"
+      }
+    }
+  ]
+}

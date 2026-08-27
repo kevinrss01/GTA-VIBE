@@ -1,0 +1,17 @@
+(node:20577) DeprecationWarning: AI SDK Warning: Deprecated: ""image" content part". The "image" content part type is deprecated. Use a "file" part with mediaType: 'image' (or a more specific image/* subtype) instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+(node:20577) DeprecationWarning: AI SDK Warning: Deprecated: ""image" content part". The "image" content part type is deprecated. Use a "file" part with mediaType: 'image' (or a more specific image/* subtype) instead.
+(node:20577) DeprecationWarning: AI SDK Warning: Deprecated: ""image" content part". The "image" content part type is deprecated. Use a "file" part with mediaType: 'image' (or a more specific image/* subtype) instead.
+(node:20577) DeprecationWarning: AI SDK Warning: Deprecated: ""image" content part". The "image" content part type is deprecated. Use a "file" part with mediaType: 'image' (or a more specific image/* subtype) instead.
+[testerarmy] GatewayInvalidRequestError: Invalid input
+[testerarmy] tags={"area":"qa_agent","stage":"tool_execute","error_code":"QA_AGENT_TOOL_ERROR","tool":"scene_assert","tool_name":"scene_assert"} extra={"errorName":"GatewayInvalidRequestError","errorMessage":"Invalid input","cause":{"name":"AI_APICallError","message":"[object Object]"},"signature":"scene_assert:","inputType":"object"}
+(node:20577) DeprecationWarning: AI SDK Warning: Deprecated: ""image" content part". The "image" content part type is deprecated. Use a "file" part with mediaType: 'image' (or a more specific image/* subtype) instead.
+(node:20577) DeprecationWarning: AI SDK Warning: Deprecated: ""image" content part". The "image" content part type is deprecated. Use a "file" part with mediaType: 'image' (or a more specific image/* subtype) instead.
+[testerarmy] GatewayInvalidRequestError: Invalid input
+[testerarmy] tags={"area":"qa_agent","stage":"tool_execute","error_code":"QA_AGENT_TOOL_ERROR","tool":"scene_assert","tool_name":"scene_assert"} extra={"errorName":"GatewayInvalidRequestError","errorMessage":"Invalid input","cause":{"name":"AI_APICallError","message":"[object Object]"},"signature":"scene_assert:","inputType":"object"}
+(node:20577) DeprecationWarning: AI SDK Warning: Deprecated: ""image" content part". The "image" content part type is deprecated. Use a "file" part with mediaType: 'image' (or a more specific image/* subtype) instead.
+(node:20577) DeprecationWarning: AI SDK Warning: Deprecated: ""image" content part". The "image" content part type is deprecated. Use a "file" part with mediaType: 'image' (or a more specific image/* subtype) instead.
+(node:20577) DeprecationWarning: AI SDK Warning: Deprecated: ""image" content part". The "image" content part type is deprecated. Use a "file" part with mediaType: 'image' (or a more specific image/* subtype) instead.
+(node:20577) DeprecationWarning: AI SDK Warning: Deprecated: ""image" content part". The "image" content part type is deprecated. Use a "file" part with mediaType: 'image' (or a more specific image/* subtype) instead.
+[testerarmy] GatewayInvalidRequestError: Invalid input
+[testerarmy] tags={"area":"qa_agent","stage":"tool_execute","error_code":"QA_AGENT_TOOL_ERROR","tool":"scene_assert","tool_name":"scene_assert"} extra={"errorName":"GatewayInvalidRequestError","errorMessage":"Invalid input","cause":{"name":"AI_APICallError","message":"[object Object]"},"signature":"scene_assert:","inputType":"object"}

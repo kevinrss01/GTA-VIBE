@@ -1,0 +1,7 @@
+! non-default convert options use the "complex convert" price tier
+task created 0b8a029a-deb2-46a3-b579-25cac9f87c4c (@0628e656-convert)
+convert_model · queued
+convert_model · success 100% · 0b8a029a
+✓ convert_model · 0b8a029a-deb2-46a3-b579-25cac9f87c4c · 10 credits
+downloading artifacts…
+✓ artifacts saved to /Users/kevin/Documents/coding_local/gta-6-claude/tripo-out/0628e656-convert-0b8a029a

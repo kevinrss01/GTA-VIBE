@@ -1,0 +1,29 @@
+{
+  "featureName": "127.0.0.1",
+  "result": "FAILED",
+  "description": "The application at http://127.0.0.1:4183/ is unreachable (ERR_CONNECTION_REFUSED) and did not become available after a 20-second wait and retry.",
+  "issues": [
+    {
+      "type": "issue",
+      "name": "Application unreachable",
+      "description": "Expected: The application should be accessible at http://127.0.0.1:4183/. Actual: The URL http://127.0.0.1:4183/ returns net::ERR_CONNECTION_REFUSED.",
+      "url": "http://127.0.0.1:4183/",
+      "severity": 5,
+      "category": "functional",
+      "reproductionSteps": [
+        "Navigate to http://127.0.0.1:4183/"
+      ],
+      "expectedBehavior": "The application should be accessible at http://127.0.0.1:4183/.",
+      "actualBehavior": "The URL http://127.0.0.1:4183/ returns net::ERR_CONNECTION_REFUSED."
+    }
+  ],
+  "screenshots": [],
+  "steps": [
+    {
+      "stepIndex": 0,
+      "title": "",
+      "status": "failed",
+      "summary": "The application at http://127.0.0.1:4183/ is unreachable (ERR_CONNECTION_REFUSED) and did not become available after a 20-second wait and retry."
+    }
+  ]
+}

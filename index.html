@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Meridian Bay</title>
+    <meta
+      name="description"
+      content="Meridian Bay - explore an original coastal city on foot, in first person."
+    />
+    <link rel="icon" href="data:," />
+    <style>
+      /*
+       * The canvas MUST be sized by CSS. Without it the renderer reads the
+       * canvas's intrinsic size, sets a larger backing buffer, which grows the
+       * intrinsic size again - a feedback loop that ends with a multi-megapixel
+       * buffer and single-digit frame rates.
+       */
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #0b0d10;
+        color: #d8cfc2;
+        font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+        overscroll-behavior: none;
+      }
+
+      #app {
+        position: fixed;
+        inset: 0;
+      }
+
+      #viewport {
+        display: block;
+        width: 100%;
+        height: 100%;
+        outline: none;
+        touch-action: none;
+        cursor: crosshair;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="viewport" aria-label="Meridian Bay city viewport" tabindex="0"></canvas>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

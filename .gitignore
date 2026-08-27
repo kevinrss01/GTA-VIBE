@@ -1,0 +1,28 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Dependencies and builds
+node_modules/
+dist/
+coverage/
+.vite/
+*.log
+
+# Browser and QA artifacts
+playwright-report/
+test-results/
+testerarmy-output/
+
+# Local provider state and connectivity proofs
+.tripo/
+mcp-verification/
+openai-api-verification/
+tripo-avatar-test/
+
+# OS/editor files
+.DS_Store
+
+# Generated 3D source artifacts (large; runtime copies live in public/models/)
+tripo-out/
