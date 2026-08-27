@@ -32,7 +32,6 @@ import {
   type CityBlock,
   type CityPlan,
   type DistrictId,
-  type Landmark,
   type Parcel,
   type Street,
 } from '../world/CityPlan';
@@ -506,6 +505,20 @@ export class Minimap {
       side,
       side,
     );
+    // Markers ride on top at a fixed screen size, and anything outside the
+    // crop is pinned to the rim so it still points the way.
+    const originX = centre.x - sourceSpan * 0.5;
+    const originY = centre.y - sourceSpan * 0.5;
+    const k = side / sourceSpan;
+    const project = (wx: number, wz: number): MapPoint => {
+      const m = worldToMap(wx, wz, this.bounds);
+      return { x: (m.x - originX) * k, y: (m.y - originY) * k };
+    };
+    this.drawMarkers(ctx, project, this.dpr, {
+      cx: radius,
+      cy: radius,
+      radius: radius - 9 * this.dpr,
+    });
     this.drawPlayer(ctx, radius, radius, this.dpr, 30);
     ctx.restore();
   }
@@ -625,10 +638,12 @@ export class Minimap {
 
     for (const block of this.plan.blocks) this.drawBlock(ctx, block);
     for (const parcel of this.plan.parcels) this.drawParcel(ctx, parcel);
-    for (const parcel of this.plan.parcels) {
-      if (parcel.enterable) this.drawEnterableMarker(ctx, parcel);
-    }
-    for (const landmark of this.plan.landmarks) this.drawLandmarkMarker(ctx, landmark);
+    // NOTE: markers are deliberately NOT baked here. The static layer is
+    // 3.2 px per metre and is then scaled to whichever view is drawing it, so
+    // a marker baked at world scale shrank with the zoom: the gun-store pin
+    // measured THREE pixels on the expanded map, with its own crosshair
+    // overdrawing what was left of the fill. They are drawn per-view instead,
+    // at a fixed size in screen pixels - see `drawMarkers`.
   }
 
   /** The bay: everything west of the shoreline curve. */
@@ -673,41 +688,52 @@ export class Minimap {
     ctx.strokeRect(a.x + 0.45, a.y + 0.45, w - 0.9, h - 0.9);
   }
 
-  private drawEnterableMarker(ctx: CanvasRenderingContext2D, parcel: Parcel): void {
-    const centre = this.toStatic(
-      (parcel.rect.minX + parcel.rect.maxX) * 0.5,
-      (parcel.rect.minZ + parcel.rect.maxZ) * 0.5,
-    );
-    if (parcel.interiorKind === 'gunStore') {
-      drawShopPin(ctx, centre.x, centre.y, 7.5);
-      return;
+  /**
+   * Draws every marker at a FIXED SIZE IN SCREEN PIXELS, on top of whatever
+   * view is being composited.
+   *
+   * `project` maps world metres to that view's pixels. `edge`, when given,
+   * clamps a marker that falls outside the view onto a ring of that radius
+   * around the centre, so an off-screen gun store still tells the player which
+   * way to walk instead of silently not existing.
+   */
+  private drawMarkers(
+    ctx: CanvasRenderingContext2D,
+    project: (x: number, z: number) => MapPoint,
+    unit: number,
+    edge?: { cx: number; cy: number; radius: number },
+  ): void {
+    const clamp = (p: MapPoint): { x: number; y: number; off: boolean } => {
+      if (!edge) return { x: p.x, y: p.y, off: false };
+      const dx = p.x - edge.cx;
+      const dy = p.y - edge.cy;
+      const d = Math.hypot(dx, dy);
+      if (d <= edge.radius) return { x: p.x, y: p.y, off: false };
+      const k = edge.radius / d;
+      return { x: edge.cx + dx * k, y: edge.cy + dy * k, off: true };
+    };
+
+    for (const landmark of this.plan.landmarks) {
+      const p = clamp(project(landmark.x, landmark.z));
+      if (p.off) continue; // Landmarks do not need an off-screen arrow.
+      drawLandmarkPin(ctx, p.x, p.y, 6 * unit);
     }
-    ctx.beginPath();
-    ctx.arc(centre.x, centre.y, 5.5, 0, TAU);
-    ctx.strokeStyle = MINIMAP_PALETTE.enterable;
-    ctx.lineWidth = 2.2;
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(centre.x, centre.y, 2.2, 0, TAU);
-    ctx.fillStyle = MINIMAP_PALETTE.playerEdge;
-    ctx.fill();
+
+    for (const parcel of this.plan.parcels) {
+      if (!parcel.enterable) continue;
+      const centre = project(
+        (parcel.rect.minX + parcel.rect.maxX) * 0.5,
+        (parcel.rect.minZ + parcel.rect.maxZ) * 0.5,
+      );
+      const isShop = parcel.interiorKind === 'gunStore';
+      const p = clamp(centre);
+      if (p.off && !isShop) continue;
+      if (isShop) drawShopPin(ctx, p.x, p.y, 9 * unit, p.off);
+      else drawDoorPin(ctx, p.x, p.y, 5.5 * unit);
+    }
   }
 
-  private drawLandmarkMarker(ctx: CanvasRenderingContext2D, landmark: Landmark): void {
-    const point = this.toStatic(landmark.x, landmark.z);
-    const r = 6.5;
-    ctx.beginPath();
-    ctx.moveTo(point.x, point.y - r);
-    ctx.lineTo(point.x + r, point.y);
-    ctx.lineTo(point.x, point.y + r);
-    ctx.lineTo(point.x - r, point.y);
-    ctx.closePath();
-    ctx.fillStyle = MINIMAP_PALETTE.landmark;
-    ctx.fill();
-    ctx.strokeStyle = MINIMAP_PALETTE.playerEdge;
-    ctx.lineWidth = 1.6;
-    ctx.stroke();
-  }
+
 
   // -- expanded raster ------------------------------------------------------
 
@@ -738,6 +764,7 @@ export class Minimap {
 
     // Painted smallest first so the district names, which carry the map, win
     // any collision with a street or a landmark caption.
+    this.drawMarkers(ctx, project, unit);
     this.drawStreetLabels(ctx, project, unit);
     this.drawLandmarkLabels(ctx, project, width, unit);
     this.drawDistrictLabels(ctx, project, unit);
@@ -956,11 +983,26 @@ export class Minimap {
 }
 
 /**
- * The gun-store pin: a filled teardrop with a crosshair, drawn larger than an
- * ordinary door ring. Shape carries as much of the difference as colour does,
- * because colour alone fails on a small dark minimap.
+ * The gun-store pin: a filled teardrop with a crosshair.
+ *
+ * Sized in SCREEN pixels by the caller, never in world units - baked at world
+ * scale it collapsed to three pixels once the map was zoomed out. When `off`
+ * is set the pin is riding the edge of the view and gains a ring, so it reads
+ * as "this way" rather than "it is here".
  */
-function drawShopPin(ctx: CanvasRenderingContext2D, x: number, y: number, r: number): void {
+function drawShopPin(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  r: number,
+  off = false,
+): void {
+  if (off) {
+    ctx.beginPath();
+    ctx.arc(x, y, r * 1.05, 0, TAU);
+    ctx.fillStyle = 'rgba(9, 12, 15, 0.85)';
+    ctx.fill();
+  }
   ctx.beginPath();
   ctx.moveTo(x, y + r);
   ctx.bezierCurveTo(x - r * 0.95, y + r * 0.15, x - r * 0.85, y - r * 0.75, x, y - r * 0.8);
@@ -969,16 +1011,47 @@ function drawShopPin(ctx: CanvasRenderingContext2D, x: number, y: number, r: num
   ctx.fillStyle = MINIMAP_PALETTE.gunStore;
   ctx.fill();
   ctx.strokeStyle = MINIMAP_PALETTE.playerEdge;
-  ctx.lineWidth = 1.4;
+  ctx.lineWidth = Math.max(1, r * 0.16);
   ctx.stroke();
-  // Crosshair, so the pin still reads as "guns" at four pixels across.
+  // Crosshair, only once the pin is big enough to carry it. Below that the
+  // strokes eat the fill and the pin stops reading as red at all.
+  if (r >= 7) {
+    ctx.beginPath();
+    ctx.arc(x, y - r * 0.12, r * 0.28, 0, TAU);
+    ctx.moveTo(x - r * 0.44, y - r * 0.12);
+    ctx.lineTo(x + r * 0.44, y - r * 0.12);
+    ctx.moveTo(x, y - r * 0.56);
+    ctx.lineTo(x, y + r * 0.32);
+    ctx.strokeStyle = MINIMAP_PALETTE.playerEdge;
+    ctx.lineWidth = Math.max(1, r * 0.12);
+    ctx.stroke();
+  }
+}
+
+/** An ordinary enterable door: a warm ring with a dark centre. */
+function drawDoorPin(ctx: CanvasRenderingContext2D, x: number, y: number, r: number): void {
   ctx.beginPath();
-  ctx.arc(x, y - r * 0.12, r * 0.30, 0, TAU);
-  ctx.moveTo(x - r * 0.46, y - r * 0.12);
-  ctx.lineTo(x + r * 0.46, y - r * 0.12);
-  ctx.moveTo(x, y - r * 0.58);
-  ctx.lineTo(x, y + r * 0.34);
+  ctx.arc(x, y, r, 0, TAU);
+  ctx.strokeStyle = MINIMAP_PALETTE.enterable;
+  ctx.lineWidth = Math.max(1.4, r * 0.4);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(x, y, r * 0.4, 0, TAU);
+  ctx.fillStyle = MINIMAP_PALETTE.playerEdge;
+  ctx.fill();
+}
+
+/** A landmark: a pale diamond. */
+function drawLandmarkPin(ctx: CanvasRenderingContext2D, x: number, y: number, r: number): void {
+  ctx.beginPath();
+  ctx.moveTo(x, y - r);
+  ctx.lineTo(x + r, y);
+  ctx.lineTo(x, y + r);
+  ctx.lineTo(x - r, y);
+  ctx.closePath();
+  ctx.fillStyle = MINIMAP_PALETTE.landmark;
+  ctx.fill();
   ctx.strokeStyle = MINIMAP_PALETTE.playerEdge;
-  ctx.lineWidth = 1.1;
+  ctx.lineWidth = Math.max(1, r * 0.22);
   ctx.stroke();
 }
