@@ -407,6 +407,10 @@ export class Driving {
     // reach, and costs nothing at ordinary speeds where the loop runs once.
     const wanted = Math.hypot(dx, dz);
     const steps = Math.max(1, Math.ceil(wanted / MAX_COLLISION_STEP));
+    // Where the car was before any of this frame's movement, so an impossible
+    // position can be undone even after several sub-steps have been committed.
+    const startX = this.x;
+    const startZ = this.z;
     let achieved = 0;
     let blocked = false;
     for (let i = 0; i < steps; i += 1) {
@@ -425,6 +429,21 @@ export class Driving {
         BODY_HEIGHT,
         true,
       );
+
+      // Refuse a sub-step that would put the car in the bay or outside the
+      // world, BEFORE committing it. Testing after the whole frame instead
+      // meant the car had already been moved there and the old rollback had
+      // nothing left to subtract, so it stopped dead in the water rather than
+      // at the edge of it.
+      if (
+        !ground.isInBounds(moved.x, moved.z) ||
+        ground.sample(moved.x, moved.z).surface === 'water'
+      ) {
+        blocked = true;
+        this.speed = 0;
+        break;
+      }
+
       const gotX = moved.x - this.x;
       const gotZ = moved.z - this.z;
       this.x = moved.x;
@@ -439,7 +458,7 @@ export class Driving {
       }
     }
 
-    if (blocked && wanted > 1e-5) {
+    if (blocked && wanted > 1e-5 && this.speed !== 0) {
       // Keep whatever sliding the world allowed and scrub speed by how much
       // was refused, so a glance costs less than a head-on hit.
       const lost = Math.max(0, 1 - achieved / wanted);
@@ -450,10 +469,12 @@ export class Driving {
     dx = 0;
     dz = 0;
 
-    // Keep the car inside the world rather than letting it drive into the bay.
+    // Belt and braces: if the car has ended up somewhere impossible anyway -
+    // a terrain edge case, or a sub-step that started on bad ground - put it
+    // back where this frame began rather than leaving it stranded.
     if (!ground.isInBounds(this.x, this.z) || ground.sample(this.x, this.z).surface === 'water') {
-      this.x -= dx;
-      this.z -= dz;
+      this.x = startX;
+      this.z = startZ;
       this.speed = 0;
     }
 
