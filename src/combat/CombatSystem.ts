@@ -940,6 +940,11 @@ export class CombatSystem {
   /**
    * A warhead going off.
    *
+   * Reads the LAUNCHER's blast numbers, because the launcher is the only thing
+   * in the armoury that fires a warhead - `Projectiles` carries a rocket, not
+   * the weapon that sent it. A second explosive weapon would have to thread
+   * its spec through the projectile rather than land here by default.
+   *
    * Damage is radial and applied ONCE per victim, which is why it walks the
    * actor sources directly rather than going anywhere near `castOne`: a blast
    * is not a very fat bullet, it does not care about line of sight along a
