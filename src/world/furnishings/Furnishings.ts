@@ -134,6 +134,15 @@ export class Furnishings {
   private readonly plan: CityPlan;
   private readonly baseUrl: string;
   private readonly missing: string[] = [];
+  /**
+   * Pieces asked to be hidden, by `furnishing-<model>-<parcelId>`.
+   *
+   * `load()` downloads every model before it builds a single mesh, so a
+   * request that arrives during that window has nothing to act on. Remembering
+   * it here is what stops the crate reappearing on the bench a second after
+   * the player carried it out of the room.
+   */
+  private readonly hidden = new Set<string>();
   private loadedModels = 0;
   private pieces = 0;
   private trianglesPlaced = 0;
@@ -219,6 +228,8 @@ export class Furnishings {
         if (!model) continue;
         const mesh = new InstancedMesh(model.geometry, model.material, matrices.length);
         mesh.name = `furnishing-${id}-${parcel.id}`;
+        // A piece taken while this was still downloading stays taken.
+        if (matrices.length === 1 && this.hidden.has(mesh.name)) mesh.visible = false;
         for (let i = 0; i < matrices.length; i += 1) {
           const matrix = matrices[i];
           if (matrix) mesh.setMatrixAt(i, matrix);
@@ -262,8 +273,15 @@ export class Furnishings {
    * interior is simply furnished without it.
    */
   setPieceVisible(parcelId: string, model: FurnishingModel, visible: boolean): boolean {
-    const mesh = this.meshes.find((candidate) => candidate.name === `furnishing-${model}-${parcelId}`);
-    if (!mesh || mesh.count !== 1) return false;
+    const name = `furnishing-${model}-${parcelId}`;
+    if (visible) this.hidden.delete(name);
+    else this.hidden.add(name);
+    const mesh = this.meshes.find((candidate) => candidate.name === name);
+    // Not loaded yet: the request is remembered, and `load` applies it to the
+    // mesh it is about to make. Reporting false would be a lie - the piece
+    // will be hidden - so the answer is whether the request was ACCEPTED.
+    if (!mesh) return true;
+    if (mesh.count !== 1) return false;
     mesh.visible = visible;
     return true;
   }

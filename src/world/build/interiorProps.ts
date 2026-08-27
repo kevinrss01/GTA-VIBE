@@ -4409,7 +4409,17 @@ function furnishingLayout(room: Room): LocalFurnishing[] {
       // back out of the room" - a quarter one way on the low flank and the
       // other way on the high one, so it always serves INTO the room.
       const barTurns = plan.barLow ? 1 : 3;
-      const boothU = plan.barLow ? edgeR : edgeL;
+      /*
+       * The booths get their own inset rather than the shared `edgeL`/`edgeR`.
+       *
+       * Those sit 0.95 m off the wall, which is enough for a plant. A booth is
+       * quarter-turned, so what has to clear the wall is its DEPTH - 1.2 m -
+       * and at 0.95 the bounds check below rejected it. Not for this seed: for
+       * EVERY room, at both orientations, so the 400 KB model downloaded and
+       * was never once given an instance.
+       */
+      const boothInset = FURNISHING_SPECS.clubBooth.halfDepth + 0.15;
+      const boothU = plan.barLow ? W - boothInset : boothInset;
       const out: LocalFurnishing[] = [
         place('clubBar', plan.barU, (plan.barV[0] + plan.barV[1]) / 2, barTurns),
         place('djBooth', W / 2, plan.stageV[0] + 0.75, 0, { lift: CLUB_STAGE_HEIGHT }),
@@ -4567,8 +4577,19 @@ export function interiorFurnishings(parcel: Parcel): readonly Furnishing[] {
       y: room.floorY + lift,
       z: world.z,
       yaw: outward + spot.turns * (Math.PI / 2) + (spot.skew ?? 0),
-      halfX: alongX === acrossU ? halfU : halfV,
-      halfZ: alongX === acrossU ? halfV : halfU,
+      /*
+       * Room axes to world axes, and NOTHING else.
+       *
+       * `halfU`/`halfV` have already had the quarter turn applied above, so
+       * the only question left is which world axis `u` runs along - `alongX`
+       * answers it on its own. Consulting `spot.turns` again here (as
+       * `alongX === acrossU` did) applied the turn a second time and handed
+       * every quarter-turned piece in every interior a collider with its
+       * width and depth swapped: an invisible wall across the room and a
+       * walk-through hole where the model actually is.
+       */
+      halfX: alongX ? halfU : halfV,
+      halfZ: alongX ? halfV : halfU,
       height: spec.height,
       solid: spec.solid,
     });

@@ -572,9 +572,12 @@ async function boot(): Promise<void> {
       combat.reset();
       combatAudio.reset();
       damageFeedback.reset();
-      // Whoever was talking stops, and the job moves on to where the
-      // conversation would have left it. See `Dialogue.skip`.
-      dialogue.skip();
+      // Whoever was talking stops, and the job backs up to the point where it
+      // will offer that conversation again. Always the two together: cutting
+      // the dialogue alone would strand the director in a stage only the
+      // dropped callback could leave. See `MissionDirector.interrupt`.
+      dialogue.cut();
+      mission.interrupt();
     },
   });
 

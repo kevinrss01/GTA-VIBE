@@ -42,10 +42,20 @@ export interface Objective {
   readonly waypoint: 'nightclub' | 'workshop' | null;
 }
 
+/**
+ * Stands in for the street the club actually fronts.
+ *
+ * The same reason `waypoint` is a building and not a coordinate: which street
+ * The Vibe opens onto is decided by the generator, and the first version of
+ * this line simply asserted "Harbour Walk" - which was wrong for the shipping
+ * seed. `MissionDirector` asks the plan and substitutes.
+ */
+export const CLUB_STREET_TOKEN = '{clubStreet}';
+
 export const OBJECTIVES: Readonly<Record<MissionStage, Objective>> = {
   offered: {
     title: 'See Sable at The Vibe',
-    detail: 'Harbour Walk. She asked for you by name.',
+    detail: `${CLUB_STREET_TOKEN}. She asked for you by name.`,
     waypoint: 'nightclub',
   },
   briefing: {

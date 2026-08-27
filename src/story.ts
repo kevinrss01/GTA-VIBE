@@ -78,7 +78,8 @@ export const CAST = {
     role: 'Owner, The Vibe',
     character: 'ped-sable',
     blurb:
-      'Runs the club on Harbour Walk, books the bands, pays the harbour master, ' +
+      'Runs the club on the Harbourside waterfront, books the bands, pays the ' +
+      'harbour master, ' +
       'and keeps a lock-up in the Cannery that is on nobody’s manifest. She ' +
       'does not hire people. She tests them.',
   },

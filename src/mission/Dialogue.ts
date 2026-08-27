@@ -101,28 +101,24 @@ export class Dialogue {
   }
 
   /**
-   * Cuts the conversation off NOW and lets it count as finished.
+   * Cuts the conversation off NOW, and does NOT run its callback.
    *
    * This is what happens when the player is killed or arrested mid-sentence:
-   * the voice and the subtitle stop, because Sable talking a corpse through a
-   * job while the BUSTED banner is up is nonsense - but the callback still
-   * runs, so the mission advances exactly as far as it would have.
+   * Sable talking a corpse through a job while the BUSTED banner is up is
+   * nonsense, and so is being paid for the delivery by dying during it.
    *
-   * SKIPPING FORWARD RATHER THAN ABANDONING IS DELIBERATE. Dropping the
-   * callback would leave the director parked in a conversational stage
-   * (`briefing`, `handover`, `payout`) that only that callback can leave,
-   * which is a softlock: the box would be in the player's hands with no way
-   * to be asked for it. The player loses the recording, which they were in no
-   * position to hear, and nothing else.
+   * Dropping the callback on its own would be a softlock - the director would
+   * be parked in a stage only that callback can leave, holding a box nobody
+   * will ask for - so `MissionDirector.interrupt` rewinds to the stage that
+   * offers the conversation again. The two are always called together; see
+   * the bust handler in `main.ts`.
    */
-  skip(): void {
+  cut(): void {
     this.stopAudio();
     this.queue = [];
     this.at = 0;
-    this.show(null);
-    const finished = this.done;
     this.done = null;
-    finished?.();
+    this.show(null);
   }
 
   update(dt: number): void {

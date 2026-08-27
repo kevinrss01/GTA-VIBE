@@ -24,8 +24,21 @@ npm run build && npm run preview   # serves dist/ on http://localhost:4183
 ```
 
 ```bash
-ta tests run --group 81fc41b7-a23a-413a-84e7-f71b943da402 --project e039ea49-386b-40a3-865d-b4c79a6c1b23 --local --url http://localhost:4183 --browser chrome --json
+ta tests run --group 81fc41b7-a23a-413a-84e7-f71b943da402 --project e039ea49-386b-40a3-865d-b4c79a6c1b23 --local --url http://localhost:4183 --browser chrome --headed --json
 ```
+
+**`--headed` is not optional.** A local run defaults to headless Chrome, which
+cannot create a WebGL context, so the game correctly refuses to start and every
+step fails on *"Meridian Bay needs WebGL, and this browser cannot provide it."*
+That is the game reporting an unsupported browser, not a defect — but it costs
+a whole run to find out. `--headed` gives Chrome a real GPU context and the
+city loads.
+
+Two more things the CLI will not tell you: **the dashboard rejects an em dash**
+in a project or test name (it goes into a request header, and the CLI throws
+`Cannot convert argument to a ByteString`), and the local runner writes a full
+transcript to `.testerarmy/<timestamp>/result.json` — read that rather than the
+`--json` summary, which reports only counts.
 
 Then read the finished run, not the queue acknowledgement:
 

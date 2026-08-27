@@ -35,6 +35,7 @@ import { formatMoney } from '../player/money';
 import type { PlayerState } from '../player/PlayerState';
 import { CAST } from '../story';
 import {
+  CLUB_STREET_TOKEN,
   CONVERSATIONS,
   MISSION_FEE,
   MISSION_NAME,
@@ -80,6 +81,18 @@ export interface MissionOptions {
 
 /** Seconds the completion banner stays up. */
 const BANNER_SECONDS = 5;
+
+/**
+ * Where a conversation that was cut short puts the player back.
+ *
+ * One entry per stage that is nothing but a conversation; every other stage is
+ * something the player is doing and survives being killed unchanged.
+ */
+const REWIND: Readonly<Partial<Record<MissionStage, MissionStage>>> = {
+  briefing: 'offered',
+  handover: 'collect',
+  payout: 'deliver',
+};
 
 export interface MissionSnapshot {
   readonly stage: MissionStage;
@@ -135,11 +148,16 @@ export class MissionDirector {
    * builder knowing a mission exists.
    */
   promptFor(id: string): string | null {
+    // Only the mission's own points, even mid-sentence. Suppressing every
+    // prompt while somebody talks took "Press E to leave" off the club's door
+    // and the shop's counter with it, for a conversation neither is part of.
+    if (id !== this.barId && id !== this.crateId) return null;
     if (this.options.dialogue.speaking) return '';
     if (id === this.barId) {
       if (this.stageValue === 'offered') return `Press E to speak to ${CAST.sable.shortName}`;
       if (this.stageValue === 'deliver') return `Press E to hand over the takings`;
-      if (this.stageValue === 'complete') return `Press E to speak to ${CAST.sable.shortName}`;
+      // Paid, and there is nothing more to say. Promising a conversation that
+      // `activate` will not start is worse than promising nothing.
       return '';
     }
     if (id === this.crateId) {
@@ -169,13 +187,19 @@ export class MissionDirector {
         this.options.dialogue.say(CONVERSATIONS.payout, () => this.finish());
         return true;
       }
-      return this.stageValue === 'complete' || this.stageValue === 'payout';
+      // `payout` is claimed so a second press mid-payment does nothing; once
+      // it is `complete` the bar is an ordinary piece of scenery again.
+      return this.stageValue === 'payout';
     }
 
     if (id === this.crateId) {
       if (this.stageValue !== 'collect') return true;
-      this.carryingValue = true;
-      this.options.onCrateTaken?.();
+      // Only the first time. A second pickup after an interrupted handover is
+      // the same box, and the world was already told it had gone.
+      if (!this.carryingValue) {
+        this.carryingValue = true;
+        this.options.onCrateTaken?.();
+      }
       this.enter('handover');
       this.options.dialogue.say(CONVERSATIONS.handover, () => {
         this.enter('deliver');
@@ -192,6 +216,31 @@ export class MissionDirector {
       return true;
     }
     return false;
+  }
+
+  /**
+   * The player went down mid-conversation. Rewind to the offer.
+   *
+   * Called with `Dialogue.cut` from the respawn director's bust handler, and
+   * only ever together with it. The three conversational stages each have
+   * exactly one stage that offers them, so backing up one step leaves the
+   * player able to walk up and press E again once they are on their feet.
+   *
+   * WHY NOT SIMPLY FINISH THE CONVERSATION. Because `payout`'s callback pays
+   * $7,500 and clears the heat, so dying during Sable's last line would be a
+   * way to be paid for the delivery while being loaded into an ambulance, with
+   * "Last Call - paid" written over the top of the BUSTED banner. And
+   * `handover`'s callback puts two stars on a player the police just stood
+   * down from.
+   *
+   * The box is NOT given back. The player picked it up, and it stays picked
+   * up: `carrying` survives, the crate stays gone from the lock-up bench, and
+   * `collect` simply offers the pickup conversation again.
+   */
+  interrupt(): void {
+    if (this.disposed) return;
+    const back = REWIND[this.stageValue];
+    if (back) this.enter(back);
   }
 
   update(dt: number): void {
@@ -218,17 +267,52 @@ export class MissionDirector {
   }
 
   private enter(stage: MissionStage): void {
+    // A conversation started before `dispose` still ends afterwards, and its
+    // callback must not move a director the application has let go of.
+    if (this.disposed) return;
     if (this.stageValue === stage) return;
     this.stageValue = stage;
     this.announce();
   }
 
   private announce(): void {
-    this.options.onObjective?.(OBJECTIVES[this.stageValue]);
+    this.options.onObjective?.(this.objectiveFor(this.stageValue));
     this.options.onWaypoint?.(this.waypointFor(this.stageValue));
   }
 
+  /**
+   * The objective, with the club's real street written into it.
+   *
+   * `script.ts` says `{clubStreet}` rather than a name because which street
+   * The Vibe fronts is the generator's decision. If the plan cannot say, the
+   * token drops out along with the sentence it was in rather than being shown
+   * to the player.
+   */
+  private objectiveFor(stage: MissionStage): Objective {
+    const objective = OBJECTIVES[stage];
+    if (!objective.detail.includes(CLUB_STREET_TOKEN)) return objective;
+    const street = this.clubStreet;
+    return {
+      ...objective,
+      detail: street
+        ? objective.detail.split(CLUB_STREET_TOKEN).join(street)
+        : objective.detail
+            .split(`${CLUB_STREET_TOKEN}. `)
+            .join('')
+            .split(CLUB_STREET_TOKEN)
+            .join(''),
+    };
+  }
+
+  /** The name of the street the club opens onto, or null if the plan has none. */
+  private get clubStreet(): string | null {
+    const id = this.club?.frontStreetId;
+    if (!id) return null;
+    return this.options.plan.streets.find((street) => street.id === id)?.name ?? null;
+  }
+
   private finish(): void {
+    if (this.disposed) return;
     this.carryingValue = false;
     this.paidValue = MISSION_FEE;
     this.options.player.earn(MISSION_FEE);

@@ -17,6 +17,7 @@ import { getCityPlan } from '../src/world/CityPlan';
 import { PlayerState, STARTING_MONEY } from '../src/player/PlayerState';
 import { MissionDirector, type DialoguePlayer } from '../src/mission/Mission';
 import {
+  CLUB_STREET_TOKEN,
   CONVERSATIONS,
   MISSION_FEE,
   OBJECTIVES,
@@ -58,9 +59,10 @@ class FakeDialogue implements DialoguePlayer {
     pending?.();
   }
 
-  /** What `Dialogue.skip` does when the player is killed mid-sentence. */
-  skip(): void {
-    this.finish();
+  /** What `Dialogue.cut` does: silence, and the callback is dropped. */
+  cut(): void {
+    this.speaking = false;
+    this.pending = null;
   }
 }
 
@@ -71,6 +73,8 @@ interface Harness {
   readonly barId: string;
   readonly crateId: string;
   readonly objectives: MissionStage[];
+  /** The detail line of the objective most recently announced. */
+  readonly shownDetail: string;
   readonly waypoints: (string | null)[];
   /** How many times the world was told to stop drawing the crate. */
   readonly taken: { count: number };
@@ -81,14 +85,24 @@ function harness(): Harness {
   const dialogue = new FakeDialogue();
   const objectives: MissionStage[] = [];
   const waypoints: (string | null)[] = [];
+  const details: string[] = [];
   const taken = { count: 0 };
   const mission = new MissionDirector({
     plan,
     player,
     dialogue,
+    /*
+     * Matched on title and waypoint, not identity: the director rewrites
+     * `detail` to put the club's real street into it, so the object handed
+     * back is not the one in `OBJECTIVES`. Those two fields are unique across
+     * all seven stages.
+     */
     onObjective: (objective) => {
+      details.push(objective.detail);
       const stage = (Object.keys(OBJECTIVES) as MissionStage[]).find(
-        (key) => OBJECTIVES[key] === objective,
+        (key) =>
+          OBJECTIVES[key].title === objective.title &&
+          OBJECTIVES[key].waypoint === objective.waypoint,
       );
       if (stage) objectives.push(stage);
     },
@@ -108,6 +122,9 @@ function harness(): Harness {
     barId: `nightclub-bar-${club?.id ?? ''}`,
     crateId: `lockup-crate-${lockup?.id ?? ''}`,
     objectives,
+    get shownDetail() {
+      return details.at(-1) ?? '';
+    },
     waypoints,
     taken,
   };
@@ -198,6 +215,25 @@ describe('the city the mission needs', () => {
 });
 
 describe('Last Call', () => {
+  /*
+   * The opening line named "Harbour Walk" because that is where the club was
+   * imagined. The generator put The Vibe on Dock Street, so the objective sent
+   * the player to one street while the HUD, standing at the door, named
+   * another. The street now comes from the plan, like the waypoint.
+   */
+  it('names the street the club is actually on', () => {
+    const h = harness();
+    const club = plan.parcels.find((p) => p.interiorKind === 'nightclub');
+    expect(club).toBeDefined();
+    if (!club) return;
+    const street = plan.streets.find((s) => s.id === club.frontStreetId);
+    expect(street, 'the club has no front street').toBeDefined();
+
+    const opening = h.objectives.length > 0 ? h.shownDetail : '';
+    expect(opening).not.toContain(CLUB_STREET_TOKEN);
+    expect(opening).toContain(street?.name ?? '<none>');
+  });
+
   it('starts by pointing at the club and asking for nothing else', () => {
     const h = harness();
     expect(h.mission.stage).toBe('offered');
@@ -324,39 +360,124 @@ describe('Last Call', () => {
   });
 
   /*
-   * Being killed or arrested mid-sentence must not park the job.
+   * Being killed or arrested mid-sentence rewinds to the offer.
    *
-   * `main.ts` calls `Dialogue.skip` from the respawn director's bust handler,
-   * and skip runs the pending callback rather than dropping it. Dropping it
-   * would leave the director in a stage only that callback can leave - the box
-   * in the player's hands and nobody willing to ask for it.
+   * `main.ts` calls `Dialogue.cut` and `MissionDirector.interrupt` together
+   * from the respawn director's bust handler. Neither is any use alone: cut
+   * drops the callback, and only interrupt can leave the stage that callback
+   * owned. Running the callback instead - the first attempt - meant dying
+   * during Sable's last line paid $7,500 over the top of the BUSTED banner.
    */
-  it('survives being interrupted in each of its three conversations', () => {
-    for (const cut of ['briefing', 'handover', 'payout'] as const) {
+  it('rewinds to the offer when a conversation is cut short', () => {
+    const cases = [
+      { cut: 'briefing', back: 'offered' },
+      { cut: 'handover', back: 'collect' },
+      { cut: 'payout', back: 'deliver' },
+    ] as const;
+
+    for (const { cut, back } of cases) {
       const h = harness();
       h.mission.activate(h.barId);
-      if (cut === 'briefing') {
-        h.dialogue.skip();
-        expect(h.mission.stage).toBe('collect');
-        continue;
+      if (cut !== 'briefing') {
+        h.dialogue.finish();
+        h.mission.activate(h.crateId);
+        if (cut !== 'handover') {
+          h.dialogue.finish();
+          h.mission.activate(h.barId);
+        }
       }
-      h.dialogue.finish();
 
-      h.mission.activate(h.crateId);
-      if (cut === 'handover') {
-        h.dialogue.skip();
-        expect(h.mission.stage).toBe('deliver');
-        // The tip-off still happened; the player simply did not hear it.
-        expect(h.player.heat).toBe(TIP_OFF_HEAT);
-        continue;
+      const moneyBefore = h.player.money;
+      const heatBefore = h.player.heat;
+      h.dialogue.cut();
+      h.mission.interrupt();
+
+      expect(h.mission.stage, cut).toBe(back);
+      // Nothing the conversation would have done happens to a dead player.
+      expect(h.player.money, cut).toBe(moneyBefore);
+      expect(h.player.heat, cut).toBe(heatBefore);
+      // The box stays picked up, and the world is not told about it twice.
+      if (cut !== 'briefing') {
+        expect(h.mission.carrying, cut).toBe(true);
+        expect(h.taken.count, cut).toBe(1);
       }
-      h.dialogue.finish();
-
-      h.mission.activate(h.barId);
-      h.dialogue.skip();
-      expect(h.mission.stage).toBe('complete');
-      expect(h.player.money).toBe(STARTING_MONEY + MISSION_FEE);
     }
+  });
+
+  it('can be picked up again after an interrupted handover, and still pays once', () => {
+    const h = harness();
+    h.mission.activate(h.barId);
+    h.dialogue.finish();
+    h.mission.activate(h.crateId);
+    h.dialogue.cut();
+    h.mission.interrupt();
+    expect(h.mission.stage).toBe('collect');
+
+    // Back on their feet, the player presses E on the crate again.
+    expect(h.mission.activate(h.crateId)).toBe(true);
+    expect(h.taken.count, 'the crate has already gone from the room').toBe(1);
+    h.dialogue.finish();
+    expect(h.mission.stage).toBe('deliver');
+    expect(h.player.heat).toBe(TIP_OFF_HEAT);
+
+    h.mission.activate(h.barId);
+    h.dialogue.finish();
+    expect(h.player.money).toBe(STARTING_MONEY + MISSION_FEE);
+  });
+
+  /*
+   * A conversation outlives the director that started it.
+   *
+   * `dispose` runs on unload while a line may still be playing; the beat that
+   * finishes a moment later must not pay a mission nobody is looking at.
+   */
+  it('does nothing once it has been disposed', () => {
+    const h = harness();
+    h.mission.activate(h.barId);
+    h.dialogue.finish();
+    h.mission.activate(h.crateId);
+    h.dialogue.finish();
+
+    h.mission.activate(h.barId);
+    const money = h.player.money;
+    h.mission.dispose();
+    h.dialogue.finish();
+
+    expect(h.mission.stage).toBe('payout');
+    expect(h.player.money).toBe(money);
+  });
+
+  /*
+   * The prompts belong to the mission's own two points and nothing else.
+   *
+   * `main.ts` treats `''` as "say nothing here" and `null` as "leave this
+   * point's own prompt alone". Returning `''` for every id while somebody
+   * talked took "Press E to leave" off the club's door for the length of a
+   * conversation the door has no part in.
+   */
+  it('never silences a prompt that is not its own', () => {
+    const h = harness();
+    h.mission.activate(h.barId);
+    expect(h.dialogue.speaking).toBe(true);
+    expect(h.mission.promptFor('interior-exit-parcel-58')).toBeNull();
+    expect(h.mission.promptFor('gun-shop-counter-parcel-41')).toBeNull();
+    expect(h.mission.promptFor(h.barId)).toBe('');
+  });
+
+  it('stops offering a conversation once there is none left to have', () => {
+    const h = harness();
+    h.mission.activate(h.barId);
+    h.dialogue.finish();
+    h.mission.activate(h.crateId);
+    h.dialogue.finish();
+    h.mission.activate(h.barId);
+    h.dialogue.finish();
+    expect(h.mission.stage).toBe('complete');
+
+    // Promising "Press E to speak to Sable" and then doing nothing when the
+    // player presses it is worse than promising nothing.
+    expect(h.mission.promptFor(h.barId)).toBe('');
+    expect(h.mission.activate(h.barId)).toBe(false);
   });
 
   it('pays a fee worth the drive', () => {

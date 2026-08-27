@@ -706,9 +706,36 @@ export class Minimap {
    * around the centre, so an off-screen gun store still tells the player which
    * way to walk instead of silently not existing.
    */
-  /** Points the map at somewhere, or clears it. */
+  /**
+   * Points the map at somewhere, or clears it.
+   *
+   * REDRAWS BOTH VIEWS, and throws away the expanded map's cache.
+   *
+   * The waypoint moves when the mission stage changes, which usually happens
+   * while the player is standing still listening to somebody - and `update`
+   * returns early when nothing has moved. Worse, the pin is painted into the
+   * full map's cached raster along with the streets and the district names,
+   * which is only rebuilt when the viewport size changes. Without both of
+   * these the dial kept pointing at the last destination until the player
+   * turned their head, and the full map kept pointing at it until they resized
+   * the window.
+   */
   setWaypoint(waypoint: { readonly x: number; readonly z: number } | null): void {
+    const same =
+      (this.waypoint === null && waypoint === null) ||
+      (this.waypoint !== null &&
+        waypoint !== null &&
+        this.waypoint.x === waypoint.x &&
+        this.waypoint.z === waypoint.z);
+    if (same) return;
     this.waypoint = waypoint;
+    if (this.disposed) return;
+    // A zero-width canvas fails the size check in `renderExpanded`, which is
+    // what makes it rebuild - and frees the old raster on the way.
+    this.expandedCache.width = 0;
+    this.expandedCache.height = 0;
+    this.dirty = true;
+    this.render();
   }
 
   private drawMarkers(

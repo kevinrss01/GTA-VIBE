@@ -13,6 +13,7 @@ import { describe, expect, it } from 'vitest';
 import { getCityPlan, type Parcel } from '../src/world/CityPlan';
 import { buildInterior } from '../src/world/build/InteriorBuilder';
 import {
+  FURNISHING_SPECS,
   gunStoreAnchors,
   gunStorePlan,
   interiorFurnishings,
@@ -314,6 +315,42 @@ describe('generated furnishings', () => {
         }
       }
     }
+  });
+
+  /*
+   * A collider has to be the shape of the thing it is standing in for.
+   *
+   * The world footprint is derived twice over - once to turn the piece within
+   * the room, once to map the room's axes onto the world's - and getting the
+   * second one to consult the first as well swapped width for depth on every
+   * quarter-turned piece in the city. Eight of fifty-nine were wrong,
+   * including the club's four-metre bar, which became a 1.5 m stub across the
+   * room: an invisible wall in the middle of the floor and a walk-through gap
+   * where the counter actually is.
+   *
+   * The check is the piece's own yaw, which is the one thing that says which
+   * way it is facing. `halfWidth` runs ACROSS the front, so it lies on x when
+   * the front points along z, and on z when the front points along x.
+   */
+  it('gives every furnishing a collider the shape of the model, whichever way it is turned', () => {
+    let checked = 0;
+    for (const parcel of enterable) {
+      for (const piece of interiorFurnishings(parcel)) {
+        const spec = FURNISHING_SPECS[piece.model];
+        // A skewed piece is not axis-aligned and has no exact answer here.
+        const quarter = piece.yaw / (Math.PI / 2);
+        if (Math.abs(quarter - Math.round(quarter)) > 1e-6) continue;
+        checked += 1;
+
+        // |sin yaw| is 1 when the piece faces along x, 0 when it faces along z.
+        const facesX = Math.abs(Math.sin(piece.yaw)) > 0.5;
+        const wantX = facesX ? spec.halfDepth : spec.halfWidth;
+        const wantZ = facesX ? spec.halfWidth : spec.halfDepth;
+        expect(piece.halfX, `${parcel.id} ${piece.model} halfX`).toBeCloseTo(wantX, 6);
+        expect(piece.halfZ, `${parcel.id} ${piece.model} halfZ`).toBeCloseTo(wantZ, 6);
+      }
+    }
+    expect(checked, 'no axis-aligned furnishings to check').toBeGreaterThan(30);
   });
 
   it('gives the same answer every time', () => {
