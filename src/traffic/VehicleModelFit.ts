@@ -533,7 +533,13 @@ class ArchClipper {
   private readonly baseCount: number;
   private readonly hasNormals: boolean;
   private readonly hasUvs: boolean;
-  /** Scratch polygons, reused so a body's worth of clipping allocates nothing. */
+  /**
+   * Scratch polygons, rotated between the three roles each edge needs.
+   *
+   * They are reused rather than reallocated per edge; the clip itself still
+   * allocates a small array per crossing vertex, which is fine because this
+   * runs once per body at load and never in a frame.
+   */
   private a: number[] = [];
   private b: number[] = [];
   private c: number[] = [];

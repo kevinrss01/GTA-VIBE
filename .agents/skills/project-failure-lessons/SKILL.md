@@ -281,3 +281,22 @@ penetration, and recentre it on the reference clip's mean centroid.
 it loops, whether it travels, and whether it stands on the same part of the
 body. `--report` prints all three (`travel ... u/cycle`, `lowest vertex`, the
 per-foot contact table) without writing anything.
+
+### 8a. The same VLM failure, seen a third time (2026-08-27)
+
+Confirming the entry above rather than adding to it. A local `--headed` run of
+the durable smoke test against the production preview returned:
+
+```
+result: FAILED   issues: []   screenshots: 0   steps completed: 2 of 12
+```
+
+The two steps that completed are the two the DOM can answer - navigate, and
+click the start button - and both PASSED, with the run agent reporting "the
+city view (Harbourside Harbour Walk) appeared", which is real evidence that the
+production build boots and reaches gameplay. Execution stops at step 3, the
+first visual assertion.
+
+`issues: []` with zero screenshots is the fingerprint. Do not read it as a
+product defect and do not weaken the saved test to make it go green: check
+`issues` and the completed step summaries, then verify the visual half locally.

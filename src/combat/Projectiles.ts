@@ -50,7 +50,16 @@ const MAX_LIVE = 4;
 /** Seconds a rocket may fly before it gives up and detonates in mid-air. */
 const MAX_FLIGHT = 6;
 
-/** Metres of clearance kept between the muzzle and the first collision test. */
+/**
+ * Metres a rocket travels before its fuse arms.
+ *
+ * Nothing is tested for collision inside this distance, which is what stops a
+ * rocket detonating on the shoulder that fired it or on the player's own
+ * collision cylinder. It is a distance TRAVELLED and not a forward offset on
+ * the probe: offsetting the probe leaves an untested gap between where the
+ * rocket is and where it looks, and at 46 m/s that gap is wider than a frame's
+ * step - a wall half a metre away would have been passed straight through.
+ */
 const ARMING_DISTANCE = 0.9;
 
 /**
@@ -72,9 +81,9 @@ export interface ProjectileOptions {
   /** Real length of the rocket along its axis, in metres. */
   readonly length?: number | undefined;
   /**
-   * Nearest obstruction along a segment, in metres, or a value at or beyond
-   * `maxT` for a clear path. This is the caller's whole world: geometry,
-   * terrain, people and vehicles all arrive through it.
+   * Distance to the nearest obstruction along a segment, in metres, or a
+   * NEGATIVE number for a clear path. This is the caller's whole world:
+   * geometry, terrain, people and vehicles all arrive through it.
    */
   readonly probe: (
     ox: number,
@@ -112,6 +121,8 @@ interface Rocket {
   vy: number;
   vz: number;
   age: number;
+  /** Metres covered since launch, for the fuse. */
+  travelled: number;
   trail: number;
   view: Object3D | null;
 }
@@ -201,6 +212,7 @@ export class Projectiles {
     rocket.vy = (dy / length) * speed;
     rocket.vz = (dz / length) * speed;
     rocket.age = 0;
+    rocket.travelled = 0;
     rocket.trail = 0;
     this.attachView(rocket);
     this.options.onLaunch?.(snapshot(rocket));
@@ -220,26 +232,24 @@ export class Projectiles {
         const dirX = rocket.vx / speed;
         const dirY = rocket.vy / speed;
         const dirZ = rocket.vz / speed;
-        // Only test past the arming distance for the first fraction of a
-        // second, so a rocket does not detonate on the shoulder that fired it.
-        const from = rocket.age < 0.12 ? ARMING_DISTANCE : 0;
-        const hit = this.options.probe(
-          rocket.x + dirX * from,
-          rocket.y + dirY * from,
-          rocket.z + dirZ * from,
-          dirX,
-          dirY,
-          dirZ,
-          step,
-        );
-        if (hit >= 0 && hit < step) {
-          const at = from + hit;
-          this.detonate(rocket, rocket.x + dirX * at, rocket.y + dirY * at, rocket.z + dirZ * at);
-          continue;
+        // The whole of the step is tested, every step, once the fuse is armed.
+        // Before that nothing is - see `ARMING_DISTANCE`.
+        if (rocket.travelled >= ARMING_DISTANCE) {
+          const hit = this.options.probe(rocket.x, rocket.y, rocket.z, dirX, dirY, dirZ, step);
+          if (hit >= 0 && hit < step) {
+            this.detonate(
+              rocket,
+              rocket.x + dirX * hit,
+              rocket.y + dirY * hit,
+              rocket.z + dirZ * hit,
+            );
+            continue;
+          }
         }
         rocket.x += dirX * step;
         rocket.y += dirY * step;
         rocket.z += dirZ * step;
+        rocket.travelled += step;
       }
 
       if (rocket.age >= MAX_FLIGHT) {
@@ -281,7 +291,8 @@ export class Projectiles {
     for (const rocket of this.rockets) if (!rocket.live) return rocket;
     if (this.rockets.length >= MAX_LIVE) return null;
     const rocket: Rocket = {
-      id: 0, live: false, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, age: 0, trail: 0, view: null,
+      id: 0, live: false, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0,
+      age: 0, travelled: 0, trail: 0, view: null,
     };
     this.rockets.push(rocket);
     return rocket;

@@ -480,7 +480,10 @@ async function boot(): Promise<void> {
     },
     onRocket: (rocket) => {
       const flight = combatAudio.flight(rocket.x, rocket.y, rocket.z);
-      rocketFlights.push({ rocket, flight });
+      // The id is captured because the handle is a live VIEW of a pooled
+      // rocket: once that slot is reused for a later shot its `live` flag goes
+      // true again, and a motor loop matched only on `live` would never stop.
+      rocketFlights.push({ rocket, flight, id: rocket.id });
     },
     onSlotDenied: (weapon, reason) => {
       hud.flash(
@@ -499,7 +502,7 @@ async function boot(): Promise<void> {
   police.setEffects(combat.effects);
 
   /** Live rocket motors, so each one's loop can follow it and then stop. */
-  const rocketFlights: { rocket: RocketHandle; flight: FlightSound }[] = [];
+  const rocketFlights: { rocket: RocketHandle; flight: FlightSound; id: number }[] = [];
 
   const respawn = new RespawnDirector({
     player,
@@ -712,7 +715,7 @@ async function boot(): Promise<void> {
     for (let i = rocketFlights.length - 1; i >= 0; i -= 1) {
       const entry = rocketFlights[i];
       if (!entry) continue;
-      if (entry.rocket.live) {
+      if (entry.rocket.live && entry.rocket.id === entry.id) {
         entry.flight.moveTo(entry.rocket.x, entry.rocket.y, entry.rocket.z);
       } else {
         entry.flight.stop();
