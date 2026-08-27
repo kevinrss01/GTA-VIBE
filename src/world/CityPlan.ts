@@ -137,6 +137,7 @@ export type InteriorKind =
   | 'cafe'
   | 'store'
   | 'gunStore'
+  | 'nightclub'
   | 'marketHall'
   | 'lobby'
   | 'workshop'
@@ -874,6 +875,18 @@ const ENTERABLE_TARGETS: readonly { district: DistrictId; kind: InteriorKind; co
   { district: 'core', kind: 'lobby', count: 1 },
   { district: 'civic', kind: 'marketHall', count: 1 },
   { district: 'ridge', kind: 'stairhall', count: 1 },
+  /*
+   * The Vibe, on the Harbour Walk. LAST in the list, and that is not a
+   * stylistic choice: every target consumes exactly one `rng.pick` from one
+   * shared stream, so a target inserted anywhere else shifts every pick after
+   * it and moves buildings all over the city. Appended, the first seven picks
+   * are the picks they always were and only the eighth is new.
+   *
+   * Measured when this was briefly second in the list: the gun shop moved
+   * districts, an Old Quarter interior ended up within earshot of the sea, and
+   * an interior in the Core poked out through its own north wall.
+   */
+  { district: 'harbourside', kind: 'nightclub', count: 1 },
 ];
 
 function buildParcels(blocks: readonly CityBlock[], streets: readonly Street[], rng: Rng): Parcel[] {

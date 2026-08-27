@@ -97,6 +97,11 @@ const MODEL_PATHS: Readonly<Record<FurnishingModel, string>> = {
   stallFlowers: 'models/interiors/stall-flowers/model.glb',
   cafeCounter: 'models/interiors/cafe-counter/model.glb',
   vendingMachine: 'models/interiors/vending-machine/model.glb',
+  clubBar: 'models/club/bar.glb',
+  clubBooth: 'models/club/booth.glb',
+  djBooth: 'models/club/dj-booth.glb',
+  clubSpeaker: 'models/club/speaker.glb',
+  cashBox: 'models/club/cash-box.glb',
 };
 
 interface Fitted {
@@ -238,6 +243,29 @@ export class Furnishings {
       this.group.add(room);
     }
     return this.pieces;
+  }
+
+  /**
+   * Shows or hides ONE piece of furniture: the box the mission asks the player
+   * to carry away, which would otherwise still be sitting on the bench after
+   * they had picked it up.
+   *
+   * WHY IT IS ALL-OR-NOTHING PER MODEL. A room draws one `InstancedMesh` per
+   * model, so there is no per-instance visibility to switch; hiding the mesh
+   * hides every copy of that model in that room. That is exactly right for a
+   * lone crate and exactly wrong for the chairs, so the call refuses - and
+   * returns false - unless the room holds a single instance of the model. A
+   * second crate added to the lock-up later would make this stop working, and
+   * it stops working LOUDLY rather than quietly hiding the furniture.
+   *
+   * Returns false if the model never loaded, which is not an error: the
+   * interior is simply furnished without it.
+   */
+  setPieceVisible(parcelId: string, model: FurnishingModel, visible: boolean): boolean {
+    const mesh = this.meshes.find((candidate) => candidate.name === `furnishing-${model}-${parcelId}`);
+    if (!mesh || mesh.count !== 1) return false;
+    mesh.visible = visible;
+    return true;
   }
 
   /** Draws only the interior the player is actually standing in or beside. */

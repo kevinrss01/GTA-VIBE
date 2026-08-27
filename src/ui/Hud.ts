@@ -17,7 +17,7 @@
  */
 
 import './ui.css';
-import { formatMoney } from './GunShopUi';
+import { formatMoney } from '../player/money';
 import { DISTRICT_LABELS } from './Minimap';
 import { CONTROL_HINTS, musicLabel, type QualityLevel } from './PauseMenu';
 
@@ -81,6 +81,10 @@ export class Hud {
   private readonly flashEl: HTMLElement;
   private flashTimer = 0;
   private flashText = '';
+  private readonly objectiveEl: HTMLElement;
+  private readonly objectiveTitleEl: HTMLElement;
+  private readonly objectiveDetailEl: HTMLElement;
+  private objectiveLine = '';
   private wanted = -1;
   private health = Number.NaN;
   private weaponLine = '';
@@ -237,7 +241,24 @@ export class Hud {
     this.flashEl.className = 'mb-hud__flash';
     this.flashEl.setAttribute('role', 'status');
 
-    this.element.append(this.vitalsEl, this.bannerEl, this.flashEl);
+    /*
+     * The objective card, top left under the district name.
+     *
+     * Deliberately NOT the banner: the banner takes the middle of the screen
+     * and is for being dead or being paid. This is a standing line that says
+     * what the player is currently doing, and it has to be readable while
+     * driving, which is why it sits out of the way and never moves.
+     */
+    this.objectiveEl = document.createElement('div');
+    this.objectiveEl.className = 'mb-hud__objective';
+    this.objectiveEl.setAttribute('aria-live', 'polite');
+    this.objectiveTitleEl = document.createElement('p');
+    this.objectiveTitleEl.className = 'mb-hud__objective-title';
+    this.objectiveDetailEl = document.createElement('p');
+    this.objectiveDetailEl.className = 'mb-hud__objective-detail';
+    this.objectiveEl.append(this.objectiveTitleEl, this.objectiveDetailEl);
+
+    this.element.append(this.vitalsEl, this.bannerEl, this.flashEl, this.objectiveEl);
     // -------------------------------------------------------------------------
 
     this.setLocation('', null);
@@ -384,6 +405,24 @@ export class Hud {
   /** The message currently up, or an empty string. For automated QA. */
   get flashMessage(): string {
     return this.flashText;
+  }
+
+  /**
+   * What the player is doing. `null` clears the card entirely, which is what a
+   * build with no mission wired in shows.
+   */
+  setObjective(title: string | null, detail = ''): void {
+    const line = `${title ?? ''}|${detail}`;
+    if (line === this.objectiveLine) return;
+    this.objectiveLine = line;
+    this.objectiveTitleEl.textContent = title ?? '';
+    this.objectiveDetailEl.textContent = detail;
+    this.objectiveEl.classList.toggle('is-visible', title !== null && title.length > 0);
+  }
+
+  /** The objective currently shown, or an empty string. For automated QA. */
+  get objective(): string {
+    return this.objectiveTitleEl.textContent ?? '';
   }
 
   /**

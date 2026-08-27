@@ -46,7 +46,7 @@
  * ============================================================================
  *
  * The shop is deliberately three separable things:
- *   `Shopkeeper.ts`     the person, one instance of a baked crowd character
+ *   `agents/StandingCharacter.ts`  Ilse, one instance of a baked character
  *   `WeaponDisplay.ts`  the generated stock, instanced
  *   `ui/GunShopUi.ts`   the counter interface
  * and this class is only the wiring between them, the interaction point, and
@@ -62,7 +62,7 @@ import { GunShopUi } from '../ui/GunShopUi';
 import type { CityPlan, Parcel } from '../world/CityPlan';
 import { gunStoreAnchors, type GunStoreAnchors } from '../world/build/interiorProps';
 import type { InteractionPoint } from '../world/build/types';
-import { Shopkeeper } from './Shopkeeper';
+import { StandingCharacter } from '../agents/StandingCharacter';
 import { WeaponDisplay } from './WeaponDisplay';
 
 export interface GunShopOptions {
@@ -94,7 +94,7 @@ export class GunShop {
 
   private readonly player: PlayerState;
   private readonly ui: GunShopUi;
-  private readonly clerk: Shopkeeper;
+  private readonly clerk: StandingCharacter;
   private readonly stock: WeaponDisplay;
   private readonly parcel: Parcel | null;
   private readonly anchors: GunStoreAnchors | null;
@@ -113,7 +113,7 @@ export class GunShop {
     this.group = new Group();
     this.group.name = 'gun-shop';
 
-    this.clerk = new Shopkeeper();
+    this.clerk = new StandingCharacter();
     this.stock = new WeaponDisplay(options.baseUrl ?? '/');
     this.group.add(this.clerk.group, this.stock.group);
     // Nothing to draw until the counter is found and the assets land.

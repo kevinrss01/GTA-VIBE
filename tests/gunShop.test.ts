@@ -64,8 +64,11 @@ describe('the gun shop is on the plan', () => {
   it('leaves every other enterable building exactly where it was', () => {
     // The gun shop was carved out of the Old Quarter's second shopfront by
     // splitting one `count: 2` target into two `count: 1` targets, which draws
-    // the same parcels from the same RNG stream. If this list ever changes,
-    // something moved a building somewhere else in the city.
+    // the same parcels from the same RNG stream; The Vibe was added by
+    // APPENDING a target, which leaves the first seven picks untouched. If any
+    // line but the last ever changes, something moved a building somewhere
+    // else in the city - which is exactly what happened when the nightclub was
+    // briefly second in the list.
     const kinds = enterable
       .map((parcel) => `${parcel.id}:${parcel.interiorKind}`)
       .sort();
@@ -75,6 +78,7 @@ describe('the gun shop is on the plan', () => {
       'parcel-112:store',
       'parcel-116:marketHall',
       'parcel-31:stairhall',
+      'parcel-58:nightclub',
       'parcel-69:gunStore',
       'parcel-9:lobby',
     ]);
@@ -219,12 +223,24 @@ describe('generated furnishings', () => {
         if (piece.solid) {
           expect(piece.y, `${parcel.id} ${piece.model} floats`).toBeCloseTo(parcel.groundY, 6);
         } else {
-          // A counter-top piece stands on something, never in mid air and
-          // never above head height.
-          expect(piece.y).toBeGreaterThan(parcel.groundY + 0.5);
+          /*
+           * A piece with no collider stands ON something, never in mid air and
+           * never above head height.
+           *
+           * The lower bound used to be 0.5, which was the height of the only
+           * surface that existed when it was written - a counter. The club
+           * added a second: a 0.34 m DJ platform, which is emitted as a solid
+           * in its own right, so the console on top of it needs no collider of
+           * its own and correctly stands lower than any counter in the city.
+           */
+          expect(piece.y).toBeGreaterThan(parcel.groundY + 0.3);
           expect(piece.y).toBeLessThan(parcel.groundY + 1.6);
         }
-        expect(piece.height).toBeGreaterThan(0.3);
+        // Nothing is smaller than a strongbox or taller than a stall canopy.
+        // The floor was 0.3 until the club's cash box arrived at 0.21, which
+        // is what a strongbox is; the bound is there to catch a model fitted
+        // by the wrong axis, and 0.18 still does that.
+        expect(piece.height).toBeGreaterThan(0.18);
         expect(piece.height).toBeLessThan(2.2);
         expect(piece.halfX).toBeGreaterThan(0.1);
         expect(piece.halfZ).toBeGreaterThan(0.1);

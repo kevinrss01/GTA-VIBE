@@ -9,6 +9,7 @@
  */
 
 import './ui.css';
+import { CITY_NAME, GAME_NAME } from '../story';
 
 const FADE_MS = 420;
 
@@ -27,7 +28,10 @@ export class LoadingScreen {
   private progress = -1;
   private disposed = false;
 
-  constructor() {
+  private readonly baseUrl: string;
+
+  constructor(baseUrl = '') {
+    this.baseUrl = baseUrl;
     this.element = document.createElement('div');
     this.element.className = 'mb-loading';
 
@@ -36,11 +40,11 @@ export class LoadingScreen {
 
     const eyebrow = document.createElement('p');
     eyebrow.className = 'mb-loading__eyebrow';
-    eyebrow.textContent = 'A city on foot';
+    eyebrow.textContent = CITY_NAME;
 
     const title = document.createElement('h1');
     title.className = 'mb-loading__title';
-    title.textContent = 'Meridian Bay';
+    title.textContent = GAME_NAME;
 
     this.track = document.createElement('div');
     this.track.className = 'mb-loading__track';
@@ -61,12 +65,34 @@ export class LoadingScreen {
     this.startButton = document.createElement('button');
     this.startButton.type = 'button';
     this.startButton.className = 'mb-button mb-button--primary mb-loading__start';
-    this.startButton.textContent = 'Click to explore Meridian Bay';
+    this.startButton.textContent = `Click to explore ${CITY_NAME}`;
     this.startButton.addEventListener('click', this.onStart);
     this.gate.append(this.startButton);
 
     panel.append(eyebrow, title, this.track, this.label, this.gate);
     this.element.append(panel);
+    this.adoptKeyArt();
+  }
+
+  /**
+   * Puts the generated key art behind the panel, IF it is there.
+   *
+   * Probed with an `Image` rather than written into the stylesheet, and that
+   * is the whole point: `tools/generate-key-art.mjs` writes
+   * `public/art/key-art.jpg`, and a build made before anybody has run it has
+   * no such file. A CSS `background-image` would log a failed request on every
+   * single load; a probe that quietly fails leaves the flat dark ground the
+   * screen already had, which is a complete design on its own.
+   */
+  private adoptKeyArt(): void {
+    if (typeof Image === 'undefined') return;
+    const url = `${this.baseUrl}art/key-art.jpg`;
+    const probe = new Image();
+    probe.onload = (): void => {
+      this.element.style.backgroundImage = `url(${JSON.stringify(url)})`;
+      this.element.classList.add('has-art');
+    };
+    probe.src = url;
   }
 
   setProgress(fraction: number, label: string): void {
