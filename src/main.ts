@@ -548,6 +548,17 @@ async function boot(): Promise<void> {
     },
   });
 
+  /*
+   * The death rattle goes on BEFORE the respawn director is built.
+   *
+   * `RespawnDirector` takes whatever `onDeath` it finds, chains it, and
+   * installs its own - so assigning here after it was constructed would
+   * silently replace the handler that respawns the player, and being killed
+   * would leave them lying in the road for good. Nothing may assign to
+   * `player.onDeath` below this line.
+   */
+  player.onDeath = () => combatAudio.death();
+
   const respawn = new RespawnDirector({
     player,
     spawn: plan.spawn,
@@ -561,6 +572,9 @@ async function boot(): Promise<void> {
       combat.reset();
       combatAudio.reset();
       damageFeedback.reset();
+      // Whoever was talking stops, and the job moves on to where the
+      // conversation would have left it. See `Dialogue.skip`.
+      dialogue.skip();
     },
   });
 
@@ -576,7 +590,6 @@ async function boot(): Promise<void> {
     combatAudio.hurt();
     damageFeedback.hit(amount / MAX_HEALTH, sourceX, sourceZ);
   };
-  player.onDeath = () => combatAudio.death();
 
   interactions.onActivate = ({ point }) => {
     // The mission gets first refusal: the bar and the lock-up crate are

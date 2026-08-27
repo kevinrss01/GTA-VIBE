@@ -7,6 +7,8 @@
  * asserted here is the same code the game runs, not a description of it.
  */
 
+import { readFileSync } from 'node:fs';
+
 import { PerspectiveCamera } from 'three';
 import { describe, expect, it } from 'vitest';
 
@@ -720,6 +722,38 @@ describe('death and respawn', () => {
     expect(harness.state.banners).toEqual(['Wasted', null]);
     expect(harness.respawn.count).toBe(1);
     harness.respawn.dispose();
+  });
+
+  /*
+   * The wiring test for the contract the two above describe.
+   *
+   * `RespawnDirector` takes whatever `player.onDeath` it finds, chains it, and
+   * installs its own - so an assignment made AFTER the constructor runs
+   * silently replaces the handler that puts the player back on their feet, and
+   * being killed leaves them lying in the road with a red screen for ever.
+   * That shipped once: `player.onDeath = () => combatAudio.death()` sat twenty
+   * lines below the constructor and only arrest worked.
+   *
+   * `main.ts` cannot be imported here - it builds a city and asks for a WebGL
+   * context at module scope - so the order is checked in the source, which is
+   * the thing that was actually wrong.
+   */
+  it('assigns player.onDeath before the respawn director is built, in main.ts', () => {
+    const source = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8');
+    const director = source.indexOf('new RespawnDirector(');
+    expect(director, 'main.ts no longer builds a RespawnDirector').toBeGreaterThan(0);
+
+    const assignments: number[] = [];
+    const pattern = /player\.onDeath\s*=/g;
+    for (let hit = pattern.exec(source); hit; hit = pattern.exec(source)) {
+      assignments.push(hit.index);
+    }
+    expect(assignments.length, 'main.ts no longer assigns player.onDeath').toBeGreaterThan(0);
+    for (const at of assignments) {
+      expect(at, 'player.onDeath is assigned after RespawnDirector, which unhooks respawn').toBeLessThan(
+        director,
+      );
+    }
   });
 
   it('hands `onDeath` back when it is disposed', () => {

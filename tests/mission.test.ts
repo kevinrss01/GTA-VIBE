@@ -57,6 +57,11 @@ class FakeDialogue implements DialoguePlayer {
     this.pending = null;
     pending?.();
   }
+
+  /** What `Dialogue.skip` does when the player is killed mid-sentence. */
+  skip(): void {
+    this.finish();
+  }
 }
 
 interface Harness {
@@ -316,6 +321,42 @@ describe('Last Call', () => {
     const h = harness();
     expect(h.mission.promptFor('door-parcel-0')).toBeNull();
     expect(h.mission.activate('door-parcel-0')).toBe(false);
+  });
+
+  /*
+   * Being killed or arrested mid-sentence must not park the job.
+   *
+   * `main.ts` calls `Dialogue.skip` from the respawn director's bust handler,
+   * and skip runs the pending callback rather than dropping it. Dropping it
+   * would leave the director in a stage only that callback can leave - the box
+   * in the player's hands and nobody willing to ask for it.
+   */
+  it('survives being interrupted in each of its three conversations', () => {
+    for (const cut of ['briefing', 'handover', 'payout'] as const) {
+      const h = harness();
+      h.mission.activate(h.barId);
+      if (cut === 'briefing') {
+        h.dialogue.skip();
+        expect(h.mission.stage).toBe('collect');
+        continue;
+      }
+      h.dialogue.finish();
+
+      h.mission.activate(h.crateId);
+      if (cut === 'handover') {
+        h.dialogue.skip();
+        expect(h.mission.stage).toBe('deliver');
+        // The tip-off still happened; the player simply did not hear it.
+        expect(h.player.heat).toBe(TIP_OFF_HEAT);
+        continue;
+      }
+      h.dialogue.finish();
+
+      h.mission.activate(h.barId);
+      h.dialogue.skip();
+      expect(h.mission.stage).toBe('complete');
+      expect(h.player.money).toBe(STARTING_MONEY + MISSION_FEE);
+    }
   });
 
   it('pays a fee worth the drive', () => {
