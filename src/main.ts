@@ -48,6 +48,11 @@ import { FirstPersonController } from './player/FirstPersonController';
 import { Driving } from './player/Driving';
 import { InteractionSystem } from './player/Interaction';
 import { AudioDirector } from './audio/AudioDirector';
+import { Dialogue } from './mission/Dialogue';
+import { MissionDirector } from './mission/Mission';
+import { StandingCharacter } from './agents/StandingCharacter';
+import { lockupAnchor, nightclubAnchor } from './world/build/interiorProps';
+import { CAST } from './story';
 import { DamageFeedback } from './ui/DamageFeedback';
 import { Hud } from './ui/Hud';
 import { LoadingScreen } from './ui/LoadingScreen';
@@ -115,7 +120,7 @@ async function boot(): Promise<void> {
     return;
   }
 
-  const loading = new LoadingScreen();
+  const loading = new LoadingScreen(import.meta.env.BASE_URL);
   document.body.appendChild(loading.element);
 
   loading.setProgress(0.04, 'Planning Meridian Bay');
@@ -504,6 +509,56 @@ async function boot(): Promise<void> {
   /** Live rocket motors, so each one's loop can follow it and then stop. */
   const rocketFlights: { rocket: RocketHandle; flight: FlightSound; id: number }[] = [];
 
+  // -- the job ---------------------------------------------------------------
+  // Sable at the bar in The Vibe, and Teo beside the crate in the Cannery
+  // lock-up. Both are one instance of a baked character standing still, the
+  // same as the gun shop's clerk.
+  const dialogue = new Dialogue(audio);
+  hud.element.append(dialogue.element);
+
+  const clubParcel = plan.parcels.find((p) => p.interiorKind === 'nightclub') ?? null;
+  const lockupParcel = plan.parcels.find((p) => p.interiorKind === 'workshop') ?? null;
+  const missionCast: { character: StandingCharacter; id: string }[] = [];
+  for (const [parcel, anchorFor, who] of [
+    [clubParcel, nightclubAnchor, CAST.sable],
+    [lockupParcel, lockupAnchor, CAST.teo],
+  ] as const) {
+    if (!parcel || !who.character) continue;
+    const anchor = anchorFor(parcel);
+    if (!anchor) continue;
+    const person = new StandingCharacter();
+    person.place(anchor);
+    engine.scene.add(person.group);
+    missionCast.push({ character: person, id: who.character });
+  }
+
+  const mission = new MissionDirector({
+    plan,
+    player,
+    dialogue,
+    onObjective: (objective) => hud.setObjective(objective.title, objective.detail),
+    onWaypoint: (waypoint) => minimap.setWaypoint(waypoint),
+    onBanner: (title, detail) => hud.setBanner(title, detail),
+    onPaid: () => audio.playOneShot('ui-tick'),
+    // Taking the box takes it: the lock-up's crate stops being drawn the
+    // moment the player lifts it, rather than sitting on the bench for the
+    // rest of the game. A no-op if the model never downloaded.
+    onCrateTaken: () => {
+      if (lockupParcel) furnishings.setPieceVisible(lockupParcel.id, 'cashBox', false);
+    },
+  });
+
+  /*
+   * The death rattle goes on BEFORE the respawn director is built.
+   *
+   * `RespawnDirector` takes whatever `onDeath` it finds, chains it, and
+   * installs its own - so assigning here after it was constructed would
+   * silently replace the handler that respawns the player, and being killed
+   * would leave them lying in the road for good. Nothing may assign to
+   * `player.onDeath` below this line.
+   */
+  player.onDeath = () => combatAudio.death();
+
   const respawn = new RespawnDirector({
     player,
     spawn: plan.spawn,
@@ -517,6 +572,12 @@ async function boot(): Promise<void> {
       combat.reset();
       combatAudio.reset();
       damageFeedback.reset();
+      // Whoever was talking stops, and the job backs up to the point where it
+      // will offer that conversation again. Always the two together: cutting
+      // the dialogue alone would strand the director in a stage only the
+      // dropped callback could leave. See `MissionDirector.interrupt`.
+      dialogue.cut();
+      mission.interrupt();
     },
   });
 
@@ -532,9 +593,12 @@ async function boot(): Promise<void> {
     combatAudio.hurt();
     damageFeedback.hit(amount / MAX_HEALTH, sourceX, sourceZ);
   };
-  player.onDeath = () => combatAudio.death();
 
   interactions.onActivate = ({ point }) => {
+    // The mission gets first refusal: the bar and the lock-up crate are
+    // ordinary interaction points that mean different things depending on what
+    // the player has been asked to do.
+    if (mission.activate(point.id)) return;
     // The counter is an interaction point like any other; the shop claims it.
     if (shop.tryOpen(point)) return;
     if (point.kind !== 'door' || !point.target) return;
@@ -679,6 +743,9 @@ async function boot(): Promise<void> {
     hud.setWanted(player.wanted);
     hud.setHealth(player.health, MAX_HEALTH);
     hud.tick(dt);
+    dialogue.update(dt);
+    mission.update(dt);
+    for (const person of missionCast) person.character.update(dt);
     damageFeedback.update(dt, {
       health: player.health / MAX_HEALTH,
       alive: player.alive,
@@ -772,7 +839,10 @@ async function boot(): Promise<void> {
     if (drive.driving) {
       hud.setInteractionPrompt('Press E to get out');
     } else if (interactions.focused) {
-      hud.setInteractionPrompt(interactions.focused.prompt);
+      // A mission override of '' means "say nothing here right now", which is
+      // different from null: null hands the point's own prompt back.
+      const override = mission.promptFor(interactions.focused.id);
+      hud.setInteractionPrompt(override === null ? interactions.focused.prompt : override || null);
     } else {
       const car = driving.candidateAt(state.x, state.z);
       hud.setInteractionPrompt(car ? `Press E to drive the ${car.kind}` : null);
@@ -827,6 +897,10 @@ async function boot(): Promise<void> {
   // Gunfire has to be resident before the first trigger pull, not fetched
   // after it: a shot whose sound arrives 300 ms late reads as no sound at all.
   combatAudio.preload();
+  // A line of dialogue that arrives after the subtitle has gone is worse than
+  // no line at all, so every recording is decoded before the first one plays.
+  dialogue.preload();
+  for (const person of missionCast) void person.character.load(person.id);
   hud.setMusicEnabled(audio.musicEnabled);
   pause.setMusicEnabled(audio.musicEnabled);
 
@@ -852,6 +926,9 @@ async function boot(): Promise<void> {
     streetAudio.dispose();
     combatAudio.dispose();
     damageFeedback.dispose();
+    dialogue.dispose();
+    mission.dispose();
+    for (const person of missionCast) person.character.dispose();
     shop.dispose();
     furnishings.dispose();
     combat.dispose();

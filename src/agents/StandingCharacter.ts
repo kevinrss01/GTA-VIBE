@@ -1,25 +1,27 @@
 /**
- * The person behind the counter.
+ * One named person standing in one place indoors.
  *
- * The crowd already ships four Tripo-generated, auto-rigged, retargeted
- * characters baked into vertex animation textures (`agents/PedestrianVat.ts`),
- * and one of them standing still playing its idle clip is exactly what a
- * shopkeeper is. Generating a dedicated clerk would have bought a different
- * shirt for forty credits and a second 2 MB download; this reuses the rig,
- * the shader, the material and the already-compiled program, and costs one
- * instanced draw call.
+ * Three of them exist: the clerk behind the counter at Bellhouse Arms, Sable
+ * at the bar in The Vibe, and Teo in the Cannery lock-up. They are not part of
+ * the crowd - `PedestrianSystem` owns a pool of walkers on the pavement graph
+ * and has no concept of somebody who stands still in a room - so each is a
+ * single instance of the same baked mesh, placed once and animated on the
+ * clock.
  *
- * The clerk is not part of the crowd: `PedestrianSystem` owns a pool of
- * walking agents on the pavement graph and has no concept of somebody who
- * stands in one place indoors. This is a single instance of the same mesh,
- * placed once and animated on the clock.
+ * The crowd already ships baked, auto-rigged, retargeted characters
+ * (`agents/PedestrianVat.ts`), and one of them standing still playing its idle
+ * clip is exactly what a shopkeeper is. Two of the three named people reuse
+ * one rather than getting a generated head of their own; Sable has her own
+ * bake, because the game is named after her club. Either way this reuses the
+ * rig, the shader, the material and the already-compiled program, and costs
+ * one instanced draw call per person.
  *
  * ## Failure
  *
  * A character that fails to download leaves `ready` false and draws nothing.
- * The shop still works - the counter, the interface and the purchase are all
- * independent of it - so a missing asset is a missing person, not a broken
- * feature.
+ * Everything they are standing next to still works - the counter, the shop
+ * interface, the mission's own conversation - so a missing asset is a missing
+ * person, not a broken feature.
  */
 
 import { Group, type InstancedMesh, type Object3D } from 'three';
@@ -28,9 +30,9 @@ import { createPedestrianVatMesh, type PedestrianVatBundle } from '../agents/Ped
 import { loadPedestrianVat, type PedestrianVatCharacter } from '../agents/PedestrianVat';
 
 /**
- * Which of the baked characters serves in the shop.
+ * Which baked character serves in the gun shop.
  *
- * Fixed rather than random: the shopkeeper is a specific person in a specific
+ * Fixed rather than random: Ilse Bellhouse is a specific person in a specific
  * building, and a clerk who changes face between two loads of the same city
  * would be a bug, not variety.
  */
@@ -40,7 +42,7 @@ export const SHOPKEEPER_CHARACTER = 'ped-c';
 const HEIGHT = 1.79;
 const GIRTH = 1.02;
 
-export interface ShopkeeperPlacement {
+export interface StandingPlacement {
   readonly x: number;
   readonly y: number;
   readonly z: number;
@@ -48,13 +50,13 @@ export interface ShopkeeperPlacement {
   readonly heading: number;
 }
 
-export class Shopkeeper {
+export class StandingCharacter {
   readonly group: Object3D;
 
   private readonly bundle: PedestrianVatBundle;
   private readonly mesh: InstancedMesh;
   private character: PedestrianVatCharacter | null = null;
-  private placement: ShopkeeperPlacement | null = null;
+  private placement: StandingPlacement | null = null;
   private clock = 0;
   private disposed = false;
 
@@ -106,7 +108,7 @@ export class Shopkeeper {
   }
 
   /** Puts the clerk on the floor behind the counter, facing the customer. */
-  place(placement: ShopkeeperPlacement): void {
+  place(placement: StandingPlacement): void {
     this.placement = placement;
     this.applyPlacement();
   }

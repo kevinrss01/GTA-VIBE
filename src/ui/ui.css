@@ -119,6 +119,118 @@
  * `image-rendering: auto` is deliberate, because the smoothing is what turns
  * a coarse gradient back into a soft one.
  */
+/*
+ * The objective card. Top left, under the district name, out of the way of
+ * both the crosshair and the minimap - a player reads it once per objective
+ * and then needs it not to be in the way of driving.
+ */
+.mb-hud__objective {
+  position: absolute;
+  top: calc(var(--mb-gap) + 52px);
+  left: calc(var(--mb-gap) + env(safe-area-inset-left, 0px));
+  z-index: 1;
+  max-width: 280px;
+  padding: 7px 11px 8px;
+  border-left: 2px solid rgba(226, 74, 120, 0.9);
+  background: rgba(12, 15, 19, 0.52);
+  opacity: 0;
+  transform: translateX(-6px);
+  transition: opacity 220ms ease, transform 220ms ease;
+}
+
+.mb-hud__objective.is-visible {
+  opacity: 1;
+  transform: none;
+}
+
+.mb-hud__objective-title {
+  margin: 0;
+  color: #f6ece0;
+  font-size: 13px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.mb-hud__objective-detail {
+  margin: 3px 0 0;
+  color: rgba(226, 219, 209, 0.7);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+/*
+ * Dialogue subtitles. Bottom centre, above the weapon readout, and always
+ * present while somebody is speaking: the conversation happens over engine
+ * noise and sirens, and there is no way to replay a line.
+ */
+.mb-dialogue {
+  position: absolute;
+  left: 50%;
+  bottom: 96px;
+  z-index: 2;
+  width: min(680px, 82vw);
+  transform: translate(-50%, 8px);
+  padding: 10px 16px 12px;
+  border-radius: 5px;
+  background: rgba(10, 12, 16, 0.72);
+  opacity: 0;
+  transition: opacity 200ms ease, transform 200ms ease;
+}
+
+.mb-dialogue.is-visible {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+.mb-dialogue__name {
+  margin: 0;
+  color: rgba(226, 74, 120, 0.95);
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.mb-dialogue__text {
+  margin: 4px 0 0;
+  color: #f4ece2;
+  font-size: 15px;
+  line-height: 1.45;
+}
+
+/*
+ * The cast list on the pause card. A definition list, because that is what it
+ * is: a person, and who they are.
+ */
+.mb-castlist {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px 0;
+  margin: 0;
+}
+
+.mb-castlist dt {
+  color: #f2e6d8;
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.mb-castlist__role {
+  display: block;
+  margin-top: 2px;
+  color: rgba(212, 175, 118, 0.85);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: none;
+}
+
+.mb-castlist dd {
+  margin: 3px 0 0;
+  color: rgba(226, 219, 209, 0.72);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .mb-hud__damage {
   position: absolute;
   inset: 0;
@@ -801,9 +913,28 @@ body.mb-map-open .mb-hud__readout {
   align-items: center;
   justify-content: center;
   padding: 24px;
-  background: #070a0c;
+  background-color: #070a0c;
+  background-position: center;
+  background-size: cover;
   opacity: 1;
   transition: opacity 420ms ease;
+}
+
+/*
+ * Only set once the key art has actually loaded - see
+ * `LoadingScreen.adoptKeyArt`. The scrim keeps the title and the progress bar
+ * legible over whatever the picture happens to be doing behind them.
+ */
+.mb-loading.has-art::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    to bottom,
+    rgba(7, 10, 12, 0.55),
+    rgba(7, 10, 12, 0.78) 45%,
+    rgba(7, 10, 12, 0.92)
+  );
 }
 
 .mb-loading.is-hidden {
@@ -816,6 +947,8 @@ body.mb-map-open .mb-hud__readout {
 }
 
 .mb-loading__panel {
+  /* Above the key art's scrim, which is an absolutely positioned pseudo. */
+  position: relative;
   width: min(420px, 100%);
   text-align: left;
 }

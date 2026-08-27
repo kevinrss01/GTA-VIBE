@@ -35,6 +35,7 @@
 
 import './ui.css';
 import { ALL_WEAPONS, WEAPONS, type PlayerSnapshot, type WeaponId } from '../player/PlayerState';
+import { formatMoney } from '../player/money';
 import { WeaponPreview } from '../shop/WeaponPreview';
 import { weaponBars, type WeaponBarKey } from '../shop/weaponStats';
 
@@ -49,10 +50,6 @@ export interface GunShopUiCallbacks {
 /** The shop's own name. It is a licensed dealer in the Old Quarter, not an armoury. */
 export const SHOP_NAME = 'Bellhouse Arms';
 const SHOP_EYEBROW = 'Licensed dealer · Old Quarter';
-
-export function formatMoney(amount: number): string {
-  return `$${Math.round(amount).toLocaleString('en-US')}`;
-}
 
 interface Row {
   readonly id: WeaponId;

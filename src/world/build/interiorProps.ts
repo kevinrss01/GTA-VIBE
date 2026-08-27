@@ -178,6 +178,27 @@ const PALETTES: Readonly<Record<InteriorKind, InteriorPalette>> = {
     glow: 'signEmissiveWarm',
     threshold: 'stoneAshlar',
   },
+  /*
+   * The Vibe: a converted harbour warehouse, so board-marked concrete rather
+   * than plaster, dark metal everywhere the light has to come off something,
+   * and the magenta sign material for the glow instead of the warm one every
+   * other room in the city uses. That one swap is most of the read - a club is
+   * a dark room with coloured light in it, and `signEmissive` is the only
+   * material in the palette that is not a shade of daylight.
+   */
+  nightclub: {
+    floor: 'metalDark',
+    wall: 'concreteBoard',
+    ceiling: 'concrete',
+    trim: 'metalDark',
+    structure: 'metalDark',
+    joinery: 'timberDark',
+    surface: 'metalDark',
+    metal: 'metalDark',
+    fabric: 'canvasAwning',
+    glow: 'signEmissive',
+    threshold: 'stoneAshlar',
+  },
   store: {
     floor: 'tileFloor',
     wall: 'stuccoSand',
@@ -276,6 +297,10 @@ function ceilingHeight(parcel: Parcel, kind: InteriorKind): number {
     case 'store':
     case 'gunStore':
       return clamp(3.05, 2.5, single);
+    // Taller than a shop and shorter than a market: a club wants headroom over
+    // the floor for the rig, and it is still one storey of a harbour terrace.
+    case 'nightclub':
+      return clamp(3.9, 2.8, Math.max(single, parcel.groundStoreyHeight - 0.14));
     case 'lobby':
       return clamp(3.6, 2.7, single);
     case 'workshop':
@@ -1200,6 +1225,9 @@ export function addFittings(ctx: Fitout): void {
       break;
     case 'gunStore':
       addGunStoreFittings(ctx);
+      break;
+    case 'nightclub':
+      addNightclubFittings(ctx);
       break;
     case 'marketHall':
       addMarketFittings(ctx);
@@ -2569,6 +2597,240 @@ function addGunLighting(ctx: Fitout, plan: GunStorePlan): void {
   });
 }
 
+// ---------------------------------------------------------------------------
+// The Vibe
+// ---------------------------------------------------------------------------
+
+/** Height of the DJ platform above the floor, in metres. */
+const CLUB_STAGE_HEIGHT = 0.34;
+/** Height the neon band runs at, and how deep it stands off the wall. */
+const CLUB_NEON_Y = 2.15;
+const CLUB_NEON_PROUD = 0.06;
+
+/**
+ * Where everything in the club goes, in room-local coordinates.
+ *
+ * Computed once and shared by the built geometry, the generated furniture and
+ * the interaction point, so the bar the player is offered a conversation at is
+ * the bar that is actually standing there. `u` runs across the frontage and
+ * `v` runs from the front wall to the back.
+ */
+export interface NightclubPlan {
+  /** The bar run, along one flank. */
+  readonly barU: number;
+  readonly barV: readonly [number, number];
+  /** Which flank it is on: true when the bar is on the low-u side. */
+  readonly barLow: boolean;
+  /** The raised platform at the back. */
+  readonly stageU: readonly [number, number];
+  readonly stageV: readonly [number, number];
+  /** Where the player is offered the conversation, and where Sable stands. */
+  readonly serviceU: number;
+  readonly serviceV: number;
+  /** Centre of the open floor. */
+  readonly floorU: number;
+  readonly floorV: number;
+}
+
+export function nightclubPlan(room: Room): NightclubPlan {
+  const { width: W, depth: D } = room;
+  // The bar takes the flank the door is NOT on, so a customer walks in past
+  // the dance floor and reaches it from the side, as they do in a real room.
+  const barLow = room.doorU >= W / 2;
+  const barU = barLow ? clamp(1.15, 0.9, W * 0.4) : clamp(W - 1.15, W * 0.6, W - 0.9);
+  const barV: [number, number] = [clamp(D * 0.34, 1.6, D - 2.2), clamp(D * 0.78, 2.6, D - 0.9)];
+
+  const stageHalf = clamp(W * 0.26, 0.9, 2.4);
+  const stageU: [number, number] = [W / 2 - stageHalf, W / 2 + stageHalf];
+  const stageV: [number, number] = [clamp(D - 2.15, 1.8, D - 0.7), clamp(D - 0.55, 2.2, D - 0.35)];
+
+  return {
+    barU,
+    barV,
+    barLow,
+    stageU,
+    stageV,
+    // The near end of the bar, one step in from the room, on the open side of
+    // it - the player should meet Sable by walking up to the bar, not by
+    // walking through it.
+    serviceU: barLow ? barU + 0.95 : barU - 0.95,
+    serviceV: barV[0] + 0.7,
+    floorU: W / 2,
+    floorV: clamp(D * 0.46, 1.6, D - 2.6),
+  };
+}
+
+/**
+ * The Vibe: a converted harbour warehouse with a bar down one side, a lit
+ * dance floor in the middle and a low stage at the back.
+ *
+ * The furniture - bar, booths, DJ console, speaker stacks - is generated and
+ * placed by `Furnishings`; what is built here is the room around it: the
+ * platform, the floor inlay, the neon, and the light.
+ */
+function addNightclubFittings(ctx: Fitout): void {
+  const { room } = ctx;
+  const plan = nightclubPlan(room);
+
+  addClubStage(ctx, plan);
+  addClubFloor(ctx, plan);
+  addClubNeon(ctx, plan);
+  addClubBackBar(ctx, plan);
+  addClubLighting(ctx, plan);
+
+  // Sable stands at the bar. `kind: 'sign'` for the same reason the gun shop's
+  // counter is: the application's door handler must not try to walk through it.
+  const service = toWorld(room, plan.serviceU, plan.serviceV);
+  ctx.sink.interaction({
+    id: `nightclub-bar-${room.parcel.id}`,
+    x: service.x,
+    y: room.floorY + 1.2,
+    z: service.z,
+    radius: 2.9,
+    prompt: 'Press E to speak to Sable',
+    kind: 'sign',
+    parcelId: room.parcel.id,
+  });
+}
+
+/** The DJ platform: a low deck at the back with a lit riser under its lip. */
+function addClubStage(ctx: Fitout, plan: NightclubPlan): void {
+  const { room } = ctx;
+  const { floorY: F, palette } = room;
+  const [su0, su1] = plan.stageU;
+  const [sv0, sv1] = plan.stageV;
+
+  addSolid(ctx, palette.structure, {
+    u: [su0, su1],
+    v: [sv0, sv1],
+    y: [F, F + CLUB_STAGE_HEIGHT],
+  });
+  // A band of light along the front lip, which is what stops the platform
+  // reading as a step somebody forgot to finish.
+  addBox(ctx, palette.glow, {
+    u: [su0 + 0.08, su1 - 0.08],
+    v: [sv0 - 0.02, sv0 + 0.04],
+    y: [F + 0.06, F + CLUB_STAGE_HEIGHT - 0.06],
+  });
+}
+
+/**
+ * The dance floor: a lit inlay set into the deck.
+ *
+ * Drawn a centimetre proud rather than flush. Coplanar with the floor it would
+ * z-fight across the whole panel, and a floor that flickers is the single most
+ * obvious way to give away that a room is two surfaces pretending to be one.
+ */
+function addClubFloor(ctx: Fitout, plan: NightclubPlan): void {
+  const { room } = ctx;
+  const { floorY: F, width: W, depth: D, palette } = room;
+  const halfU = clamp(W * 0.22, 0.8, 2.6);
+  const halfV = clamp(D * 0.16, 0.8, 2.2);
+  const u: [number, number] = [
+    clamp(plan.floorU - halfU, 0.5, W - 0.5),
+    clamp(plan.floorU + halfU, 0.5, W - 0.5),
+  ];
+  const v: [number, number] = [
+    clamp(plan.floorV - halfV, 0.5, D - 0.5),
+    clamp(plan.floorV + halfV, 0.5, D - 0.5),
+  ];
+  if (u[1] - u[0] < 0.6 || v[1] - v[0] < 0.6) return;
+
+  // A grid rather than one slab: four lit panels with dark joints between them
+  // reads as a floor and a single lit rectangle reads as a hole.
+  const cells = 4;
+  for (let i = 0; i < cells; i += 1) {
+    for (let j = 0; j < cells; j += 1) {
+      if ((i + j) % 2 === 1) continue;
+      const cu = u[0] + ((u[1] - u[0]) * i) / cells;
+      const cv = v[0] + ((v[1] - v[0]) * j) / cells;
+      addBox(ctx, palette.glow, {
+        u: [cu + 0.05, cu + (u[1] - u[0]) / cells - 0.05],
+        v: [cv + 0.05, cv + (v[1] - v[0]) / cells - 0.05],
+        y: [F + 0.005, F + 0.015],
+      });
+    }
+  }
+}
+
+/** A neon band round three walls, at the height a lit sign would be hung. */
+function addClubNeon(ctx: Fitout, plan: NightclubPlan): void {
+  const { room } = ctx;
+  const { floorY: F, width: W, depth: D, palette } = room;
+  const y = Math.min(room.ceilY - 0.35, F + CLUB_NEON_Y);
+  const t = CLUB_NEON_PROUD;
+
+  // Both flanks, from just inside the front wall to the back.
+  for (const flank of [true, false]) {
+    const u: [number, number] = flank ? [LINING, LINING + t] : [W - LINING - t, W - LINING];
+    addBox(ctx, palette.glow, { u, v: [0.6, D - LINING], y: [y, y + 0.07] });
+  }
+  // And across the back, above the stage.
+  addBox(ctx, palette.glow, {
+    u: [LINING, W - LINING],
+    v: [D - LINING - t, D - LINING],
+    y: [y + 0.5, y + 0.57],
+  });
+  void plan;
+}
+
+/**
+ * The back bar: a shelf run on the wall behind where the generated bar stands,
+ * lit from under each shelf.
+ */
+function addClubBackBar(ctx: Fitout, plan: NightclubPlan): void {
+  const { room } = ctx;
+  const { floorY: F, width: W, palette } = room;
+  const wallU: [number, number] = plan.barLow
+    ? [LINING, LINING + 0.28]
+    : [W - LINING - 0.28, W - LINING];
+  const [bv0, bv1] = plan.barV;
+  if (bv1 - bv0 < 1.0) return;
+
+  for (const [i, height] of [1.15, 1.55, 1.95].entries()) {
+    addBox(ctx, palette.joinery, {
+      u: wallU,
+      v: [bv0 + 0.15, bv1 - 0.15],
+      y: [F + height, F + height + 0.05],
+    });
+    // The light is under the shelf, not on it: bottles are lit from below in
+    // every bar there has ever been, and it is the only reason a shelf of
+    // small objects reads at all at this distance.
+    if (i < 2) {
+      addBox(ctx, palette.glow, {
+        u: [wallU[0], wallU[0] + 0.06],
+        v: [bv0 + 0.2, bv1 - 0.2],
+        y: [F + height - 0.04, F + height],
+      });
+    }
+  }
+}
+
+/**
+ * Club light: deliberately less of it than a shop gets.
+ *
+ * Two dim strips over the bar and one over the stage. The room's read comes
+ * from the emissive material, which costs no light at all - this project
+ * measured point lights at 61 per cent of the frame, so a nightclub is exactly
+ * the room where that budget has to be spent carefully rather than generously.
+ */
+function addClubLighting(ctx: Fitout, plan: NightclubPlan): void {
+  const { room } = ctx;
+  const { floorY: F, palette } = room;
+  const y = Math.min(room.ceilY - 0.2, F + 3.2);
+  const [bv0, bv1] = plan.barV;
+  const barSpan: [number, number] = plan.barLow
+    ? [plan.barU - 0.5, plan.barU + 0.5]
+    : [plan.barU - 0.5, plan.barU + 0.5];
+
+  addStripLight(ctx, barSpan, (bv0 + bv1) / 2, y, { intensity: 1.5, distance: 9 });
+  addStripLight(ctx, [plan.stageU[0] + 0.4, plan.stageU[1] - 0.4], plan.stageV[0] - 0.4, y, {
+    intensity: 1.3,
+    distance: 9,
+  });
+  void palette;
+}
+
 /**
  * Market hall: the shell the generated stalls trade in - exposed steel
  * trusses, a line of high bay lamps, a paved aisle, the hall sign, and the
@@ -3054,10 +3316,99 @@ function addLobbyFittings(ctx: Fitout): void {
  * Workshop: benches down the flanks, a tool wall, a hoist gantry, pallets, and
  * a steel mezzanine office reached by a straight flight.
  */
+/**
+ * Where the mission's crate sits, in world space, or null for any other room.
+ *
+ * Derived from the SAME layout entry that places the model, so the prompt the
+ * player walks up to and the box they can see are the same object. Exported
+ * because both the world build (which emits the interaction point) and the
+ * mission (which decides what pressing E does) need it.
+ */
+/**
+ * Where a named person stands in a room, and which way they face.
+ *
+ * Two of these exist: Sable behind the bar in the club, and Teo beside the
+ * crate in the lock-up. Both are derived from the layout that put the bar and
+ * the crate there, so a person is never standing inside their own furniture.
+ */
+export interface StandingAnchor {
+  readonly x: number;
+  readonly y: number;
+  readonly z: number;
+  /** Camera-convention heading: forward is `(-sin h, 0, -cos h)`. */
+  readonly heading: number;
+}
+
+/** Sable, behind her own bar, facing the room. */
+export function nightclubAnchor(parcel: Parcel): StandingAnchor | null {
+  if (parcel.interiorKind !== 'nightclub') return null;
+  const room = makeRoom(parcel, 'nightclub');
+  const plan = nightclubPlan(room);
+  // A step behind the bar run, on the wall side, and a little further in than
+  // the service point so she is across the counter from the player.
+  const behind = plan.barLow ? plan.barU - 0.62 : plan.barU + 0.62;
+  const at = toWorld(room, clamp(behind, 0.45, room.width - 0.45), plan.serviceV + 0.35);
+  const service = toWorld(room, plan.serviceU, plan.serviceV);
+  return {
+    x: at.x,
+    y: room.floorY,
+    z: at.z,
+    // Facing whoever is standing at the service point.
+    heading: Math.atan2(-(service.x - at.x), -(service.z - at.z)),
+  };
+}
+
+/** Teo, beside the bench the crate is on, facing the door. */
+export function lockupAnchor(parcel: Parcel): StandingAnchor | null {
+  const crate = lockupCrateAt(parcel);
+  if (!crate) return null;
+  const room = makeRoom(parcel, 'workshop');
+  const door = toWorld(room, room.doorU, 0);
+  // A pace to the door side of the crate, so he is beside it rather than
+  // standing in the bench.
+  const dx = door.x - crate.x;
+  const dz = door.z - crate.z;
+  const length = Math.hypot(dx, dz) || 1;
+  return {
+    x: crate.x + (dx / length) * 1.05,
+    y: room.floorY,
+    z: crate.z + (dz / length) * 1.05,
+    heading: Math.atan2(-dx / length, -dz / length),
+  };
+}
+
+export function lockupCrateAt(parcel: Parcel): { x: number; y: number; z: number } | null {
+  if (parcel.interiorKind !== 'workshop') return null;
+  const crate = interiorFurnishings(parcel).find((piece) => piece.model === 'cashBox');
+  return crate ? { x: crate.x, y: crate.y, z: crate.z } : null;
+}
+
 function addWorkshopFittings(ctx: Fitout): void {
   const { room } = ctx;
   const { rng, floorY: F, width: W, depth: D, ceilY: C } = room;
   const backFace = D - LINING;
+
+  /*
+   * The crate on the bench, as something the player can press E on.
+   *
+   * `kind: 'sign'`, like the shop counter, so the door handler ignores it. It
+   * exists whether or not a mission is running - the world does not know about
+   * missions - and what it SAYS is decided at runtime by whoever is listening;
+   * see `MissionDirector.promptFor`.
+   */
+  const crate = lockupCrateAt(room.parcel);
+  if (crate) {
+    ctx.sink.interaction({
+      id: `lockup-crate-${room.parcel.id}`,
+      x: crate.x,
+      y: crate.y,
+      z: crate.z,
+      radius: 2.4,
+      prompt: 'Press E to check the crate',
+      kind: 'sign',
+      parcelId: room.parcel.id,
+    });
+  }
 
   // Bay markings on the slab.
   addQuad(ctx, 'roadPaintYellow', [W * 0.34, W * 0.34 + 0.1], [1.2, D - 1.2], F + 0.012, true);
@@ -3860,7 +4211,12 @@ export type FurnishingModel =
   | 'stallButcher'
   | 'stallFlowers'
   | 'cafeCounter'
-  | 'vendingMachine';
+  | 'vendingMachine'
+  | 'clubBar'
+  | 'clubBooth'
+  | 'djBooth'
+  | 'clubSpeaker'
+  | 'cashBox';
 
 /**
  * How each model is fitted and how big it ends up.
@@ -3925,6 +4281,33 @@ export const FURNISHING_SPECS: Readonly<Record<FurnishingModel, FurnishingSpec>>
   stallFlowers: { fit: 'y', metres: 2.15, front: 'x', height: 2.15, halfWidth: 1.06, halfDepth: 1.05, solid: true },
   cafeCounter: { fit: 'z', metres: 2.2, front: '-x', height: 1.32, halfWidth: 1.1, halfDepth: 0.46, solid: true },
   vendingMachine: { fit: 'y', metres: 1.85, front: 'x', height: 1.85, halfWidth: 0.45, halfDepth: 0.45, solid: true },
+  /*
+   * The Vibe. Each is fitted by the dimension its real counterpart is bought
+   * by - a bar and a banquette by their frontage, a speaker stack and a
+   * console by their height - and every `front` was read off the model's own
+   * measured bounds rather than assumed. Measured: the bar, the booth, the
+   * console and the cash box all normalise along Z; the speaker stack is the
+   * one whose long axis is its height.
+   */
+  clubBar: { fit: 'z', metres: 4.2, front: '-x', height: 1.73, halfWidth: 2.1, halfDepth: 0.76, solid: true },
+  clubBooth: { fit: 'z', metres: 2.4, front: '-z', height: 0.95, halfWidth: 0.99, halfDepth: 1.2, solid: true },
+  /*
+   * Not solid, and it is a platform rather than a counter that makes it so:
+   * the DJ console stands ON the stage, and the stage is already a solid the
+   * player walks into. A second collider for the console would have to sit at
+   * floor level to satisfy the "solid pieces stand on the floor" invariant,
+   * which would put an invisible wall a third of a metre in front of a
+   * platform that is right there to be seen. Same reasoning as the espresso
+   * machine on the cafe counter.
+   */
+  djBooth: { fit: 'z', metres: 1.7, front: '-z', height: 1.05, halfWidth: 0.35, halfDepth: 0.85, solid: false },
+  clubSpeaker: { fit: 'y', metres: 1.9, front: '-z', height: 1.9, halfWidth: 0.48, halfDepth: 0.86, solid: true },
+  /*
+   * Sable's takings. Not solid: it stands ON a workbench, the player is meant
+   * to walk up to it, and a collider round a 40 cm box on a bench is a knee
+   * you can bark yourself on for no reason.
+   */
+  cashBox: { fit: 'z', metres: 0.42, front: '-z', height: 0.21, halfWidth: 0.14, halfDepth: 0.21, solid: false },
 };
 
 export interface Furnishing {
@@ -4020,6 +4403,33 @@ function furnishingLayout(room: Room): LocalFurnishing[] {
     }
     case 'gunStore':
       return [place('plant', edgeR, near, 0, { skew: 0.3 })];
+    case 'nightclub': {
+      const plan = nightclubPlan(room);
+      // The bar runs along its flank, so it is turned a quarter from "facing
+      // back out of the room" - a quarter one way on the low flank and the
+      // other way on the high one, so it always serves INTO the room.
+      const barTurns = plan.barLow ? 1 : 3;
+      /*
+       * The booths get their own inset rather than the shared `edgeL`/`edgeR`.
+       *
+       * Those sit 0.95 m off the wall, which is enough for a plant. A booth is
+       * quarter-turned, so what has to clear the wall is its DEPTH - 1.2 m -
+       * and at 0.95 the bounds check below rejected it. Not for this seed: for
+       * EVERY room, at both orientations, so the 400 KB model downloaded and
+       * was never once given an instance.
+       */
+      const boothInset = FURNISHING_SPECS.clubBooth.halfDepth + 0.15;
+      const boothU = plan.barLow ? W - boothInset : boothInset;
+      const out: LocalFurnishing[] = [
+        place('clubBar', plan.barU, (plan.barV[0] + plan.barV[1]) / 2, barTurns),
+        place('djBooth', W / 2, plan.stageV[0] + 0.75, 0, { lift: CLUB_STAGE_HEIGHT }),
+        place('clubSpeaker', clamp(plan.stageU[0] - 0.7, 0.7, W - 0.7), plan.stageV[0] + 0.3, 0),
+        place('clubSpeaker', clamp(plan.stageU[1] + 0.7, 0.7, W - 0.7), plan.stageV[0] + 0.3, 0),
+        place('clubBooth', boothU, clamp(D * 0.4, 1.6, D - 1.6), plan.barLow ? 3 : 1, { skew: 0.1 }),
+        place('clubBooth', boothU, clamp(D * 0.68, 2.4, D - 1.3), plan.barLow ? 3 : 1, { skew: -0.12 }),
+      ];
+      return out;
+    }
     case 'lobby': {
       // A waiting group off the axis of the doors: sofa against the back, two
       // chairs facing it, a plant on each side, and the drinks cabinet where
@@ -4094,6 +4504,26 @@ function furnishingLayout(room: Room): LocalFurnishing[] {
       return [
         place('workbench', clamp(W * 0.36, 1.2, W - 1.2), clamp(D * 0.55, 1.6, D - 1.6), 2),
         place('workbench', clamp(W * 0.36, 1.2, W - 1.2), clamp(D * 0.55 + 2.2, 1.6, D - 1.6), 0),
+        /*
+         * Sable's takings, sitting on the first bench where Teo has been
+         * minding them for two nights.
+         *
+         * Placed in the LAYOUT rather than by the mission, so the model, its
+         * anchor and the collider all come from the one table every other
+         * piece of furniture in the city comes from; the mission only decides
+         * whether the player may pick it up. It stands on the bench, so the
+         * lift is that bench's own height.
+         */
+        place(
+          'cashBox',
+          // Shoved to one end of the bench rather than sitting in the middle
+          // of it, which is both where somebody actually puts a box down and
+          // what keeps its footprint off the bench's own collider centre.
+          clamp(W * 0.36 + FURNISHING_SPECS.workbench.halfWidth * 0.55, 1.2, W - 1.2),
+          clamp(D * 0.55, 1.6, D - 1.6),
+          2,
+          { lift: FURNISHING_SPECS.workbench.height },
+        ),
         place('stockShelving', edgeR, clamp(D * 0.4, 1.2, D - 1.2), 3),
         // The trade counter goes against the flank beside the door, not out in
         // the floor: in the middle of the bay it sat on the diagonal a walker
@@ -4147,8 +4577,19 @@ export function interiorFurnishings(parcel: Parcel): readonly Furnishing[] {
       y: room.floorY + lift,
       z: world.z,
       yaw: outward + spot.turns * (Math.PI / 2) + (spot.skew ?? 0),
-      halfX: alongX === acrossU ? halfU : halfV,
-      halfZ: alongX === acrossU ? halfV : halfU,
+      /*
+       * Room axes to world axes, and NOTHING else.
+       *
+       * `halfU`/`halfV` have already had the quarter turn applied above, so
+       * the only question left is which world axis `u` runs along - `alongX`
+       * answers it on its own. Consulting `spot.turns` again here (as
+       * `alongX === acrossU` did) applied the turn a second time and handed
+       * every quarter-turned piece in every interior a collider with its
+       * width and depth swapped: an invisible wall across the room and a
+       * walk-through hole where the model actually is.
+       */
+      halfX: alongX ? halfU : halfV,
+      halfZ: alongX ? halfV : halfU,
       height: spec.height,
       solid: spec.solid,
     });

@@ -78,6 +78,8 @@ export const MINIMAP_PALETTE = {
    * is not findable - it is only findable once you already know which one.
    */
   gunStore: '#d4574b',
+  /** The Vibe's magenta, so a mission marker is never a shop marker. */
+  waypoint: '#e24a78',
   landmark: '#93aab8',
   player: '#eef2f4',
   playerEdge: '#0b0f12',
@@ -297,6 +299,13 @@ export class Minimap {
   readonly element: HTMLElement;
 
   private readonly plan: CityPlan;
+  /**
+   * Where the mission is pointing, in world metres, or null.
+   *
+   * Held here rather than passed into `update` because it changes about four
+   * times in a session and the frame loop should not be carrying it.
+   */
+  private waypoint: { readonly x: number; readonly z: number } | null = null;
   private readonly bounds: MapBounds;
   private readonly size: number;
   private readonly metresPerPixel: number;
@@ -697,6 +706,38 @@ export class Minimap {
    * around the centre, so an off-screen gun store still tells the player which
    * way to walk instead of silently not existing.
    */
+  /**
+   * Points the map at somewhere, or clears it.
+   *
+   * REDRAWS BOTH VIEWS, and throws away the expanded map's cache.
+   *
+   * The waypoint moves when the mission stage changes, which usually happens
+   * while the player is standing still listening to somebody - and `update`
+   * returns early when nothing has moved. Worse, the pin is painted into the
+   * full map's cached raster along with the streets and the district names,
+   * which is only rebuilt when the viewport size changes. Without both of
+   * these the dial kept pointing at the last destination until the player
+   * turned their head, and the full map kept pointing at it until they resized
+   * the window.
+   */
+  setWaypoint(waypoint: { readonly x: number; readonly z: number } | null): void {
+    const same =
+      (this.waypoint === null && waypoint === null) ||
+      (this.waypoint !== null &&
+        waypoint !== null &&
+        this.waypoint.x === waypoint.x &&
+        this.waypoint.z === waypoint.z);
+    if (same) return;
+    this.waypoint = waypoint;
+    if (this.disposed) return;
+    // A zero-width canvas fails the size check in `renderExpanded`, which is
+    // what makes it rebuild - and frees the old raster on the way.
+    this.expandedCache.width = 0;
+    this.expandedCache.height = 0;
+    this.dirty = true;
+    this.render();
+  }
+
   private drawMarkers(
     ctx: CanvasRenderingContext2D,
     project: (x: number, z: number) => MapPoint,
@@ -730,6 +771,19 @@ export class Minimap {
       if (p.off && !isShop) continue;
       if (isShop) drawShopPin(ctx, p.x, p.y, 9 * unit, p.off);
       else drawDoorPin(ctx, p.x, p.y, 5.5 * unit);
+    }
+
+    /*
+     * The mission waypoint, drawn LAST so it is on top of every other pin.
+     *
+     * It is the only marker that is allowed to survive being clamped to the
+     * rim: the whole point of it is telling the player which way to drive, and
+     * a waypoint that vanishes the moment it leaves the minimap is a waypoint
+     * that is missing exactly when it is needed.
+     */
+    if (this.waypoint) {
+      const p = clamp(project(this.waypoint.x, this.waypoint.z));
+      drawWaypointPin(ctx, p.x, p.y, 8 * unit, p.off);
     }
   }
 
@@ -990,6 +1044,46 @@ export class Minimap {
  * is set the pin is riding the edge of the view and gains a ring, so it reads
  * as "this way" rather than "it is here".
  */
+/**
+ * The mission waypoint: a hollow diamond with a dot in it, in the club's own
+ * magenta so it cannot be confused with the gun shop's red pin.
+ *
+ * `off` draws it as an arrow pointing off the rim instead, which is the state
+ * it spends most of a cross-city drive in.
+ */
+function drawWaypointPin(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  r: number,
+  off: boolean,
+): void {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.lineWidth = Math.max(1.4, r * 0.22);
+  ctx.strokeStyle = 'rgba(12, 14, 18, 0.85)';
+  ctx.fillStyle = MINIMAP_PALETTE.waypoint;
+
+  ctx.beginPath();
+  ctx.moveTo(0, -r);
+  ctx.lineTo(r * 0.78, 0);
+  ctx.lineTo(0, r);
+  ctx.lineTo(-r * 0.78, 0);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  if (!off) {
+    // A dark pip in the middle, so a waypoint sitting on top of a building
+    // block still reads as a marker rather than as a coloured tile.
+    ctx.fillStyle = 'rgba(12, 14, 18, 0.9)';
+    ctx.beginPath();
+    ctx.arc(0, 0, r * 0.24, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
 function drawShopPin(
   ctx: CanvasRenderingContext2D,
   x: number,

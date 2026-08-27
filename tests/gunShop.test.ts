@@ -13,6 +13,7 @@ import { describe, expect, it } from 'vitest';
 import { getCityPlan, type Parcel } from '../src/world/CityPlan';
 import { buildInterior } from '../src/world/build/InteriorBuilder';
 import {
+  FURNISHING_SPECS,
   gunStoreAnchors,
   gunStorePlan,
   interiorFurnishings,
@@ -64,8 +65,11 @@ describe('the gun shop is on the plan', () => {
   it('leaves every other enterable building exactly where it was', () => {
     // The gun shop was carved out of the Old Quarter's second shopfront by
     // splitting one `count: 2` target into two `count: 1` targets, which draws
-    // the same parcels from the same RNG stream. If this list ever changes,
-    // something moved a building somewhere else in the city.
+    // the same parcels from the same RNG stream; The Vibe was added by
+    // APPENDING a target, which leaves the first seven picks untouched. If any
+    // line but the last ever changes, something moved a building somewhere
+    // else in the city - which is exactly what happened when the nightclub was
+    // briefly second in the list.
     const kinds = enterable
       .map((parcel) => `${parcel.id}:${parcel.interiorKind}`)
       .sort();
@@ -75,6 +79,7 @@ describe('the gun shop is on the plan', () => {
       'parcel-112:store',
       'parcel-116:marketHall',
       'parcel-31:stairhall',
+      'parcel-58:nightclub',
       'parcel-69:gunStore',
       'parcel-9:lobby',
     ]);
@@ -219,12 +224,24 @@ describe('generated furnishings', () => {
         if (piece.solid) {
           expect(piece.y, `${parcel.id} ${piece.model} floats`).toBeCloseTo(parcel.groundY, 6);
         } else {
-          // A counter-top piece stands on something, never in mid air and
-          // never above head height.
-          expect(piece.y).toBeGreaterThan(parcel.groundY + 0.5);
+          /*
+           * A piece with no collider stands ON something, never in mid air and
+           * never above head height.
+           *
+           * The lower bound used to be 0.5, which was the height of the only
+           * surface that existed when it was written - a counter. The club
+           * added a second: a 0.34 m DJ platform, which is emitted as a solid
+           * in its own right, so the console on top of it needs no collider of
+           * its own and correctly stands lower than any counter in the city.
+           */
+          expect(piece.y).toBeGreaterThan(parcel.groundY + 0.3);
           expect(piece.y).toBeLessThan(parcel.groundY + 1.6);
         }
-        expect(piece.height).toBeGreaterThan(0.3);
+        // Nothing is smaller than a strongbox or taller than a stall canopy.
+        // The floor was 0.3 until the club's cash box arrived at 0.21, which
+        // is what a strongbox is; the bound is there to catch a model fitted
+        // by the wrong axis, and 0.18 still does that.
+        expect(piece.height).toBeGreaterThan(0.18);
         expect(piece.height).toBeLessThan(2.2);
         expect(piece.halfX).toBeGreaterThan(0.1);
         expect(piece.halfZ).toBeGreaterThan(0.1);
@@ -298,6 +315,42 @@ describe('generated furnishings', () => {
         }
       }
     }
+  });
+
+  /*
+   * A collider has to be the shape of the thing it is standing in for.
+   *
+   * The world footprint is derived twice over - once to turn the piece within
+   * the room, once to map the room's axes onto the world's - and getting the
+   * second one to consult the first as well swapped width for depth on every
+   * quarter-turned piece in the city. Eight of fifty-nine were wrong,
+   * including the club's four-metre bar, which became a 1.5 m stub across the
+   * room: an invisible wall in the middle of the floor and a walk-through gap
+   * where the counter actually is.
+   *
+   * The check is the piece's own yaw, which is the one thing that says which
+   * way it is facing. `halfWidth` runs ACROSS the front, so it lies on x when
+   * the front points along z, and on z when the front points along x.
+   */
+  it('gives every furnishing a collider the shape of the model, whichever way it is turned', () => {
+    let checked = 0;
+    for (const parcel of enterable) {
+      for (const piece of interiorFurnishings(parcel)) {
+        const spec = FURNISHING_SPECS[piece.model];
+        // A skewed piece is not axis-aligned and has no exact answer here.
+        const quarter = piece.yaw / (Math.PI / 2);
+        if (Math.abs(quarter - Math.round(quarter)) > 1e-6) continue;
+        checked += 1;
+
+        // |sin yaw| is 1 when the piece faces along x, 0 when it faces along z.
+        const facesX = Math.abs(Math.sin(piece.yaw)) > 0.5;
+        const wantX = facesX ? spec.halfDepth : spec.halfWidth;
+        const wantZ = facesX ? spec.halfWidth : spec.halfDepth;
+        expect(piece.halfX, `${parcel.id} ${piece.model} halfX`).toBeCloseTo(wantX, 6);
+        expect(piece.halfZ, `${parcel.id} ${piece.model} halfZ`).toBeCloseTo(wantZ, 6);
+      }
+    }
+    expect(checked, 'no axis-aligned furnishings to check').toBeGreaterThan(30);
   });
 
   it('gives the same answer every time', () => {

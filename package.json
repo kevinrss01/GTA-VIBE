@@ -1,9 +1,9 @@
 {
-  "name": "meridian-bay",
+  "name": "gta-vibe",
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "Meridian Bay - an original first-person open-world city built with Three.js.",
+  "description": "GTA Vibe - an original first-person open-world game set in Meridian Bay, built with Three.js.",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",

@@ -30,7 +30,8 @@ export type AudioAssetKind =
   | 'vehicle'
   | 'weapon'
   | 'impact'
-  | 'body';
+  | 'body'
+  | 'dialogue';
 
 export type AmbienceBedId =
   | 'ambience/harbour'
@@ -129,6 +130,24 @@ export type ImpactAssetId =
 export type BodyAssetId = 'plr/hurt' | 'plr/death' | 'plr/heartbeat' | 'plr/tinnitus';
 
 /**
+ * Spoken dialogue.
+ *
+ * The only text-to-speech in the game, and the only assets with a script: the
+ * words are in `src/mission/script.ts`, the recordings are here, and
+ * `tools/generate-mission-voices.mjs` is the runnable form of both. Every line
+ * is written for this game about invented people; none is an impersonation of
+ * anybody, and the two voices are stock library voices rather than clones.
+ */
+export type DialogueAssetId =
+  | 'dlg/sable-brief-1'
+  | 'dlg/sable-brief-2'
+  | 'dlg/sable-brief-3'
+  | 'dlg/teo-handover-1'
+  | 'dlg/teo-handover-2'
+  | 'dlg/sable-paid-1'
+  | 'dlg/sable-paid-2';
+
+/**
  * The distant traffic layer. Deliberately not an `AmbienceBedId`: like the sea,
  * it sums on top of whichever land bed is playing at a level taken from the
  * world (here, how much traffic is actually moving nearby) rather than
@@ -146,6 +165,7 @@ export type AudioAssetId =
   | WeaponAssetId
   | ImpactAssetId
   | BodyAssetId
+  | DialogueAssetId
   | StreetLayerId;
 
 /** Provenance for a generated asset. Never contains a key or a signed URL. */
@@ -911,6 +931,76 @@ export const BODY_SOUNDS = {
 export const EXPLOSION_SOUND: WeaponAssetId = 'wpn/explosion';
 export const ROCKET_FLIGHT_SOUND: WeaponAssetId = 'wpn/rocket-flight';
 
+// ---------------------------------------------------------------------------
+// Dialogue
+// ---------------------------------------------------------------------------
+
+const DIALOGUE_MODEL = 'eleven_multilingual_v2';
+const DIALOGUE_GENERATED_ON = '2026-08-27';
+
+/**
+ * Two library voices, chosen from the account's own 658 rather than assumed.
+ *
+ * Sable is steady because she owns the room; Teo is not because he does not.
+ * Neither is a clone of a real person, and no line impersonates anybody: the
+ * whole cast is invented for this game.
+ */
+const DIALOGUE_VOICES = {
+  sable: { id: 'pFZP5JQG7iQjIQuC4Bku', name: 'Lily - Velvety Actress' },
+  teo: { id: 'N2lVS1w4EtoT3dr4eOWO', name: 'Callum - Husky Trickster' },
+} as const;
+
+interface DialogueSpec {
+  readonly id: DialogueAssetId;
+  readonly file: string;
+  readonly speaker: keyof typeof DIALOGUE_VOICES;
+  readonly duration: number;
+  readonly bytes: number;
+  readonly trimDb: number;
+  readonly text: string;
+}
+
+const DIALOGUE_SPECS: readonly DialogueSpec[] = [
+  { id: 'dlg/sable-brief-1', file: 'sable-brief-1.mp3', speaker: 'sable', duration: 5.201, bytes: 84471, trimDb: 1.6, text: "So you're the one who came back. Good. I need somebody nobody in this city has bought yet." },
+  { id: 'dlg/sable-brief-2', file: 'sable-brief-2.mp3', speaker: 'sable', duration: 9.845, bytes: 158450, trimDb: 0.9, text: 'Two nights ago a box of my money went into a lock-up down in the Cannery, and it has not come out. Teo is sitting on it, and Teo is frightened of his own shadow.' },
+  { id: 'dlg/sable-brief-3', file: 'sable-brief-3.mp3', speaker: 'sable', duration: 4.598, bytes: 74440, trimDb: -1.4, text: "Bring it to me. Don't open it, don't count it, and don't stop for anybody." },
+  { id: 'dlg/teo-handover-1', file: 'teo-handover-1.mp3', speaker: 'teo', duration: 6.594, bytes: 106623, trimDb: -1.5, text: "You're Sable's? Take it. Take it, please, I don't want it in here another night." },
+  { id: 'dlg/teo-handover-2', file: 'teo-handover-2.mp3', speaker: 'teo', duration: 5.341, bytes: 86561, trimDb: -4.2, text: "Listen. I might have mentioned it to a man in a bar. I'm sorry. Drive fast." },
+  { id: 'dlg/sable-paid-1', file: 'sable-paid-1.mp3', speaker: 'sable', duration: 3.901, bytes: 63573, trimDb: 1.6, text: "You made it. And it's still heavy. That's the part most people get wrong." },
+  { id: 'dlg/sable-paid-2', file: 'sable-paid-2.mp3', speaker: 'sable', duration: 3.065, bytes: 50199, trimDb: -3.1, text: 'Seven and a half. Come back when you want the next one.' },
+];
+
+const DIALOGUE: readonly AudioAsset[] = DIALOGUE_SPECS.map((spec) => ({
+  id: spec.id,
+  path: `/audio/voice/${spec.file}`,
+  kind: 'dialogue' as const,
+  duration: spec.duration,
+  loop: false,
+  sampleRate: 44100,
+  channels: 1,
+  bytes: spec.bytes,
+  trimDb: spec.trimDb,
+  generation: {
+    provider: 'elevenlabs' as const,
+    modelId: DIALOGUE_MODEL,
+    prompt: spec.text,
+    date: DIALOGUE_GENERATED_ON,
+    // Text-to-speech is charged per character of the line, not per second.
+    credits: spec.text.length,
+    parameters: {
+      voice_id: DIALOGUE_VOICES[spec.speaker].id,
+      voice_name: DIALOGUE_VOICES[spec.speaker].name,
+      output_format: 'mp3_44100_128',
+    },
+  },
+}));
+
+/** The spoken line for a script beat, with the words it says. */
+export const DIALOGUE_LINES: Readonly<Record<DialogueAssetId, { speaker: string; text: string; duration: number }>> =
+  Object.fromEntries(
+    DIALOGUE_SPECS.map((spec) => [spec.id, { speaker: spec.speaker, text: spec.text, duration: spec.duration }]),
+  ) as Readonly<Record<DialogueAssetId, { speaker: string; text: string; duration: number }>>;
+
 export const MUSIC_ASSET_ID: MusicAssetId = 'music/meridian-theme';
 
 const MUSIC: AudioAsset = {
@@ -975,6 +1065,7 @@ export const AUDIO_ASSETS: readonly AudioAsset[] = [
   ...SFX,
   ...VEHICLE,
   ...COMBAT,
+  ...DIALOGUE,
   STREET_LAYER,
   MUSIC,
   VOICE,

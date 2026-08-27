@@ -15,6 +15,7 @@
 import './ui.css';
 import { VOLUME_CHANNELS, type VolumeChannel } from '../audio/AudioDirector';
 import { controlHints, type ControlHint } from './platform';
+import { CAST, GAME_NAME, GAME_PREMISE, PROTAGONIST_PREMISE } from '../story';
 
 export type QualityLevel = 'low' | 'medium' | 'high';
 
@@ -41,11 +42,14 @@ export type { ControlHint };
  */
 export const CONTROL_HINTS: readonly ControlHint[] = controlHints();
 
-/** Short, original description of the city shown under the title. */
-const CITY_BLURB =
-  'An original coastal city, built to be walked. Meridian Bay looks west across ' +
-  'a tidal bay: a working waterfront, a close-grained old quarter, a small ' +
-  'downtown, and terraced streets climbing the ridge behind it.';
+/**
+ * What the pause card says under the title.
+ *
+ * The setting, then who the player is. Both come from `story.ts` so the menu,
+ * the loading screen and the mission cannot disagree about the city or about
+ * whose hands these are.
+ */
+const CITY_BLURB = `${GAME_PREMISE}\n\n${PROTAGONIST_PREMISE}`;
 
 const VOLUME_LABELS: Readonly<Record<VolumeChannel, string>> = {
   master: 'Overall',
@@ -109,11 +113,15 @@ export class PauseMenu {
 
     const title = document.createElement('h1');
     title.className = 'mb-pause__title';
-    title.textContent = 'Meridian Bay';
+    title.textContent = GAME_NAME;
 
     const blurb = document.createElement('p');
     blurb.className = 'mb-pause__blurb';
-    blurb.textContent = CITY_BLURB;
+    // Two paragraphs, so the setting and the player are not one wall of text.
+    for (const [i, paragraph] of CITY_BLURB.split('\n\n').entries()) {
+      if (i > 0) blurb.append(document.createElement('br'), document.createElement('br'));
+      blurb.append(document.createTextNode(paragraph));
+    }
 
     const actions = document.createElement('div');
     actions.className = 'mb-pause__actions';
@@ -140,6 +148,7 @@ export class PauseMenu {
       actions,
       this.buildVolume(),
       this.buildQuality(),
+      this.buildCast(),
       this.buildControls(),
     );
     this.element.append(this.panel);
@@ -302,6 +311,37 @@ export class PauseMenu {
 
     group.append(row);
     return group;
+  }
+
+  /**
+   * Who is in this city and what they want.
+   *
+   * The player never sees a cutscene and there is no journal, so the pause
+   * card is where the cast lives. It reads straight out of `story.ts`, which
+   * is also what the mission and the club use, so a name can only be wrong in
+   * one place.
+   */
+  private buildCast(): HTMLElement {
+    const section = document.createElement('div');
+    section.className = 'mb-pause__group';
+    const heading = document.createElement('p');
+    heading.className = 'mb-pause__legend';
+    heading.textContent = 'People';
+    const list = document.createElement('dl');
+    list.className = 'mb-castlist';
+    for (const person of Object.values(CAST)) {
+      const who = document.createElement('dt');
+      who.textContent = person.name;
+      const role = document.createElement('span');
+      role.className = 'mb-castlist__role';
+      role.textContent = person.role;
+      who.append(role);
+      const blurb = document.createElement('dd');
+      blurb.textContent = person.blurb;
+      list.append(who, blurb);
+    }
+    section.append(heading, list);
+    return section;
   }
 
   private buildControls(): HTMLElement {
