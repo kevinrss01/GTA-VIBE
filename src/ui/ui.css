@@ -200,6 +200,10 @@
 /*
  * The cast list on the pause card. A definition list, because that is what it
  * is: a person, and who they are.
+ *
+ * The colours used to be three hand-mixed creams that bypassed the token block
+ * and drifted a little warmer than everything around them. They are the tokens
+ * now, which is also what makes the high-contrast preference reach this list.
  */
 .mb-castlist {
   display: grid;
@@ -209,7 +213,7 @@
 }
 
 .mb-castlist dt {
-  color: #f2e6d8;
+  color: var(--mb-ink-bright);
   font-size: 12px;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -218,7 +222,7 @@
 .mb-castlist__role {
   display: block;
   margin-top: 2px;
-  color: rgba(212, 175, 118, 0.85);
+  color: var(--mb-accent);
   font-size: 11px;
   letter-spacing: 0.04em;
   text-transform: none;
@@ -226,7 +230,7 @@
 
 .mb-castlist dd {
   margin: 3px 0 0;
-  color: rgba(226, 219, 209, 0.72);
+  color: var(--mb-ink-dim);
   font-size: 12px;
   line-height: 1.45;
 }
@@ -581,17 +585,58 @@ body.mb-map-open .mb-hud__readout {
   transition: opacity 180ms ease, visibility 0s;
 }
 
+/*
+ * THE PANEL IS A COLUMN WITH EXACTLY ONE SCROLL CONTAINER IN IT.
+ *
+ * This is the fix for the defect that made the menu unusable: the panel had no
+ * `max-height` and no `overflow-y`, so at a 480 px viewport it was measured at
+ * 1136 px tall inside a 480 px layer, with the top and the bottom of it simply
+ * unreachable. Three rules carry the fix and none of them may be dropped:
+ *
+ *   `max-height: min(100%, 780px)` - 100% resolves against `.mb-pause`'s
+ *     content box (the viewport less its 24 px padding), so the panel is inside
+ *     the window at every size before any content is measured. The 780 px cap
+ *     stops it stretching into a wall of text on a tall display.
+ *   `min-height: 0` on `.mb-pause__view` - a flex item's default minimum is its
+ *     CONTENT size, which is exactly the rule that turns a scroll container
+ *     into an overflowing one. Without this line the panel grows again.
+ *   `overflow-y: auto` on the view and nothing else. The head, the tab rail and
+ *     the footer do not scroll, so the section a player is reading scrolls
+ *     under a title that stays put.
+ */
 .mb-pause__panel {
-  width: min(460px, 100%);
-  padding: 30px 32px 28px;
+  display: flex;
+  flex-direction: column;
+  width: min(900px, 100%);
+  /*
+   * A HEIGHT, not just a cap. Sized to content, the panel was measured jumping
+   * between 276 px and 612 px as the player moved along the rail, which throws
+   * the tab they are aiming at to a different part of the screen between one
+   * click and the next. One height for every section holds the rail still and
+   * lets the section under it scroll.
+   */
+  height: min(100%, 640px);
+  max-height: 100%;
+  min-height: 0;
   border: 1px solid var(--mb-line);
   border-radius: var(--mb-radius);
   background: rgba(10, 13, 16, 0.94);
   box-shadow: 0 24px 80px rgba(0, 0, 0, 0.6);
+  /* The rounded corner has to clip the scrolling section under it. */
+  overflow: hidden;
+}
+
+.mb-pause__head {
+  flex: none;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 22px 28px 14px;
 }
 
 .mb-pause__eyebrow {
-  margin: 0 0 10px;
+  margin: 0 0 8px;
   font-size: 10px;
   letter-spacing: 0.32em;
   text-transform: uppercase;
@@ -599,30 +644,307 @@ body.mb-map-open .mb-hud__readout {
 }
 
 .mb-pause__title {
-  margin: 0 0 12px;
-  font-size: 26px;
+  margin: 0;
+  font-size: 24px;
   font-weight: 500;
   letter-spacing: 0.1em;
   color: var(--mb-ink-bright);
 }
 
-.mb-pause__blurb {
+/*
+ * The close control. A second way out beside Resume, in the corner where a
+ * player already looks for one - and the only reason the menu needs no
+ * click-outside-to-close, which would make an accidental click resume a game
+ * somebody was still reading.
+ */
+.mb-pause__close {
+  pointer-events: auto;
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  margin: -2px -4px 0 0;
+  padding: 0;
+  appearance: none;
+  border: 1px solid var(--mb-line);
+  border-radius: var(--mb-radius);
+  background: transparent;
+  color: var(--mb-ink-dim);
+  cursor: pointer;
+  transition: color 140ms ease, border-color 140ms ease;
+}
+
+.mb-pause__close:hover {
+  border-color: var(--mb-line-strong);
+  color: var(--mb-ink-bright);
+}
+
+.mb-pause__close:focus-visible {
+  outline: 1px solid var(--mb-accent);
+  outline-offset: 2px;
+}
+
+/*
+ * The rail wraps rather than scrolling sideways: a tab a player cannot see is
+ * a tab they will not find, and eight short labels wrap to two rows long
+ * before they run out of a 1024 px window.
+ */
+.mb-pause__rail {
+  flex: none;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  padding: 0 28px;
+  border-bottom: 1px solid var(--mb-line);
+}
+
+.mb-pause__tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 2px;
+}
+
+.mb-pause__resume {
+  pointer-events: auto;
+  margin: 0 0 10px;
+  padding: 7px 16px;
+  appearance: none;
+  border: 1px solid rgba(200, 160, 106, 0.5);
+  border-radius: var(--mb-radius);
+  background: var(--mb-panel);
+  color: var(--mb-ink-bright);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: border-color 140ms ease, background-color 140ms ease;
+}
+
+.mb-pause__resume:hover {
+  border-color: var(--mb-accent);
+  background: rgba(200, 160, 106, 0.12);
+}
+
+.mb-pause__resume:focus-visible {
+  outline: 1px solid var(--mb-accent);
+  outline-offset: 2px;
+}
+
+.mb-pause__tab {
+  pointer-events: auto;
+  position: relative;
+  margin: 0;
+  padding: 10px 12px 11px;
+  appearance: none;
+  border: 0;
+  /* Overlaps the rail's hairline, so the selected underline replaces it. */
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  background: transparent;
+  color: var(--mb-ink-dim);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: color 140ms ease, border-color 140ms ease;
+}
+
+.mb-pause__tab:hover {
+  color: var(--mb-ink);
+}
+
+.mb-pause__tab[aria-selected='true'] {
+  color: var(--mb-ink-bright);
+  border-bottom-color: var(--mb-accent);
+}
+
+.mb-pause__tab:focus-visible {
+  outline: 1px solid var(--mb-accent);
+  outline-offset: -2px;
+}
+
+/* The one scroll container. See the note on `.mb-pause__panel`. */
+.mb-pause__view {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  /* A wheel over the menu must not scroll whatever is behind it. */
+  overscroll-behavior: contain;
+  padding: 22px 28px 24px;
+  /* Reserved on every section, so switching tabs cannot shift the text. */
+  scrollbar-gutter: stable;
+}
+
+/*
+ * A scrollbar the player can actually see.
+ *
+ * macOS hides overlay scrollbars until something moves, which on a short
+ * window makes a section that scrolls look exactly like the clipped panel this
+ * menu replaced. Styling the WebKit pseudo-elements - and NOT setting
+ * `scrollbar-width`, which would make Chrome ignore them again - opts into a
+ * classic, always-drawn bar in the interface's own colours.
+ */
+.mb-pause__view::-webkit-scrollbar {
+  width: 11px;
+}
+
+.mb-pause__view::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.mb-pause__view::-webkit-scrollbar-thumb {
+  background-color: var(--mb-line-strong);
+  background-clip: padding-box;
+  border: 4px solid transparent;
+  border-radius: 6px;
+}
+
+.mb-pause__view::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(198, 214, 224, 0.42);
+}
+
+.mb-pause__page:focus-visible {
+  outline: 1px solid var(--mb-accent);
+  outline-offset: 4px;
+}
+
+/*
+ * Two columns where there is room for two, one where there is not. `auto-fit`
+ * rather than a breakpoint, because what decides this is the width the panel
+ * actually got, not the width of the window.
+ */
+.mb-pause__cols {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 8px 34px;
+}
+
+.mb-pause__block {
   margin: 0 0 22px;
-  max-width: 44ch;
+}
+
+.mb-pause__block:last-child {
+  margin-bottom: 0;
+}
+
+.mb-pause__blurb {
+  margin: 0 0 12px;
+  max-width: 52ch;
   font-size: 12px;
   line-height: 1.75;
   color: var(--mb-ink-dim);
 }
 
-.mb-pause__actions {
+.mb-pause__note {
+  margin: 10px 0 0;
+  max-width: 56ch;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--mb-ink-dim);
+}
+
+/* The live objective, marked by the one accent the interface allows itself. */
+.mb-pause__objective {
+  margin: 0 0 24px;
+  padding-left: 14px;
+  border-left: 2px solid var(--mb-accent);
+}
+
+.mb-pause__objective-title {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 500;
+  letter-spacing: 0.03em;
+  color: var(--mb-ink-bright);
+}
+
+.mb-pause__objective-detail {
+  margin: 5px 0 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--mb-ink-dim);
+}
+
+/*
+ * Filled by the application with the expanded minimap; empty until then. The
+ * sibling rule is the safety net for a map added while the section is already
+ * on screen, which no tab change would be there to notice.
+ */
+.mb-pause__map {
   display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  margin-bottom: 24px;
+  justify-content: center;
+  /* Whatever is dropped in here is sized by its owner, not by this panel. */
+  overflow: auto;
+}
+
+.mb-pause__map:empty {
+  display: none;
+}
+
+.mb-pause__map:not(:empty) + .mb-pause__empty {
+  display: none;
+}
+
+.mb-pause__empty {
+  margin: 0;
+  padding: 40px 0;
+  text-align: center;
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--mb-ink-dim);
+}
+
+.mb-pause__foot {
+  flex: none;
+  margin: 0;
+  padding: 12px 28px 14px;
+  border-top: 1px solid var(--mb-line);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--mb-ink-dim);
+}
+
+/* A setting, its explanation, and its state - in that reading order. */
+.mb-switch {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 14px 0;
+  border-top: 1px solid var(--mb-line);
+}
+
+.mb-switch:last-child {
+  border-bottom: 1px solid var(--mb-line);
+}
+
+.mb-switch__label {
+  margin: 0;
+  font-size: 13px;
+  color: var(--mb-ink);
+}
+
+.mb-switch .mb-button {
+  flex: none;
+  min-width: 62px;
+  text-align: center;
+}
+
+.mb-switch .mb-button[aria-pressed='true'] {
+  border-color: rgba(200, 160, 106, 0.5);
+  color: var(--mb-ink-bright);
 }
 
 .mb-pause__group {
-  margin: 0 0 20px;
+  margin: 0 0 22px;
   padding: 0;
   border: 0;
 }
@@ -635,9 +957,51 @@ body.mb-map-open .mb-hud__readout {
   margin: 0 0 10px;
   padding: 0;
   font-size: 10px;
+  font-weight: 500;
   letter-spacing: 0.24em;
   text-transform: uppercase;
   color: var(--mb-ink-dim);
+}
+
+/*
+ * A short window - a laptop with a browser's chrome eating half of it - gets
+ * the same menu with less air, rather than a scroll bar through the title.
+ */
+@media (max-height: 620px) {
+  .mb-pause {
+    padding: 14px;
+  }
+
+  .mb-pause__head {
+    padding: 14px 22px 10px;
+  }
+
+  .mb-pause__title {
+    font-size: 19px;
+  }
+
+  .mb-pause__eyebrow {
+    margin-bottom: 5px;
+  }
+
+  .mb-pause__rail {
+    padding: 0 22px;
+  }
+
+  .mb-pause__view {
+    padding: 16px 22px 18px;
+  }
+
+  .mb-pause__foot {
+    padding: 9px 22px 10px;
+  }
+}
+
+/* Below this there is no room for a footer that only repeats the rail. */
+@media (max-height: 460px) {
+  .mb-pause__foot {
+    display: none;
+  }
 }
 
 .mb-segmented {
@@ -706,6 +1070,28 @@ body.mb-map-open .mb-hud__readout {
   letter-spacing: 0.16em;
   text-transform: uppercase;
   align-self: center;
+}
+
+/*
+ * The same list, given room to breathe on the pause menu's Controls tab: ruled
+ * rows rather than a dense block, and a measure that stops the two columns
+ * drifting a hand's width apart on a wide panel. The shop's copy of this list
+ * is unchanged - it is a hint in a corner, not a reference table.
+ */
+.mb-keylist--pause {
+  grid-template-columns: minmax(112px, auto) 1fr;
+  gap: 0;
+  max-width: 620px;
+}
+
+.mb-keylist--pause dt,
+.mb-keylist--pause dd {
+  padding: 8px 0;
+  border-top: 1px solid var(--mb-line);
+}
+
+.mb-keylist--pause dd {
+  padding-left: 20px;
 }
 
 /* --------------------------------------------------------------------- */
@@ -1008,6 +1394,15 @@ body.mb-map-open .mb-hud__readout {
   padding: 11px 20px;
 }
 
+/*
+ * REDUCED MOTION, TWICE OVER.
+ *
+ * The `.is-open` rules are listed here as well as the base ones, and that is
+ * the whole point of this edit: a media query adds no specificity, so
+ * `.mb-pause.is-open`'s own `transition` declaration beat the `.mb-pause` rule
+ * below and the 180 ms fade INTO the menu played at full length for a reader
+ * who had asked for no motion. Only the fade out was ever reduced.
+ */
 @media (prefers-reduced-motion: reduce) {
   .mb-button,
   .mb-hud__prompt,
@@ -1016,7 +1411,12 @@ body.mb-map-open .mb-hud__readout {
   .mb-map,
   .mb-minimap,
   .mb-pause,
+  .mb-pause.is-open,
+  .mb-pause__tab,
+  .mb-pause__close,
+  .mb-pause__resume,
   .mb-shop,
+  .mb-shop.is-open,
   .mb-shop__status,
   .mb-loading,
   .mb-loading__bar,
@@ -1026,14 +1426,54 @@ body.mb-map-open .mb-hud__readout {
   }
 }
 
-/* -- volume sliders ------------------------------------------------------- */
+/*
+ * The same thing as a preference the player can set from the menu, for the
+ * machine whose operating system offers no such switch - or whose owner wants
+ * it for this game only. Written to `documentElement` by `PauseMenu`, so it
+ * reaches every layer including ones added after this rule was written.
+ */
+:root[data-mb-motion='reduced'] *,
+:root[data-mb-motion='reduced'] *::before,
+:root[data-mb-motion='reduced'] *::after {
+  transition-duration: 1ms !important;
+  animation-duration: 1ms !important;
+  scroll-behavior: auto !important;
+}
+
+/*
+ * High contrast: the same interface, with the ink and the hairlines lifted.
+ *
+ * It works by moving the tokens rather than by restyling components, so it
+ * reaches the HUD, the minimap, the shop and this menu at once - which is also
+ * why the pause menu's hand-mixed creams were reconciled onto tokens above.
+ */
+:root[data-mb-contrast='high'] {
+  --mb-ink: #eef3f7;
+  --mb-ink-bright: #ffffff;
+  --mb-ink-dim: #c9d3da;
+  --mb-panel: rgba(6, 9, 11, 0.9);
+  --mb-line: rgba(214, 228, 238, 0.3);
+  --mb-line-strong: rgba(214, 228, 238, 0.56);
+  --mb-accent: #e8c58c;
+}
+
+:root[data-mb-contrast='high'] .mb-pause__panel,
+:root[data-mb-contrast='high'] .mb-shop__panel {
+  background: rgba(6, 8, 10, 0.98);
+}
+
+:root[data-mb-contrast='high'] .mb-pause {
+  background: rgba(2, 3, 4, 0.9);
+}
+
+/* -- sliders -------------------------------------------------------------- */
 
 .mb-slider {
   display: grid;
-  grid-template-columns: 1fr 130px 44px;
+  grid-template-columns: 1fr 150px 46px;
   align-items: center;
   gap: 12px;
-  margin: 0 0 10px;
+  margin: 0 0 14px;
 }
 
 .mb-slider:last-child {
@@ -1043,23 +1483,33 @@ body.mb-map-open .mb-hud__readout {
 .mb-slider__label {
   font-size: 13px;
   letter-spacing: 0.01em;
-  color: rgba(226, 214, 199, 0.78);
+  color: var(--mb-ink);
 }
 
 .mb-slider__value {
   font-variant-numeric: tabular-nums;
   font-size: 12px;
   text-align: right;
-  color: rgba(226, 214, 199, 0.55);
+  color: var(--mb-ink-dim);
 }
 
+/*
+ * The filled part of the track is a gradient, not a pseudo-element: no browser
+ * exposes the lower half of a range input to CSS, and the two vendor-specific
+ * ways to fake it disagree. `--mb-fill` is written by the module on every
+ * input event, so the fill and the printed percentage cannot drift apart.
+ */
 .mb-slider__input {
   -webkit-appearance: none;
   appearance: none;
   width: 100%;
   height: 3px;
   border-radius: 2px;
-  background: rgba(226, 214, 199, 0.2);
+  background: linear-gradient(
+    90deg,
+    var(--mb-accent) 0 var(--mb-fill, 0%),
+    var(--mb-line-strong) var(--mb-fill, 0%) 100%
+  );
   outline: none;
   cursor: pointer;
 }
@@ -1071,7 +1521,7 @@ body.mb-map-open .mb-hud__readout {
   height: 14px;
   border: 0;
   border-radius: 50%;
-  background: #e2d6c7;
+  background: var(--mb-ink-bright);
   cursor: pointer;
 }
 
@@ -1080,12 +1530,12 @@ body.mb-map-open .mb-hud__readout {
   height: 14px;
   border: 0;
   border-radius: 50%;
-  background: #e2d6c7;
+  background: var(--mb-ink-bright);
   cursor: pointer;
 }
 
 .mb-slider__input:focus-visible {
-  box-shadow: 0 0 0 2px rgba(226, 214, 199, 0.45);
+  box-shadow: 0 0 0 2px var(--mb-accent);
 }
 
 @media (max-width: 520px) {

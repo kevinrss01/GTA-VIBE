@@ -19,6 +19,18 @@
  *     plus any looping emitters the world registers (fountains and the like);
  *   - music: off on every load, opt-in only, and never fetched until then.
  *
+ * A limiter sits between the master gain and the output. It is a guard rail
+ * rather than a mix stage - see `makeLimiter` - because the buses are trimmed
+ * for the average case and the game has moments where a dozen legitimate
+ * voices land inside the same 50 ms.
+ *
+ * ## Pausing
+ *
+ * `setGamePaused` and the visibility hook are two independent HOLDS on the
+ * same context-level suspend, not a counter, so pausing then tabbing away and
+ * back leaves a paused game silent. See `setGamePaused` for why that matters
+ * and why it goes through `ctx.suspend()` rather than the music switch.
+ *
  * ## The music contract
  *
  * Music is a product decision, not a mixing one, and it is enforced here rather
@@ -44,6 +56,7 @@ import {
   MUSIC_ASSET_ID,
   ONE_SHOTS,
   PRELOAD_ASSET_IDS,
+  ROAD_SURFACE,
   SEA_BED,
   STEP_SURFACES,
   SURFACE_AMBIENCE,
@@ -174,16 +187,39 @@ const RUN_GAIN_DB = 2.5;
 const RUN_PITCH = 1.05;
 
 /**
- * Step cadence, exported so the caller can drive `footstep()` at the right rate.
- * The director does not schedule steps itself; the player controller owns the
- * decision of when a foot lands.
+ * Hard ceiling on the player's own footsteps sounding at once.
+ *
+ * The controller emits a step per `strideLength` metres walked, which is one
+ * every 0.325 s at a run. The step assets are 0.32 s, so two should never
+ * genuinely overlap - but a frame-rate collapse, a debug time step or a pitch
+ * jitter that lands long can all stack them, and there is no limiter under
+ * this. Three is generous enough that nothing audible is ever dropped and low
+ * enough that the summed level cannot run away.
+ *
+ * The cadence constants that used to live here were dead: `STEP_INTERVAL_WALK`,
+ * `STEP_INTERVAL_RUN` and `stepIntervalFor` were exported for a caller that
+ * never existed, because `FirstPersonController` schedules steps by DISTANCE
+ * walked rather than on a clock. They are gone rather than kept as a second,
+ * wrong description of the cadence.
  */
-export const STEP_INTERVAL_WALK = 0.52;
-export const STEP_INTERVAL_RUN = 0.34;
+const MAX_PLAYER_STEP_VOICES = 3;
 
-export function stepIntervalFor(running: boolean): number {
-  return running ? STEP_INTERVAL_RUN : STEP_INTERVAL_WALK;
-}
+/**
+ * How many consecutive footsteps a new surface must be reported on before the
+ * sound actually changes.
+ *
+ * The ground sampler resolves a surface per point, so a player walking along a
+ * boundary - a kerb, the edge of an apron, a path across grass - can be given a
+ * different surface on every step, which is heard as the material flickering
+ * underfoot. Requiring two steps in a row costs at most one step of the old
+ * material on a real crossing, which nobody notices, and removes the flicker
+ * entirely.
+ *
+ * `onRoad` bypasses it: that flag is the world's authoritative "this is a
+ * carriageway", not a sampled guess, so crossing on or off a road switches
+ * immediately and correctly.
+ */
+const SURFACE_HOLD_STEPS = 2;
 
 /**
  * The ferry terminal PA. Position mirrors the `ferry-terminal` landmark in
@@ -343,6 +379,7 @@ export class AudioDirector implements AudioBusHost {
 
   private ctx: AudioContext | null = null;
   private master: GainNode | null = null;
+  private limiter: DynamicsCompressorNode | null = null;
   private ambienceBus: GainNode | null = null;
   private sfxBus: GainNode | null = null;
   private musicBus: GainNode | null = null;
@@ -379,6 +416,13 @@ export class AudioDirector implements AudioBusHost {
 
   private readonly emitters = new Set<RegisteredEmitter>();
   private readonly stepFlip = new Map<SurfaceId, number>();
+  /** The player's own footsteps in flight; see MAX_PLAYER_STEP_VOICES. */
+  private stepVoices = 0;
+  /** Surface hysteresis state; see `settleSurface`. */
+  private heldSurface: SurfaceId | null = null;
+  private pendingSurface: SurfaceId | null = null;
+  private pendingSteps = 0;
+  private heldOnRoad: boolean | null = null;
 
   private readonly volumes: Record<VolumeChannel, number> = loadVolumes();
   private state: ListenerState | null = null;
@@ -389,6 +433,9 @@ export class AudioDirector implements AudioBusHost {
 
   private disposed = false;
   private visibilityHandler: (() => void) | null = null;
+  /** Independent reasons the context is suspended; see `setGamePaused`. */
+  private pausedHold = false;
+  private hiddenHold = false;
 
   constructor(options?: AudioDirectorOptions) {
     this.basePath = options?.basePath ?? '';
@@ -426,7 +473,7 @@ export class AudioDirector implements AudioBusHost {
     this.ctx = ctx;
 
     this.master = ctx.createGain();
-    this.master.connect(ctx.destination);
+    this.master.connect(this.makeLimiter(ctx));
 
     this.ambienceBus = this.makeBus(AMBIENCE_BUS_DB);
     this.sfxBus = this.makeBus(SFX_BUS_DB);
@@ -436,7 +483,9 @@ export class AudioDirector implements AudioBusHost {
     // The buses exist now, so the stored levels can finally be applied.
     this.applyVolumes();
 
-    if (ctx.state === 'suspended') {
+    // A player who paused before ever unlocking must not get audio back on the
+    // gesture that unlocks it; the holds are the single source of truth here.
+    if (ctx.state === 'suspended' && !this.suspended) {
       try {
         await ctx.resume();
       } catch {
@@ -459,6 +508,34 @@ export class AudioDirector implements AudioBusHost {
     if (this.musicOn) await this.startMusic();
   }
 
+  /**
+   * A catch-all limiter between the master gain and the output.
+   *
+   * There was nothing of the kind anywhere in the graph, and the mix has
+   * genuinely unbounded moments: a burst of gunfire, an explosion and its
+   * debris, five engines and a siren can all land inside the same 50 ms with no
+   * single voice being wrong. The buses are trimmed for the AVERAGE case, so
+   * without a ceiling the sum clips at the sound card.
+   *
+   * Deliberately transparent rather than a mix effect: -3 dBFS threshold, a
+   * 20:1 ratio and a wide 8 dB knee mean it does nothing at all until the sum
+   * is already within 7 dB of full scale, and the 250 ms release is long enough
+   * that it cannot pump the ambience beds. It is a guard rail; the footstep and
+   * voice budgets are what actually keep the level right.
+   */
+  private makeLimiter(ctx: AudioContext): AudioNode {
+    if (typeof ctx.createDynamicsCompressor !== 'function') return ctx.destination;
+    const limiter = ctx.createDynamicsCompressor();
+    limiter.threshold.value = -3;
+    limiter.knee.value = 8;
+    limiter.ratio.value = 20;
+    limiter.attack.value = 0.003;
+    limiter.release.value = 0.25;
+    limiter.connect(ctx.destination);
+    this.limiter = limiter;
+    return limiter;
+  }
+
   private makeBus(db: number): GainNode {
     const ctx = this.ctx as AudioContext;
     const bus = ctx.createGain();
@@ -476,17 +553,53 @@ export class AudioDirector implements AudioBusHost {
     if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return;
 
     const handler = (): void => {
-      const ctx = this.ctx;
-      if (!ctx || this.disposed) return;
-      try {
-        if (document.visibilityState === 'hidden') void ctx.suspend();
-        else void ctx.resume();
-      } catch {
-        /* Suspend/resume is best-effort. */
-      }
+      this.hiddenHold = document.visibilityState === 'hidden';
+      this.applySuspension();
     };
     this.visibilityHandler = handler;
     document.addEventListener('visibilitychange', handler);
+  }
+
+  /**
+   * Suspends audio while the game is paused, and resumes it when it is not.
+   *
+   * ## Why two named holds and not a counter
+   *
+   * Pause and tab-visibility both want the context suspended, and they overlap:
+   * pausing, tabbing away and tabbing back must leave a PAUSED game silent.
+   * A `suspendCount += 1 / -= 1` pair gets that wrong the moment either source
+   * fires twice in a row, and `visibilitychange` does exactly that - it fires on
+   * every focus change, not only on transitions the game asked about. Two named
+   * booleans are idempotent by construction: setting a hold that is already set
+   * is a no-op, and the context is suspended if and only if some hold is up.
+   *
+   * ## Why context-level suspend and not the music switch
+   *
+   * The music contract at the top of this file: suspend/resume must never touch
+   * music STATE. `ctx.suspend()` freezes the whole graph including a playing
+   * track's position, so resuming continues it from where it was; a stopped
+   * track stays stopped because nothing here starts one.
+   */
+  setGamePaused(paused: boolean): void {
+    if (this.pausedHold === paused) return;
+    this.pausedHold = paused;
+    this.applySuspension();
+  }
+
+  /** True while some hold wants the graph frozen. */
+  get suspended(): boolean {
+    return this.pausedHold || this.hiddenHold;
+  }
+
+  private applySuspension(): void {
+    const ctx = this.ctx;
+    if (!ctx || this.disposed) return;
+    try {
+      if (this.suspended) void ctx.suspend();
+      else void ctx.resume();
+    } catch {
+      /* Suspend/resume is best-effort. */
+    }
   }
 
   setMasterVolume(v: number): void {
@@ -804,13 +917,27 @@ export class AudioDirector implements AudioBusHost {
 
   // -- footsteps and one-shots ---------------------------------------------
 
-  /** Plays a footstep for the given surface, alternating the two variants. */
-  footstep(surface: SurfaceId, running: boolean): void {
+  /**
+   * Plays a footstep for the given surface, alternating the two variants.
+   *
+   * `onRoad` is `GroundSample.onRoad`, which the world already computes and
+   * documents as being "so the footstep mixer can pick the right variant" but
+   * which nothing in audio read until now. It is the authoritative carriageway
+   * flag rather than a sampled material, so it wins outright over `surface`,
+   * and a change in it resets the hysteresis below - stepping off a kerb is a
+   * real transition and must be heard on the step that makes it.
+   *
+   * Omitting it is legal and leaves the sampled surface in charge, which is
+   * what a caller with no ground sample (a cutscene, a test) should get.
+   */
+  footstep(surface: SurfaceId, running: boolean, onRoad?: boolean): void {
     if (this.disposed || !this.ctx) return;
+    if (this.stepVoices >= MAX_PLAYER_STEP_VOICES) return;
 
-    const variants = STEP_SURFACES[surface];
-    const flip = this.stepFlip.get(surface) ?? 0;
-    this.stepFlip.set(surface, flip ^ 1);
+    const heard = this.settleSurface(surface, onRoad);
+    const variants = STEP_SURFACES[heard];
+    const flip = this.stepFlip.get(heard) ?? 0;
+    this.stepFlip.set(heard, flip ^ 1);
     const assetId = variants[flip === 0 ? 0 : 1];
 
     const jitterDb = (Math.random() * 2 - 1) * STEP_GAIN_JITTER_DB;
@@ -818,7 +945,50 @@ export class AudioDirector implements AudioBusHost {
     const rate =
       (1 + (Math.random() * 2 - 1) * STEP_PITCH_JITTER) * (running ? RUN_PITCH : 1);
 
-    this.playBuffered(assetId, dbToGain(gainDb), rate);
+    this.playBuffered(assetId, dbToGain(gainDb), rate, true);
+  }
+
+  /**
+   * Which surface is actually heard for this step.
+   *
+   * Two rules, in order. A carriageway is a carriageway: if the world says the
+   * foot is on a road, the sound is asphalt whatever the sampler returned, and
+   * the moment `onRoad` flips the held surface is abandoned. Otherwise a new
+   * surface has to survive `SURFACE_HOLD_STEPS` consecutive footsteps before it
+   * is heard, which is what stops a boundary flickering between two materials
+   * step by step.
+   */
+  private settleSurface(surface: SurfaceId, onRoad?: boolean): SurfaceId {
+    if (onRoad !== undefined && onRoad !== this.heldOnRoad) {
+      this.heldOnRoad = onRoad;
+      this.heldSurface = onRoad ? ROAD_SURFACE : surface;
+      this.pendingSurface = null;
+      this.pendingSteps = 0;
+      return this.heldSurface;
+    }
+    if (onRoad === true) return ROAD_SURFACE;
+
+    if (this.heldSurface === null) {
+      this.heldSurface = surface;
+      return surface;
+    }
+    if (surface === this.heldSurface) {
+      this.pendingSurface = null;
+      this.pendingSteps = 0;
+      return this.heldSurface;
+    }
+
+    if (surface === this.pendingSurface) this.pendingSteps += 1;
+    else {
+      this.pendingSurface = surface;
+      this.pendingSteps = 1;
+    }
+    if (this.pendingSteps < SURFACE_HOLD_STEPS) return this.heldSurface;
+
+    this.heldSurface = surface;
+    this.pendingSurface = null;
+    this.pendingSteps = 0;
+    return surface;
   }
 
   playOneShot(id: OneShotId): void {
@@ -832,7 +1002,12 @@ export class AudioDirector implements AudioBusHost {
    * `unlock()`; if one is missing the call is a silent no-op rather than a
    * deferred sound arriving seconds late.
    */
-  private playBuffered(assetId: AudioAssetId, gainValue: number, rate: number): void {
+  private playBuffered(
+    assetId: AudioAssetId,
+    gainValue: number,
+    rate: number,
+    step = false,
+  ): void {
     const ctx = this.ctx;
     const buffer = this.buffers.get(assetId);
     if (!ctx || !buffer) {
@@ -848,7 +1023,9 @@ export class AudioDirector implements AudioBusHost {
     source.buffer = buffer;
     source.playbackRate.value = rate;
     source.connect(gain);
+    if (step) this.stepVoices += 1;
     source.onended = (): void => {
+      if (step) this.stepVoices = Math.max(0, this.stepVoices - 1);
       this.disconnect(source);
       this.disconnect(gain);
     };
@@ -1104,6 +1281,8 @@ export class AudioDirector implements AudioBusHost {
       if (bus) this.disconnect(bus);
     }
     if (this.master) this.disconnect(this.master);
+    if (this.limiter) this.disconnect(this.limiter);
+    this.limiter = null;
 
     this.ambienceBus = null;
     this.sfxBus = null;
@@ -1115,6 +1294,11 @@ export class AudioDirector implements AudioBusHost {
     this.buffers.clear();
     this.loading.clear();
     this.stepFlip.clear();
+    this.stepVoices = 0;
+    this.heldSurface = null;
+    this.pendingSurface = null;
+    this.pendingSteps = 0;
+    this.heldOnRoad = null;
     this.activeBed = null;
     this.seaTarget = 0;
     this.seaRequested = false;
@@ -1132,9 +1316,28 @@ export class AudioDirector implements AudioBusHost {
 
   // -- small shared helpers -------------------------------------------------
 
+  /**
+   * Ramps a parameter, or sets it outright while the context is suspended.
+   *
+   * `ctx.currentTime` stops advancing under `suspend()`, so every ramp
+   * scheduled during a pause targets the same instant and they pile up on one
+   * another: the frame loop is gated while paused, but a level change can still
+   * arrive from a UI slider or a lifecycle callback, and this must not turn
+   * into a queue of ramps that all fire at once on resume. Assigning the value
+   * is both correct and inaudible, because nothing is being rendered.
+   */
   private ramp(param: AudioParam, value: number, seconds: number): void {
     const ctx = this.ctx;
     if (!ctx) return;
+    if (ctx.state === 'suspended') {
+      try {
+        param.cancelScheduledValues(ctx.currentTime);
+      } catch {
+        /* Nothing was scheduled. */
+      }
+      param.value = value;
+      return;
+    }
     const now = ctx.currentTime;
     try {
       param.cancelScheduledValues(now);

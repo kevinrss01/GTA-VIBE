@@ -120,6 +120,7 @@ export class Engine {
   private readonly clock = new Clock();
   private frameHandle = 0;
   private running = false;
+  private paused = false;
   private disposed = false;
   private quality: QualityLevel = 'high';
   private pixelRatioScale = 1;
@@ -308,14 +309,23 @@ export class Engine {
     if (!this.running) return;
     this.frameHandle = requestAnimationFrame(this.tick);
 
+    // The delta is READ every frame, paused or not. `Clock.getDelta` reports
+    // the time since it was last asked, so skipping the call while the pause
+    // menu is open would hand the first resumed frame the whole length of the
+    // pause - the clamp below would cap it at 100 ms, but a tenth of a second
+    // of traffic, gunfire and falling rockets still arrives in one step. Read
+    // it and throw it away instead, and resuming costs exactly one frame.
     const raw = this.clock.getDelta();
     // 100 ms is a slow frame; anything beyond that is a stall, not gameplay.
     const dt = Math.min(raw, 0.1);
     const started = performance.now();
 
     this.renderer.info.reset();
-    this.onUpdate?.(dt, this.clock.elapsedTime);
+    if (!this.paused) this.onUpdate?.(dt, (this.simTime += dt));
     const afterUpdate = performance.now();
+    // Rendering continues while paused: the world stays on screen behind the
+    // menu, it simply stops advancing. It also keeps the canvas correct across
+    // a resize with the menu open.
     this.renderFrame();
     const finished = performance.now();
     this.lastUpdateMs = afterUpdate - started;
@@ -323,6 +333,34 @@ export class Engine {
 
     this.collectStats(finished - started, raw);
   };
+
+  /**
+   * Stops the simulation without stopping the picture.
+   *
+   * Everything the game simulates hangs off `onUpdate`, so not calling it is
+   * the whole pause: physics, traffic, the crowd, aircraft, projectiles,
+   * mission timers, animation and audio position updates all stop together,
+   * and none of them needs to know a pause exists.
+   *
+   * `simTime` is the clock the world is told about, and it does NOT advance
+   * here. That matters because several systems treat it as an ABSOLUTE time
+   * rather than an accumulator - traffic signals and pedestrian crossings both
+   * phase off it - so handing them wall-clock time after a two-minute pause
+   * would teleport every light in the city to a new phase on the first resumed
+   * frame.
+   */
+  setPaused(paused: boolean): void {
+    this.paused = paused;
+  }
+
+  get isPaused(): boolean {
+    return this.paused;
+  }
+
+  /** The world's own clock: seconds of SIMULATED time since the first frame. */
+  get simulatedTime(): number {
+    return this.simTime;
+  }
 
   /**
    * Runs exactly one frame with an explicit delta, outside the rAF loop.
@@ -335,7 +373,7 @@ export class Engine {
   stepOnce(dt: number): void {
     if (this.disposed) return;
     this.renderer.info.reset();
-    this.onUpdate?.(dt, (this.stepClock += dt));
+    this.onUpdate?.(dt, (this.simTime += dt));
     this.renderFrame();
   }
 
@@ -362,7 +400,8 @@ export class Engine {
     this.renderer.autoClear = autoClear;
   }
 
-  private stepClock = 0;
+  /** Simulated seconds. Advances only on frames the world was updated. */
+  private simTime = 0;
 
   /**
    * True when the overlay has something VISIBLE in it.

@@ -42,6 +42,7 @@ import {
   getAudioAsset,
   HANDLING_SOUNDS,
   IMPACT_SOUNDS,
+  impactSoundFor,
   ROCKET_FLIGHT_SOUND,
   WEAPON_SOUNDS,
   type AudioAssetId,
@@ -54,6 +55,18 @@ const MAX_IMPACT_VOICES = 8;
 
 /** Seconds between impact one-shots, so a shotgun is one hit and not eight. */
 const IMPACT_INTERVAL = 0.055;
+
+/**
+ * Intensity spread on an impact.
+ *
+ * A weakest hit is 8 dB down and 8 per cent sharp against a full-energy one,
+ * which is roughly the difference between a pistol round and a rifle round into
+ * the same surface. Both ends stay clearly audible: an impact the player cannot
+ * hear reads as the round having missed.
+ */
+const IMPACT_WEAK_LEVEL = 0.4;
+const IMPACT_WEAK_RATE = 1.08;
+const IMPACT_PITCH_JITTER = 0.12;
 
 /** Pitch jitter on repeated fire, so a held trigger is not a machine. */
 const SHOT_PITCH_JITTER = 0.045;
@@ -93,7 +106,14 @@ function dbToGain(db: number): number {
   return Math.pow(10, db / 20);
 }
 
-/** What a projectile arrived at. Mirrors `CombatFx`'s own impact kinds. */
+/**
+ * What a projectile arrived at.
+ *
+ * The known set. `impact()` deliberately accepts any string on top of it: the
+ * combat layer owns its own `ImpactKind` and is growing it, and a material this
+ * module has never heard of must produce a concrete hit rather than a compile
+ * error in somebody else's file or, worse, a silent round.
+ */
 export type ImpactSoundKind = keyof typeof IMPACT_SOUNDS;
 export type HandlingSound = keyof typeof HANDLING_SOUNDS;
 export type WeaponSound = keyof typeof WEAPON_SOUNDS;
@@ -192,15 +212,29 @@ export class CombatAudio {
     this.playFlat(id, dbToGain(getAudioAsset(id).trimDb), 1);
   }
 
-  /** Where a round landed. Rate-limited; a shotgun is one impact, not eight. */
-  impact(kind: ImpactSoundKind, x: number, y: number, z: number): void {
+  /**
+   * Where a round landed. Rate-limited; a shotgun is one impact, not eight.
+   *
+   * `intensity` is 0..1 and defaults to 1, so every existing call site keeps
+   * its current behaviour. It exists because impacts had NO intensity variation
+   * at all: a .22 grazing a wall and a rifle round into the same wall were the
+   * same recording at the same level, which is the defect the bullet impacts
+   * shared with the vehicle ones. A weak hit is quieter AND higher - less
+   * energy goes into the surface, so less of it ends up in the low end - which
+   * is a cheap approximation of what actually happens and reads correctly.
+   */
+  impact(kind: ImpactSoundKind | string, x: number, y: number, z: number, intensity = 1): void {
     if (this.impactCooldown > 0) return;
     this.impactCooldown = IMPACT_INTERVAL;
-    const id = IMPACT_SOUNDS[kind];
+    const id = impactSoundFor(kind);
+    const strength = intensity < 0 ? 0 : intensity > 1 ? 1 : intensity;
     // Impacts vary far more than gunshots do - the same round into the same
     // wall never sounds the same twice - so they get a wider rate spread.
-    const rate = 1 + (Math.random() * 2 - 1) * 0.12;
-    this.playAt(id, x, y, z, dbToGain(getAudioAsset(id).trimDb), IMPACT_REF, IMPACT_MAX, rate, true);
+    const jitter = 1 + (Math.random() * 2 - 1) * IMPACT_PITCH_JITTER;
+    const rate = jitter * (IMPACT_WEAK_RATE + (1 - IMPACT_WEAK_RATE) * strength);
+    const gain =
+      dbToGain(getAudioAsset(id).trimDb) * (IMPACT_WEAK_LEVEL + (1 - IMPACT_WEAK_LEVEL) * strength);
+    this.playAt(id, x, y, z, gain, IMPACT_REF, IMPACT_MAX, rate, true);
   }
 
   /**

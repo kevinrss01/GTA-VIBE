@@ -55,7 +55,15 @@ import {
   VEHICLE_WEIGHTS,
   type VehicleBlueprint,
 } from './VehicleCatalogue';
-import type { TrafficObstacle, VehicleControl, VehicleKind, VehicleView } from './types';
+import {
+  VEHICLE_INTEGRITY,
+  impactDamage,
+  type TrafficObstacle,
+  type VehicleControl,
+  type VehicleImpact,
+  type VehicleKind,
+  type VehicleView,
+} from './types';
 
 // -- tuning -----------------------------------------------------------------
 
@@ -129,9 +137,122 @@ const STUCK_LIMIT = 70;
 const RECYCLE_DISTANCE = 70;
 /** Minimum distance from the camera at which a recycled vehicle may reappear. */
 const RESPAWN_CLEARANCE = 58;
+/**
+ * The longest body in the fleet, for sizing a spawn proximity query.
+ *
+ * Derived rather than written down: `tests/traffic.test.ts` caps every
+ * blueprint at 7.5 m, and a constant that drifted away from the catalogue
+ * would silently shrink the query until it stopped catching the lorry it
+ * exists for.
+ */
+const LONGEST_VEHICLE = Math.max(...ALL_VEHICLE_KINDS.map((k) => VEHICLE_BLUEPRINTS[k].length));
 
 /** Cell size of the vehicle broad-phase grid, metres. */
 const GRID_CELL = 20;
+
+// -- impacts and free bodies ------------------------------------------------
+
+/**
+ * Change in speed, m/s, below which a hit is felt but does not free the body.
+ *
+ * A car that left its lane every time something brushed it would spend the
+ * day being re-attached, and every re-attach is a discontinuity in the queue
+ * behind it. Below this the impulse is spent on the vehicle's own speed and
+ * on damage, and the driver stays in charge.
+ */
+const LOOSE_TRIGGER = 0.9;
+/**
+ * Seconds one vehicle ignores further impulses after taking one.
+ *
+ * Two cars in contact stay in contact for many frames, and a contact that
+ * re-applied its impulse at 120 Hz would launch a hatchback over a building.
+ * A quarter of a second is longer than any single collision lasts and shorter
+ * than the gap between two genuinely separate hits.
+ */
+const IMPACT_COOLDOWN = 0.22;
+/**
+ * How a free body slows: rolling along its own axis, scrubbing across it.
+ *
+ * Split because the two are nothing alike. A car shoved sideways is dragging
+ * four locked tyres and stops in well under a second; one shunted forwards is
+ * rolling, and a genuinely free-rolling car coasts for six or seven seconds,
+ * which reads as ice. 3.0 m/s2 is a wreck with a bent wheel and no driver -
+ * from 8 m/s it is stopped and back in traffic inside three seconds.
+ */
+const ROLL_DECEL = 3.0;
+const SCRUB_DECEL = 8.5;
+/** Yaw rate decay while loose, per second. */
+const SPIN_DAMPING = 1.5;
+/**
+ * Roll rate decay, per second, in the two regimes a rolling car has.
+ *
+ * They are nothing alike and one constant cannot serve both. Below
+ * `ROLL_CONTACT_ANGLE` the car is still on all four tyres and the roll it has
+ * is suspension travel, which a damper kills inside a cycle. Past it two
+ * wheels are off the ground and the body is swinging about the other pair,
+ * with nothing but air resisting it.
+ *
+ * Measured with a single constant: 2.2 everywhere damped the rock-back
+ * correctly but pushed the rollover threshold to 8.1 rad/s, half again more
+ * than the real figure; 0.9 everywhere put the threshold at 5.7 and then left
+ * a merely-shoved car rocking for seven seconds before it could rejoin
+ * traffic. Split, a shoved car is upright and back in its lane in two seconds
+ * and the threshold sits at 7.4.
+ */
+const ROLL_CONTACT_ANGLE = 0.3;
+const ROLL_DAMPING_GROUNDED = 3.5;
+const ROLL_DAMPING_AIRBORNE = 1.6;
+/**
+ * Ceilings on the angular rates one impact may impart, radians per second.
+ *
+ * Not physics, arithmetic hygiene: an explosion or a bug upstream can hand in
+ * an impulse of any size, and a car spinning at fifty radians a second is a
+ * strobe rather than a crash. Both are far above anything a collision at the
+ * speeds this city reaches produces.
+ */
+const MAX_YAW_RATE = 9;
+const MAX_ROLL_RATE = 8;
+/**
+ * Restoring angular acceleration that keeps a car on its wheels, 1/s2.
+ *
+ * Modelled as a pendulum with minima at upright and inverted, `-TIP_TORQUE *
+ * sin(2 * roll)`, which costs one sine and gives exactly the behaviour that
+ * matters: below the barrier the body rocks back onto its wheels, above it
+ * carries over and stays there. The undamped barrier is `TIP_TORQUE`, so the
+ * ideal threshold is `sqrt(2 * TIP_TORQUE)` = 4.9 rad/s; measured with the
+ * damping below it is 7.4, against about 5.4 for the real thing at this track
+ * and centre-of-mass height. Deliberately on the hard side: a rollover should
+ * be the crash the player remembers, not one they cause every other junction.
+ *
+ * In lateral velocity change - which is what a caller actually controls - a
+ * saloon struck a metre above its contact patches goes over at 7.7 m/s and
+ * rocks back below it. The lever matters as much as the impulse: the same hit
+ * at bumper height, 0.7 m, needs 11 m/s.
+ */
+const TIP_TORQUE = 12;
+/** Speed and spin below which a free body counts as at rest. */
+const REST_SPEED = 0.3;
+const REST_SPIN = 0.3;
+/** Seconds continuously at rest before a free body rejoins traffic. */
+const SETTLE_SECONDS = 0.4;
+/**
+ * Seconds a body may stay loose before it is recycled out of sight.
+ *
+ * Same safety valve as `STUCK_LIMIT`, for the same reason: a wreck that can
+ * never rejoin a lane would otherwise sit in the road forever, and the fleet
+ * would bleed cars every time the player crashed one. Long enough that the
+ * player who caused it gets to see it, and the recycle still waits for
+ * `RECYCLE_DISTANCE` so nothing ever vanishes in front of them.
+ */
+const LOOSE_LIMIT = 18;
+/** Restitution of a free body against the world. Sheet metal, not rubber. */
+const WALL_RESTITUTION = 0.25;
+/** Body height a loose car collides with, matching `Driving`'s own box. */
+const LOOSE_BODY_HEIGHT = 1.4;
+/** Closing speed, m/s, below which an ambient car touching a driven one is a nudge. */
+const CONTACT_SPEED = 1.4;
+/** Coefficient of restitution between two cars. Sheet metal absorbs most of it. */
+const CAR_RESTITUTION = 0.15;
 
 // -- lane metadata ----------------------------------------------------------
 
@@ -223,6 +344,9 @@ interface MutableView {
   braking: boolean;
   accelLong: number;
   control: VehicleControl;
+  integrity: number;
+  damage: number;
+  overturned: boolean;
 }
 
 export interface Vehicle {
@@ -254,6 +378,36 @@ export interface Vehicle {
   groundPitch: number;
   groundRoll: number;
   wheelSpin: number;
+
+  /**
+   * Free-body state. Only integrated while `control === 'loose'`, but always
+   * present so the hot path never branches on whether the fields exist.
+   */
+  vx: number;
+  vz: number;
+  yawRate: number;
+  rollRate: number;
+  /**
+   * Attitude a crash left behind, added on top of the road slope and the
+   * suspension. Kept separate from `bodyPitch`/`bodyRoll` because those are a
+   * spring driven by this frame's accelerations, and separate from
+   * `groundPitch`/`groundRoll` because `settleBody` zeroes those at long range
+   * - an overturned car has to stay overturned on the far side of the city.
+   */
+  crashPitch: number;
+  crashRoll: number;
+  /** How far the body has to be lifted to rest on its side or its roof. */
+  bodyLift: number;
+  /** Seconds spent loose, and seconds spent continuously at rest while loose. */
+  looseTimer: number;
+  restTimer: number;
+  /** Seconds left before another impulse will be accepted. */
+  impactCooldown: number;
+
+  /** Structural points remaining, out of `VEHICLE_INTEGRITY`. */
+  integrity: number;
+  /** The same as a fraction, 0 to 1. Cached because the renderer reads it per frame. */
+  damage: number;
 
   desiredSpeed: number;
   braking: boolean;
@@ -292,7 +446,43 @@ export interface TrafficSimOptions {
   readonly seed?: string;
   /** Beyond this the ground is sampled coarsely; nothing else changes. */
   readonly detailDistance?: number;
+  /**
+   * The static world a loose body bounces off. Optional: without it a knocked
+   * car still slides, spins and settles, it just does not notice walls. Every
+   * headless test that only needs traffic runs without one.
+   */
+  readonly collision?: TrafficCollision;
 }
+
+/**
+ * The slice of the player's `CollisionWorld` a free body needs.
+ *
+ * Structural rather than an import, so `TrafficSim` keeps its promise of
+ * containing nothing but arithmetic and never reaches into the player module.
+ */
+export interface TrafficCollision {
+  moveBox(
+    x: number,
+    z: number,
+    yaw: number,
+    dx: number,
+    dz: number,
+    halfLength: number,
+    halfWidth: number,
+    feetY: number,
+    height: number,
+    vehicles?: boolean,
+  ): { x: number; z: number; feetY: number };
+}
+
+/** Where a body ends up after one free step, and what it hit getting there. */
+export type ImpactListener = (
+  x: number,
+  y: number,
+  z: number,
+  intensity: number,
+  kind: 'vehicle' | 'world',
+) => void;
 
 // -- helpers ----------------------------------------------------------------
 
@@ -326,6 +516,97 @@ function bezier(arc: TurnArc, t: number): { x: number; z: number } {
 }
 
 /**
+ * Plan-view separating-axis test between two yaw-oriented vehicle footprints.
+ *
+ * Four axes is exact for a box pair in the plane. Used only where an
+ * approximate answer would be wrong - deciding whether a car has actually
+ * struck a driven one - never in the following model, which works on gaps.
+ */
+/**
+ * How deep two footprints overlap, and along which direction, or zero.
+ *
+ * The separating-axis test already computes every candidate axis; the smallest
+ * positive overlap among them IS the minimum translation that separates them,
+ * so the depth costs nothing beyond the boolean. The axis is written into a
+ * module-level scratch rather than returned, because this runs inside the
+ * frame loop and a returned pair would allocate.
+ */
+const penetrationAxis = { x: 0, z: 0 };
+
+function footprintPenetration(
+  x: number,
+  z: number,
+  yaw: number,
+  ahl: number,
+  ahw: number,
+  b: Vehicle,
+): number {
+  const afx = -Math.sin(yaw);
+  const afz = -Math.cos(yaw);
+  const bfx = -Math.sin(b.yaw);
+  const bfz = -Math.cos(b.yaw);
+  const bhl = b.blueprint.length * 0.5;
+  const bhw = b.blueprint.width * 0.5;
+  const dx = b.x - x;
+  const dz = b.z - z;
+  let least = Infinity;
+  for (let axis = 0; axis < 4; axis += 1) {
+    const ax = axis === 0 ? afx : axis === 1 ? -afz : axis === 2 ? bfx : -bfz;
+    const az = axis === 0 ? afz : axis === 1 ? afx : axis === 2 ? bfz : bfx;
+    const reach =
+      ahl * Math.abs(afx * ax + afz * az) +
+      ahw * Math.abs(-afz * ax + afx * az) +
+      bhl * Math.abs(bfx * ax + bfz * az) +
+      bhw * Math.abs(-bfz * ax + bfx * az);
+    const overlap = reach - Math.abs(dx * ax + dz * az);
+    if (overlap <= 0) return 0;
+    if (overlap < least) {
+      least = overlap;
+      // Oriented away from `b`, so `a` is the one that gets pushed out.
+      const sign = dx * ax + dz * az > 0 ? -1 : 1;
+      penetrationAxis.x = ax * sign;
+      penetrationAxis.z = az * sign;
+    }
+  }
+  return least;
+}
+
+function footprintsOverlap(a: Vehicle, b: Vehicle): boolean {
+  const afx = -Math.sin(a.yaw);
+  const afz = -Math.cos(a.yaw);
+  const arx = -afz;
+  const arz = afx;
+  const bfx = -Math.sin(b.yaw);
+  const bfz = -Math.cos(b.yaw);
+  const brx = -bfz;
+  const brz = bfx;
+  const ahl = a.blueprint.length * 0.5;
+  const ahw = a.blueprint.width * 0.5;
+  const bhl = b.blueprint.length * 0.5;
+  const bhw = b.blueprint.width * 0.5;
+  const dx = b.x - a.x;
+  const dz = b.z - a.z;
+  const separated = (ax: number, az: number, own: number): boolean =>
+    Math.abs(dx * ax + dz * az) >
+    own + bhl * Math.abs(bfx * ax + bfz * az) + bhw * Math.abs(brx * ax + brz * az);
+  if (separated(afx, afz, ahl)) return false;
+  if (separated(arx, arz, ahw)) return false;
+  if (
+    Math.abs(dx * bfx + dz * bfz) >
+    bhl + ahl * Math.abs(afx * bfx + afz * bfz) + ahw * Math.abs(arx * bfx + arz * bfz)
+  ) {
+    return false;
+  }
+  if (
+    Math.abs(dx * brx + dz * brz) >
+    bhw + ahl * Math.abs(afx * brx + afz * brz) + ahw * Math.abs(arx * brx + arz * brz)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/**
  * Intelligent Driver Model acceleration.
  *
  * `gap` is bumper to bumper; `closing` is this vehicle's speed minus the
@@ -356,6 +637,11 @@ export class TrafficSim {
   readonly views: MutableView[] = [];
 
   private readonly laneInfo = new Map<string, LaneInfo>();
+  /**
+   * Which lanes feed each junction. Built once with `laneInfo`, because the
+   * road network never changes, and read by `junctionConflict` at 120 Hz.
+   */
+  private readonly junctionApproaches = new Map<string, LaneInfo[]>();
   private readonly laneList: LaneInfo[] = [];
   private readonly spawnLanes: LaneInfo[] = [];
   private readonly spawnWeights: number[] = [];
@@ -393,6 +679,23 @@ export class TrafficSim {
 
   private obstacles: readonly TrafficObstacle[] = [];
   private crossingBlocked: ((crossingId: string) => boolean) | null = null;
+  private collision: TrafficCollision | null = null;
+  /** Notified for every resolved impact. See `TrafficSystem.onImpact`. */
+  impactListener: ImpactListener | null = null;
+  /**
+   * Impulse waiting to be collected by whoever owns a driven vehicle's pose.
+   *
+   * A `player` vehicle's position is written from outside, so the sim cannot
+   * move it: all it can do is record what hit it and let the owner - `Driving`,
+   * or a pursuit - decide what that does to the car. Keyed by vehicle id, and
+   * empty on all but the handful of frames where something actually connects.
+   */
+  private readonly pendingImpulses = new Map<
+    number,
+    { x: number; z: number; yaw: number; damage: number }
+  >();
+  /** Driven vehicles this frame, rebuilt in place. Usually one, never many. */
+  private readonly driven: Vehicle[] = [];
   private time = 0;
   private cameraX = 0;
   private cameraZ = 0;
@@ -403,6 +706,7 @@ export class TrafficSim {
     this.heightAt = options.heightAt;
     this.rng = createRng(options.seed ?? 'meridian-traffic-01');
     this.detailDistance = options.detailDistance ?? 240;
+    this.collision = options.collision ?? null;
 
     for (const street of options.plan.streets) this.streets.set(street.id, street);
     this.buildLaneInfo();
@@ -478,6 +782,11 @@ export class TrafficSim {
         blockages: [],
       };
       this.laneInfo.set(lane.id, info);
+      if (info.exit) {
+        const list = this.junctionApproaches.get(info.exit.junction.id);
+        if (list) list.push(info);
+        else this.junctionApproaches.set(info.exit.junction.id, [info]);
+      }
       this.laneList.push(info);
     }
 
@@ -725,6 +1034,9 @@ export class TrafficSim {
       braking: false,
       accelLong: 0,
       control: 'ambient',
+      integrity: VEHICLE_INTEGRITY,
+      damage: 0,
+      overturned: false,
     };
     return {
       id,
@@ -752,6 +1064,18 @@ export class TrafficSim {
       groundPitch: 0,
       groundRoll: 0,
       wheelSpin: 0,
+      vx: 0,
+      vz: 0,
+      yawRate: 0,
+      rollRate: 0,
+      crashPitch: 0,
+      crashRoll: 0,
+      bodyLift: 0,
+      looseTimer: 0,
+      restTimer: 0,
+      impactCooldown: 0,
+      integrity: VEHICLE_INTEGRITY,
+      damage: 0,
       desiredSpeed: 10,
       braking: false,
       brakeHold: 0,
@@ -803,6 +1127,33 @@ export class TrafficSim {
         }
       }
       if (blocked) continue;
+      /*
+       * ...and not on top of anybody on a DIFFERENT lane either.
+       *
+       * The check above is one-dimensional: it compares `along` within one
+       * lane, which is exactly right for the car in front and blind to the one
+       * crossing at right angles. Near a junction the two lanes are metres
+       * apart in the plan and arbitrarily far apart in `along`, so a car could
+       * be seeded straight through a lorry on the cross street.
+       *
+       * Measured before this check: a coupe on Grand Concourse and a box lorry
+       * on Ridge Road overlapping by 0.524 m, three and a half seconds into a
+       * ten-minute run. It was always possible and the old lane graph simply
+       * never rolled it; adding two streets re-rolled the draws and it
+       * appeared. The plan-view test is the honest one.
+       *
+       * Radius, not a box test: this runs at most 14 times per placement and
+       * the whole point is to reject the site, not to resolve a contact.
+       */
+      const reach = halfLength + LONGEST_VEHICLE * 0.5 + 1;
+      this.forEachNearVehicle(point.x, point.z, reach, (other) => {
+        if (other === vehicle || blocked) return;
+        const need = halfLength + other.blueprint.length * 0.5 + 1;
+        const ddx = other.x - point.x;
+        const ddz = other.z - point.z;
+        if (ddx * ddx + ddz * ddz < need * need) blocked = true;
+      });
+      if (blocked) continue;
 
       vehicle.laneId = info.lane.id;
       vehicle.along = along;
@@ -829,6 +1180,8 @@ export class TrafficSim {
       vehicle.accelLat = 0;
       vehicle.bodyPitch = 0;
       vehicle.bodyRoll = 0;
+      // A vehicle that reappears is a different car, not the wreck that left.
+      this.resetBody(vehicle);
       vehicle.active = true;
       vehicle.control = 'ambient';
       vehicle.view.control = 'ambient';
@@ -841,6 +1194,27 @@ export class TrafficSim {
       let at = info.occupants.length;
       while (at > 0 && (info.occupants[at - 1] as Vehicle).along > along) at -= 1;
       info.occupants.splice(at, 0, vehicle);
+      /*
+       * ...and into the broad-phase grid, so the NEXT placement can see it.
+       *
+       * `rebuildIndexes` fills the grid at the top of every `update`, which is
+       * enough for a respawn but not for the initial seeding: the whole fleet
+       * is placed before the first frame runs, against an empty grid, so the
+       * cross-lane check above saw nobody and every car was placed as though
+       * it were alone. Measured: a coupe on Grand Concourse and a box lorry on
+       * Ridge Road overlapping by 0.524 m three and a half seconds in.
+       *
+       * Inserting here costs one push per placement and is discarded by the
+       * next rebuild, which is the correct lifetime for it.
+       */
+      const key = TrafficSim.cellKey(vehicle.x, vehicle.z);
+      const cell = this.grid.get(key);
+      if (cell) cell.push(vehicle);
+      else {
+        const fresh = this.gridPool.pop() ?? [];
+        fresh.push(vehicle);
+        this.grid.set(key, fresh);
+      }
       return true;
     }
     return false;
@@ -979,6 +1353,15 @@ export class TrafficSim {
     this.crossingBlocked = predicate;
   }
 
+  /**
+   * Gives free bodies a world to bounce off. Optional, and installed after
+   * construction because the collision world is built from the baked city and
+   * the traffic system is built from the plan - neither can precede the other.
+   */
+  setCollision(collision: TrafficCollision | null): void {
+    this.collision = collision;
+  }
+
   // -- frame ----------------------------------------------------------------
 
   update(dt: number, cameraX: number, cameraZ: number, time: number): void {
@@ -995,6 +1378,10 @@ export class TrafficSim {
         this.placeVehicle(vehicle, RESPAWN_CLEARANCE);
         continue;
       }
+      if (vehicle.impactCooldown > 0) vehicle.impactCooldown -= step;
+      const dx = vehicle.x - cameraX;
+      const dz = vehicle.z - cameraZ;
+      const distance = Math.hypot(dx, dz);
       if (vehicle.control === 'player') {
         // Still settle a player car on the road. `settleBody` is what reads the
         // terrain into `vehicle.y`, and it only ran inside `stepVehicle` - which
@@ -1005,12 +1392,16 @@ export class TrafficSim {
         this.syncView(vehicle);
         continue;
       }
+      if (vehicle.control === 'loose') {
+        // Never coarsened. A free body lives for a few seconds, is almost
+        // always the thing the player is looking at, and integrating it at a
+        // quarter rate visibly changes where it ends up.
+        this.stepLoose(vehicle, step, distance);
+        continue;
+      }
       // Simulation level of detail: distant cars are stepped less often with a
       // proportionally larger dt. IDM is stable well past 100 ms, and nothing
       // within sight of the player is ever coarsened.
-      const dx = vehicle.x - cameraX;
-      const dz = vehicle.z - cameraZ;
-      const distance = Math.hypot(dx, dz);
       const stride = distance < 130 ? 1 : distance < 260 ? 2 : 4;
       vehicle.simAccumulator += step;
       if (stride > 1 && (this.frame + vehicle.bucket) % stride !== 0) continue;
@@ -1019,6 +1410,8 @@ export class TrafficSim {
       if (vehicleStep <= 0) continue;
       this.stepVehicle(vehicle, vehicleStep, distance);
     }
+
+    this.resolveDrivenContacts();
 
     this.views.length = 0;
     for (const vehicle of this.vehicles) {
@@ -1038,13 +1431,14 @@ export class TrafficSim {
     }
     this.grid.clear();
 
+    this.driven.length = 0;
     for (const vehicle of this.vehicles) {
       if (!vehicle.active) continue;
       if (vehicle.control === 'ambient') {
         const info = this.laneInfo.get(vehicle.laneId);
         if (info) info.occupants.push(vehicle);
         if (vehicle.claim) this.addClaim(vehicle, vehicle.claim);
-      }
+      } else if (vehicle.control === 'player') this.driven.push(vehicle);
       const key = TrafficSim.cellKey(vehicle.x, vehicle.z);
       const cell = this.grid.get(key);
       if (cell) cell.push(vehicle);
@@ -1421,7 +1815,9 @@ export class TrafficSim {
     if (vehicle.claim === exit.junction.id) return null;
     const distance = exit.stopAlong - vehicle.along - halfLength;
     if (distance < -0.6) {
-      // Already over the line: commit rather than stop in the middle of a box.
+      // Already over the line: commit rather than stop in the middle of a
+      // box. Whether it should ever have got this far is decided upstream, by
+      // the committed-approach rule in `junctionConflict`.
       vehicle.claim = exit.junction.id;
       this.addClaim(vehicle, exit.junction.id);
       return null;
@@ -1526,6 +1922,46 @@ export class TrafficSim {
       }
     }
 
+    /*
+     * Do not take the box in front of a car that can no longer stop.
+     *
+     * Admission is granted at `distance <= 0.9`, but a conflicting driver on
+     * another approach may already be inside its own braking distance of its
+     * own line. Claiming ahead of that car does not stop it - nothing can -
+     * it simply arrives anyway, hits the `distance < -0.6` commit path, takes
+     * the same junction and drives into whoever is in it.
+     *
+     * Measured before this rule: a pickup and a saloon on opposite approaches
+     * of Anchor Street, both turning into Ferro Street, both holding
+     * `j:ferro-street:anchor-street`, both stopped, overlapping by 0.223 m,
+     * and still there 69 seconds later when `STUCK_LIMIT` recycled one.
+     *
+     * Yielding is the cheap side of this trade. The car that waits is the one
+     * that CAN wait, by construction, and it waits about as long as the other
+     * takes to cross - whereas the alternative, refusing the commit, stops a
+     * car inside the box and was measured costing five points of arterial
+     * density and seven points of twelve-minute flow.
+     */
+    const approaches = this.junctionApproaches.get(junction.id);
+    for (const approachInfo of approaches ?? []) {
+      if (approachInfo === info || !approachInfo.exit) continue;
+      // The last occupant is the one nearest the line; nobody behind it can be
+      // committed while it is not.
+      for (let i = approachInfo.occupants.length - 1; i >= 0; i -= 1) {
+        const other = approachInfo.occupants[i] as Vehicle;
+        if (other === vehicle || !other.active) continue;
+        const toLine =
+          approachInfo.exit.stopAlong - other.along - other.blueprint.length * 0.5;
+        // Behind its line and able to pull up: it is not committed, and the
+        // ordinary claim exclusion covers it.
+        if (toLine < 0) break;
+        const stopping = (other.speed * other.speed) / (2 * BRAKE_COMFORT);
+        if (toLine > stopping) break;
+        if (this.movementsConflict(vehicle, approachInfo, other)) return true;
+        break;
+      }
+    }
+
     // A left turn also yields to oncoming traffic that has not arrived yet.
     // The gap a driver will accept shrinks the longer they have been sitting
     // there: without that, one waiting left-turner blocks the single lane
@@ -1555,7 +1991,28 @@ export class TrafficSim {
           const other = oncomingInfo.occupants[i] as Vehicle;
           const toJunction = oncomingInfo.lane.length - other.along;
           if (toJunction < -other.blueprint.length) break;
-          if (toJunction < 0) return other.turn !== 1;
+          /*
+           * The oncoming car is already IN the box.
+           *
+           * This used to wave our driver through whenever that car was also
+           * turning - `return other.turn !== 1` - on the reasoning that two
+           * opposing left-turners pass each other driver's side to driver's
+           * side. Real junctions are often marked for exactly that. These
+           * ones are not: the two turn arcs this simulation builds cross, and
+           * `movementsConflict` says so everywhere else in the file. One rule
+           * said conflict and this one said clear, so both cars entered.
+           *
+           * Measured before the change: a pickup and a saloon on opposite
+           * approaches of Anchor Street, both turning into Ferro Street, both
+           * holding `j:ferro-street:anchor-street`, both stopped, overlapping
+           * by 0.223 m - and still there 69 seconds later, when `STUCK_LIMIT`
+           * finally recycled one of them.
+           *
+           * Yielding here is bounded: a car inside the box is leaving it, so
+           * this is a wait of a second or two, not the standing-queue deadlock
+           * the time-based gap below exists to prevent.
+           */
+          if (toJunction < 0) return true;
           if (toJunction < other.speed * patience + 6) return true;
           break;
         }
@@ -1715,6 +2172,571 @@ export class TrafficSim {
     vehicle.speed = 0;
   }
 
+  // -- impacts and free bodies ----------------------------------------------
+
+  /**
+   * Applies one collision to one vehicle. Returns true if it took the hit.
+   *
+   * THE WHOLE POINT of this method is that a struck car goes where it was
+   * actually hit. The impulse divided by the chassis mass is the change in
+   * velocity, so a hatchback is thrown by what a box truck shrugs off; the
+   * moment of that impulse about the centre of mass is the yaw, so a corner
+   * hit spins the car and a square one does not; and its lateral component
+   * acting at the contact height above the tyres is the roll, so a hard enough
+   * side impact takes the car over. Nothing here is a special case - all three
+   * come out of the same impulse and the same chassis numbers.
+   *
+   * Once past `LOOSE_TRIGGER` the vehicle leaves the traffic AI entirely and
+   * integrates as a free body until it stops. A `player` vehicle cannot be
+   * moved from here - somebody else owns its pose - so its impulse is banked
+   * for `takeImpulse` instead.
+   */
+  applyImpact(vehicleId: number, hit: VehicleImpact): boolean {
+    const vehicle = this.vehicles.find((v) => v.id === vehicleId && v.active);
+    if (!vehicle) return false;
+    // One contact lasts many frames. Without this, standing on a car with the
+    // throttle open would integrate the same impulse at the frame rate.
+    if (vehicle.impactCooldown > 0) return false;
+    vehicle.impactCooldown = IMPACT_COOLDOWN;
+
+    const chassis = vehicle.blueprint.chassis;
+    const mass = Math.max(1, chassis.mass);
+    const impulse = Math.max(0, hit.impulse);
+    const jx = hit.dirX * impulse;
+    const jz = hit.dirZ * impulse;
+    const deltaV = impulse / mass;
+
+    this.damage(vehicle, hit.damage);
+    this.report(hit.x, hit.y, hit.z, deltaV / 12, 'vehicle');
+
+    if (vehicle.control === 'player') {
+      const pending = this.pendingImpulses.get(vehicleId);
+      const rx = hit.x - vehicle.x;
+      const rz = hit.z - vehicle.z;
+      // Torque about +Y. Pushing the right-hand side forward swings the nose
+      // left, which is the positive yaw direction in this game's convention.
+      const yaw = rz * jx - rx * jz;
+      if (pending) {
+        pending.x += jx;
+        pending.z += jz;
+        pending.yaw += yaw;
+        pending.damage += hit.damage;
+      } else {
+        this.pendingImpulses.set(vehicleId, { x: jx, z: jz, yaw, damage: hit.damage });
+      }
+      return true;
+    }
+
+    if (vehicle.control === 'ambient') {
+      if (deltaV < LOOSE_TRIGGER) {
+        // Felt, not freed: spend it on the driver's own speed and let them
+        // carry on. Anything else turns a kerbside scrape into a recovery.
+        const fx = -Math.sin(vehicle.yaw);
+        const fz = -Math.cos(vehicle.yaw);
+        vehicle.speed = Math.max(0, vehicle.speed + (jx * fx + jz * fz) / mass);
+        return true;
+      }
+      this.goLoose(vehicle);
+    }
+
+    vehicle.vx += jx / mass;
+    vehicle.vz += jz / mass;
+
+    // Yaw. A box's moment of inertia about its vertical axis is m(L2 + W2)/12.
+    const length = vehicle.blueprint.length;
+    const width = vehicle.blueprint.width;
+    const yawInertia = (mass * (length * length + width * width)) / 12;
+    const rx = hit.x - vehicle.x;
+    const rz = hit.z - vehicle.z;
+    vehicle.yawRate = clamp(
+      vehicle.yawRate + (rz * jx - rx * jz) / yawInertia,
+      -MAX_YAW_RATE,
+      MAX_YAW_RATE,
+    );
+
+    // Roll. The lateral component acts at the contact height above the tyres,
+    // and the body pivots over the tyres it is being pushed onto - which is
+    // why a car tips in the direction of the hit, not away from it. Positive
+    // roll is right-side-up, so a shove to the driver's right rolls negative.
+    const rightX = Math.cos(vehicle.yaw);
+    const rightZ = -Math.sin(vehicle.yaw);
+    const lateral = jx * rightX + jz * rightZ;
+    const lever = Math.max(0, hit.y - vehicle.y);
+    const halfTrack = chassis.track * 0.5;
+    const comHeight = vehicle.blueprint.height * 0.45;
+    const rollInertia = mass * (halfTrack * halfTrack + comHeight * comHeight);
+    vehicle.rollRate = clamp(
+      vehicle.rollRate - (lateral * lever) / rollInertia,
+      -MAX_ROLL_RATE,
+      MAX_ROLL_RATE,
+    );
+
+    return true;
+  }
+
+  /**
+   * Structural damage with no impulse behind it - gunfire, fire, an explosion
+   * felt at a distance. Returns true if the vehicle existed and took it.
+   *
+   * Deliberately NOT subject to `IMPACT_COOLDOWN`: a rifle fires far faster
+   * than the cooldown and every round has to count.
+   */
+  applyDamage(vehicleId: number, amount: number): boolean {
+    const vehicle = this.vehicles.find((v) => v.id === vehicleId && v.active);
+    if (!vehicle || !(amount > 0)) return false;
+    this.damage(vehicle, amount);
+    return true;
+  }
+
+  /**
+   * Collects and clears the impulse banked for a driven vehicle, in newton
+   * seconds, or null when nothing hit it. Allocates only on a real contact.
+   */
+  takeImpulse(vehicleId: number): { x: number; z: number; yaw: number; damage: number } | null {
+    const pending = this.pendingImpulses.get(vehicleId);
+    if (!pending) return null;
+    this.pendingImpulses.delete(vehicleId);
+    return pending;
+  }
+
+  private damage(vehicle: Vehicle, amount: number): void {
+    if (!(amount > 0)) return;
+    vehicle.integrity = Math.max(0, vehicle.integrity - amount);
+    vehicle.damage = 1 - vehicle.integrity / VEHICLE_INTEGRITY;
+  }
+
+  private report(
+    x: number,
+    y: number,
+    z: number,
+    intensity: number,
+    kind: 'vehicle' | 'world',
+  ): void {
+    if (!this.impactListener || intensity <= 0.01) return;
+    this.impactListener(x, y, z, Math.min(1, intensity), kind);
+  }
+
+  /** Takes a vehicle out of the traffic AI without stopping it. */
+  private goLoose(vehicle: Vehicle): void {
+    const fx = -Math.sin(vehicle.yaw);
+    const fz = -Math.cos(vehicle.yaw);
+    vehicle.vx = fx * vehicle.speed;
+    vehicle.vz = fz * vehicle.speed;
+    vehicle.control = 'loose';
+    vehicle.view.control = 'loose';
+    vehicle.looseTimer = 0;
+    // A car already on its roof stays flagged; one on its wheels starts the
+    // episode upright whatever happened to it in a previous life.
+    if (Math.abs(vehicle.crashRoll) < Math.PI / 2) vehicle.view.overturned = false;
+    vehicle.restTimer = 0;
+    vehicle.stuck = 0;
+    vehicle.braking = false;
+    vehicle.brakeHold = 0;
+    if (vehicle.claim) this.dropClaim(vehicle, vehicle.claim);
+    vehicle.claim = null;
+    const info = this.laneInfo.get(vehicle.laneId);
+    if (info) {
+      const index = info.occupants.indexOf(vehicle);
+      if (index >= 0) info.occupants.splice(index, 1);
+    }
+  }
+
+  /** Clears everything a crash left on a vehicle. */
+  private resetBody(vehicle: Vehicle): void {
+    vehicle.vx = 0;
+    vehicle.vz = 0;
+    vehicle.yawRate = 0;
+    vehicle.rollRate = 0;
+    vehicle.crashPitch = 0;
+    vehicle.crashRoll = 0;
+    vehicle.bodyLift = 0;
+    vehicle.looseTimer = 0;
+    vehicle.restTimer = 0;
+    vehicle.impactCooldown = 0;
+    vehicle.integrity = VEHICLE_INTEGRITY;
+    vehicle.damage = 0;
+    vehicle.view.overturned = false;
+    this.pendingImpulses.delete(vehicle.id);
+  }
+
+  /**
+   * One free-body step: no lane, no rail, no IDM.
+   *
+   * The vehicle integrates its own velocity, drags on the road, resolves
+   * against the static world and rocks on its suspension until it is slow
+   * enough to count as stopped. `steerAndMove` is bypassed entirely, which is
+   * the point: its 1.6 m rail snap would drag a spinning car straight back
+   * onto the centreline it was just knocked off.
+   */
+  private stepLoose(vehicle: Vehicle, dt: number, cameraDistance: number): void {
+    vehicle.looseTimer += dt;
+
+    const fx = -Math.sin(vehicle.yaw);
+    const fz = -Math.cos(vehicle.yaw);
+    const rx = Math.cos(vehicle.yaw);
+    const rz = -Math.sin(vehicle.yaw);
+
+    // Drag, resolved in the body frame: rolling along the axis, scrubbing
+    // across it. See ROLL_DECEL / SCRUB_DECEL for why they differ so much.
+    let along = vehicle.vx * fx + vehicle.vz * fz;
+    let across = vehicle.vx * rx + vehicle.vz * rz;
+    const rollDrop = ROLL_DECEL * dt;
+    const scrubDrop = SCRUB_DECEL * dt;
+    const wasAlong = along;
+    along = Math.abs(along) <= rollDrop ? 0 : along - Math.sign(along) * rollDrop;
+    across = Math.abs(across) <= scrubDrop ? 0 : across - Math.sign(across) * scrubDrop;
+    vehicle.vx = fx * along + rx * across;
+    vehicle.vz = fz * along + rz * across;
+
+    // Attitude. Yaw is pure damping - nothing restores a heading - while roll
+    // sits in a potential with minima upright and inverted, so it either rocks
+    // back or goes over. Pitch is a bounded spring: an end-over-end needs four
+    // times the energy of a roll on this wheelbase and never happens in a city.
+    vehicle.yawRate = damp(vehicle.yawRate, 0, SPIN_DAMPING, dt);
+    vehicle.rollRate -= TIP_TORQUE * Math.sin(2 * vehicle.crashRoll) * dt;
+    const onTyres = Math.abs(vehicle.crashRoll) < ROLL_CONTACT_ANGLE;
+    vehicle.rollRate = damp(
+      vehicle.rollRate,
+      0,
+      onTyres ? ROLL_DAMPING_GROUNDED : ROLL_DAMPING_AIRBORNE,
+      dt,
+    );
+    vehicle.yaw = normaliseAngle(vehicle.yaw + vehicle.yawRate * dt);
+    vehicle.crashRoll = normaliseAngle(vehicle.crashRoll + vehicle.rollRate * dt);
+    vehicle.crashPitch = damp(vehicle.crashPitch, 0, 4, dt);
+    // A quarter turn is the top of the potential: past it gravity is taking
+    // the body over rather than bringing it back, so that is the moment the
+    // car has gone over and the latch is what makes it stay gone. Latched
+    // rather than read off the final angle, because a hard enough hit can
+    // carry the body past inverted and the answer must not depend on exactly
+    // where it stopped rolling.
+    if (!vehicle.view.overturned && Math.abs(vehicle.crashRoll) > Math.PI / 2) {
+      vehicle.view.overturned = true;
+    }
+
+    // Move, and let the world refuse it.
+    const dx = vehicle.vx * dt;
+    const dz = vehicle.vz * dt;
+    const before = Math.hypot(vehicle.vx, vehicle.vz);
+    if (this.collision && (dx !== 0 || dz !== 0)) {
+      const moved = this.collision.moveBox(
+        vehicle.x,
+        vehicle.z,
+        vehicle.yaw,
+        dx,
+        dz,
+        vehicle.blueprint.length * 0.5,
+        vehicle.blueprint.width * 0.5,
+        vehicle.y,
+        LOOSE_BODY_HEIGHT,
+      );
+      // `moveBox` resolves one world axis at a time, so a refused axis is a
+      // face the body is up against: bounce that component and keep the other,
+      // which is what makes a car spin off a wall rather than stick to it.
+      const gotX = moved.x - vehicle.x;
+      const gotZ = moved.z - vehicle.z;
+      let hitWall = false;
+      if (dx !== 0 && Math.abs(gotX) < Math.abs(dx) - 1e-6) {
+        vehicle.vx = -vehicle.vx * WALL_RESTITUTION;
+        hitWall = true;
+      }
+      if (dz !== 0 && Math.abs(gotZ) < Math.abs(dz) - 1e-6) {
+        vehicle.vz = -vehicle.vz * WALL_RESTITUTION;
+        hitWall = true;
+      }
+      vehicle.x = moved.x;
+      vehicle.z = moved.z;
+      if (hitWall) {
+        const lost = before - Math.hypot(vehicle.vx, vehicle.vz);
+        vehicle.yawRate *= 0.5;
+        this.damage(vehicle, impactDamage(lost * vehicle.blueprint.chassis.mass));
+        this.report(vehicle.x, vehicle.y + 0.6, vehicle.z, lost / 12, 'world');
+      }
+    } else {
+      vehicle.x += dx;
+      vehicle.z += dz;
+    }
+
+    this.separateLoose(vehicle);
+
+    // Published state. `speed` stays the signed forward component so the wheels
+    // spin the right way and the crowd reads a velocity, not a magnitude.
+    const speed = Math.hypot(vehicle.vx, vehicle.vz);
+    vehicle.speed = vehicle.vx * fx + vehicle.vz * fz;
+    vehicle.accelLong = (Math.abs(along) - Math.abs(wasAlong)) / Math.max(dt, 1e-4);
+    vehicle.accelLat = 0;
+    vehicle.wheelSpin -= (vehicle.speed * dt) / vehicle.blueprint.wheelRadius;
+
+    this.settleBody(vehicle, dt, cameraDistance);
+
+    // At rest for long enough, or out of patience.
+    if (
+      speed < REST_SPEED &&
+      Math.abs(vehicle.yawRate) < REST_SPIN &&
+      Math.abs(vehicle.rollRate) < REST_SPIN
+    ) {
+      vehicle.restTimer += dt;
+      if (vehicle.restTimer > SETTLE_SECONDS) this.settleLoose(vehicle);
+    } else vehicle.restTimer = 0;
+
+    this.syncView(vehicle);
+
+    if (vehicle.control === 'loose' && vehicle.looseTimer > LOOSE_LIMIT) {
+      // Same rule as `STUCK_LIMIT`: it waits, visibly, until the camera has
+      // moved on. Nothing is ever allowed to disappear in front of the player.
+      if (cameraDistance > RECYCLE_DISTANCE) this.recycle(vehicle);
+      else vehicle.looseTimer = LOOSE_LIMIT;
+    }
+  }
+
+  /**
+   * Keeps a free body out of the cars it lands among.
+   *
+   * The traffic model's non-overlap guarantee comes from the one-dimensional
+   * lane bookkeeping, and a car that has left its lane is outside it. Without
+   * this a knocked car slides through the queue it was shunted into, and a
+   * wreck comes to rest inside somebody's boot.
+   *
+   * Only the FREE body is moved. Everything else is on rails, and pushing a
+   * lane-bound car sideways would break the very invariant this is protecting.
+   * Above a closing speed the contact is a collision as well as an overlap, so
+   * it goes through the same impulse exchange as any other - which is what
+   * makes a crash knock on into the car in front of it. `IMPACT_COOLDOWN`
+   * bounds that: one car cannot be hit twice inside a fifth of a second, so a
+   * pile-up settles instead of running away.
+   */
+  private separateLoose(vehicle: Vehicle): void {
+    const reach = vehicle.blueprint.length * 0.5 + 3.5;
+    const cx = Math.floor(vehicle.x / GRID_CELL);
+    const cz = Math.floor(vehicle.z / GRID_CELL);
+    const span = Math.ceil(reach / GRID_CELL);
+    for (let ix = cx - span; ix <= cx + span; ix += 1) {
+      for (let iz = cz - span; iz <= cz + span; iz += 1) {
+        const cell = this.grid.get((ix + 4096) * 8192 + (iz + 4096));
+        if (!cell) continue;
+        for (const other of cell) {
+          if (other === vehicle || !other.active) continue;
+          if (Math.abs(other.x - vehicle.x) > reach || Math.abs(other.z - vehicle.z) > reach) {
+            continue;
+          }
+          const depth = footprintPenetration(
+            vehicle.x,
+            vehicle.z,
+            vehicle.yaw,
+            vehicle.blueprint.length * 0.5,
+            vehicle.blueprint.width * 0.5,
+            other,
+          );
+          if (depth <= 0) continue;
+          const nx = penetrationAxis.x;
+          const nz = penetrationAxis.z;
+          vehicle.x += nx * depth;
+          vehicle.z += nz * depth;
+          const closing = -(vehicle.vx * nx + vehicle.vz * nz);
+          if (closing <= 0) continue;
+          if (closing > CONTACT_SPEED && other.impactCooldown <= 0) {
+            this.exchangeImpulse(other, vehicle, -nx, -nz, closing);
+          } else {
+            // Too slow to be a collision: just stop driving into them.
+            vehicle.vx += nx * closing;
+            vehicle.vz += nz * closing;
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Decides what a stopped free body does next.
+   *
+   * A car that is upright, drivable and beside a lane rejoins traffic, which is
+   * what keeps the fleet at strength and keeps the road clear. Anything else -
+   * on its roof, written off, or come to rest somewhere no lane fits - stays a
+   * wreck and waits out `LOOSE_LIMIT`, published as an obstacle the whole time
+   * so the traffic behind it queues instead of driving through it.
+   */
+  private settleLoose(vehicle: Vehicle): void {
+    // Snap to the attitude the body is actually resting in: on its wheels, or
+    // on its roof. Nothing rests on the top of the potential.
+    const overturned = vehicle.view.overturned;
+    vehicle.crashRoll = overturned ? Math.sign(vehicle.crashRoll || 1) * Math.PI : 0;
+    vehicle.rollRate = 0;
+    vehicle.yawRate = 0;
+    vehicle.vx = 0;
+    vehicle.vz = 0;
+    vehicle.speed = 0;
+    if (overturned || vehicle.integrity <= 0) return;
+    const spot = this.findAttachLane(vehicle);
+    if (!spot) return;
+
+    // Wait for a gap before pulling back out, and judge it at the pose the
+    // vehicle will END UP in, not the one it stopped in.
+    //
+    // Rejoining a lane hands the vehicle back to a model that steers on rails:
+    // within a frame or two the pure-pursuit and the 1.6 m centreline snap have
+    // dragged the body sideways onto the lane line. A car that stopped in a
+    // clear patch of road can therefore be pulled straight into the flank of
+    // one that is queued on the line it is rejoining, and the lane bookkeeping
+    // will not notice, because its non-overlap guarantee is one-dimensional and
+    // only covers cars already on the same lane.
+    //
+    // Measured before this: one shunted car in a five-minute run rejoined into
+    // another and the pair sat interpenetrated by 0.34 m for the seventy
+    // seconds it took `STUCK_LIMIT` to recycle one of them. Refusing simply
+    // leaves the body loose, and `stepLoose` asks again every frame until the
+    // road clears or `LOOSE_LIMIT` recycles it - which is what a driver whose
+    // car has been spun round in traffic actually does.
+    // Only from inside the lane, pointing roughly along it.
+    //
+    // `attach` is generous by design - it is what puts the player's car back
+    // in traffic when they step out of it beside a kerb, and refusing there
+    // would strand them. Fourteen metres of lateral tolerance is far too much
+    // for an automatic recovery: a body that stopped in the middle of a
+    // junction would take the nearest lane, and the centreline snap would then
+    // drag it bodily across the carriageway into oncoming traffic - which is
+    // exactly what produced the one sustained interpenetration this file's
+    // crash-load measurement found. Inside the corridor, within 35 degrees.
+    if (spot.offset > spot.info.laneHalf + 0.8 || spot.facing > 0.6) return;
+
+    // Never back into traffic from inside a junction box.
+    //
+    // `placeVehicle` refuses to SEED a car there for a reason, and the reason
+    // applies twice over here: a vehicle inside the box holds no claim, so the
+    // admission rules cannot see it, and the first driver to take the claim
+    // crosses straight into it. That is the second sustained interpenetration
+    // the crash-load measurement found - two stopped cars at an angle, 3.2 m
+    // apart, wedged until `STUCK_LIMIT` recycled one of them seventy seconds
+    // later. Left loose instead, the body is published as an obstacle and
+    // everything approaching the junction queues behind it, which is both
+    // correct and what a real blocked junction looks like.
+    const half = vehicle.blueprint.length * 0.5;
+    const exit = spot.info.exit;
+    if (exit && spot.along > exit.stopAlong - half) return;
+    const entry = spot.info.entry;
+    if (entry && spot.along < entry.crossingAlong + half) return;
+
+    const target = lanePoint(spot.info.lane, spot.along);
+    if (!this.poseIsClear(vehicle, target.x, target.z, spot.info.heading)) return;
+    this.attach(vehicle);
+  }
+
+  /** True when no other vehicle's footprint overlaps this pose. */
+  private poseIsClear(vehicle: Vehicle, x: number, z: number, yaw: number): boolean {
+    const halfLength = vehicle.blueprint.length * 0.5;
+    const halfWidth = vehicle.blueprint.width * 0.5;
+    const reach = halfLength + 3.5;
+    const cx = Math.floor(x / GRID_CELL);
+    const cz = Math.floor(z / GRID_CELL);
+    const span = Math.ceil(reach / GRID_CELL);
+    for (let ix = cx - span; ix <= cx + span; ix += 1) {
+      for (let iz = cz - span; iz <= cz + span; iz += 1) {
+        const cell = this.grid.get((ix + 4096) * 8192 + (iz + 4096));
+        if (!cell) continue;
+        for (const other of cell) {
+          if (other === vehicle || !other.active) continue;
+          if (Math.abs(other.x - x) > reach || Math.abs(other.z - z) > reach) continue;
+          if (footprintPenetration(x, z, yaw, halfLength, halfWidth, other) > 0) return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Impacts between an ambient car and one whose pose is written from outside.
+   *
+   * The other direction - the player driving into traffic - is detected by the
+   * collision resolve in `Driving`, which knows about it a frame earlier and
+   * calls `applyImpact` directly. This covers the case nothing else can see:
+   * a car running into a driven one that is parked, or crossing in front of it.
+   * The cooldown `applyImpact` sets is what stops the two paths double-counting
+   * the same contact.
+   *
+   * Costs nothing when nobody is driving, and `driven` is one entry plus the
+   * police units even when somebody is.
+   */
+  private resolveDrivenContacts(): void {
+    if (this.driven.length === 0) return;
+    for (const target of this.driven) {
+      const reach = target.blueprint.length * 0.5 + 3.5;
+      const cx = Math.floor(target.x / GRID_CELL);
+      const cz = Math.floor(target.z / GRID_CELL);
+      const span = Math.ceil(reach / GRID_CELL);
+      for (let ix = cx - span; ix <= cx + span; ix += 1) {
+        for (let iz = cz - span; iz <= cz + span; iz += 1) {
+          const cell = this.grid.get((ix + 4096) * 8192 + (iz + 4096));
+          if (!cell) continue;
+          for (const other of cell) {
+            if (other.control !== 'ambient' || !other.active) continue;
+            if (other.impactCooldown > 0) continue;
+            const dx = target.x - other.x;
+            const dz = target.z - other.z;
+            const range = Math.hypot(dx, dz);
+            if (range < 1e-4 || range > reach) continue;
+            // Closing speed along the line of centres. A car that is already
+            // separating is not a collision however much it overlaps.
+            const nx = dx / range;
+            const nz = dz / range;
+            const ofx = -Math.sin(other.yaw);
+            const ofz = -Math.cos(other.yaw);
+            const tfx = -Math.sin(target.yaw);
+            const tfz = -Math.cos(target.yaw);
+            const closing =
+              (ofx * other.speed - tfx * target.speed) * nx +
+              (ofz * other.speed - tfz * target.speed) * nz;
+            if (closing < CONTACT_SPEED) continue;
+            if (!footprintsOverlap(target, other)) continue;
+            this.exchangeImpulse(other, target, nx, nz, closing);
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * One inelastic collision between two vehicles, applied to both.
+   *
+   * `n` points from `a` towards `b`, so `a` is pushed back along it and `b` is
+   * pushed along it. The reduced mass is what makes the exchange believable in
+   * both directions: a lorry meeting a hatchback barely notices, and the same
+   * arithmetic run the other way throws the hatchback.
+   */
+  private exchangeImpulse(
+    a: Vehicle,
+    b: Vehicle,
+    nx: number,
+    nz: number,
+    closing: number,
+  ): void {
+    const ma = Math.max(1, a.blueprint.chassis.mass);
+    const mb = Math.max(1, b.blueprint.chassis.mass);
+    const impulse = (1 + CAR_RESTITUTION) * closing * ((ma * mb) / (ma + mb));
+    if (impulse <= 0) return;
+    // Contact point: half way between the two centres, at bumper height.
+    const px = (a.x + b.x) * 0.5;
+    const pz = (a.z + b.z) * 0.5;
+    const py = Math.min(a.y, b.y) + 0.55;
+    const wear = impactDamage(impulse);
+    this.applyImpact(a.id, {
+      x: px,
+      y: py,
+      z: pz,
+      dirX: -nx,
+      dirZ: -nz,
+      impulse,
+      damage: wear,
+    });
+    this.applyImpact(b.id, {
+      x: px,
+      y: py,
+      z: pz,
+      dirX: nx,
+      dirZ: nz,
+      impulse,
+      damage: wear,
+    });
+  }
+
   // -- presentation ---------------------------------------------------------
 
   /**
@@ -1781,15 +2803,35 @@ export class TrafficSim {
   private syncView(vehicle: Vehicle): void {
     const view = vehicle.view;
     view.x = vehicle.x;
-    view.y = vehicle.y + vehicle.blueprint.height * 0.5;
     view.z = vehicle.z;
     view.yaw = vehicle.yaw;
     view.speed = vehicle.speed;
-    view.pitch = vehicle.groundPitch + vehicle.bodyPitch;
-    view.roll = vehicle.groundRoll + vehicle.bodyRoll;
+    // A rolled body sits on its flank or its roof, which raises the mesh off
+    // its own origin and changes the vertical half-extent of the box every
+    // other system tests against. The branch keeps the upright path - which is
+    // every vehicle on all but a handful of frames - exactly as cheap as it was.
+    const halfHeight = vehicle.blueprint.height * 0.5;
+    if (vehicle.crashRoll === 0) {
+      vehicle.bodyLift = 0;
+      view.y = vehicle.y + halfHeight;
+      view.halfHeight = halfHeight;
+    } else {
+      const halfWidth = vehicle.blueprint.width * 0.5;
+      const sin = Math.abs(Math.sin(vehicle.crashRoll));
+      const cos = Math.cos(vehicle.crashRoll);
+      // Lowest corner of the rolled section, so the shell rests on the road.
+      vehicle.bodyLift = halfWidth * sin + vehicle.blueprint.height * Math.max(0, -cos);
+      const half = halfHeight * Math.abs(cos) + halfWidth * sin;
+      view.y = vehicle.y + vehicle.bodyLift + half;
+      view.halfHeight = half;
+    }
+    view.pitch = vehicle.groundPitch + vehicle.bodyPitch + vehicle.crashPitch;
+    view.roll = vehicle.groundRoll + vehicle.bodyRoll + vehicle.crashRoll;
     view.braking = vehicle.braking;
     view.accelLong = vehicle.accelLong;
     view.control = vehicle.control;
+    view.integrity = vehicle.integrity;
+    view.damage = vehicle.damage;
   }
 
   // -- handover -------------------------------------------------------------
@@ -1814,8 +2856,43 @@ export class TrafficSim {
    * roughly the way it is facing, or recycles it when there is no such lane.
    */
   attach(vehicle: Vehicle): void {
+    const found = this.findAttachLane(vehicle);
+    if (!found) {
+      this.recycle(vehicle);
+      vehicle.control = 'ambient';
+      vehicle.view.control = 'ambient';
+      return;
+    }
+    vehicle.control = 'ambient';
+    vehicle.view.control = 'ambient';
+    vehicle.laneId = found.info.lane.id;
+    vehicle.along = found.along;
+    vehicle.stuck = 0;
+    vehicle.looseTimer = 0;
+    vehicle.restTimer = 0;
+    vehicle.vx = 0;
+    vehicle.vz = 0;
+    vehicle.yawRate = 0;
+    vehicle.rollRate = 0;
+    vehicle.desiredSpeed = this.desiredSpeedFor(vehicle, found.info);
+    this.chooseNext(vehicle, found.info);
+  }
+
+  /**
+   * The lane a detached vehicle would rejoin, or null when none fits.
+   *
+   * Split out of `attach` so a free body can ASK before it commits: `attach`
+   * recycles when nothing fits, and a wreck that vanished the moment it stopped
+   * rolling - in front of the player who had just crashed it - would be the
+   * most obvious tell in the game.
+   */
+  private findAttachLane(
+    vehicle: Vehicle,
+  ): { info: LaneInfo; along: number; offset: number; facing: number } | null {
     let best: LaneInfo | null = null;
     let bestAlong = 0;
+    let bestOffset = 0;
+    let bestFacing = 0;
     let bestScore = Infinity;
     for (const info of this.laneList) {
       if (info.dead) continue;
@@ -1832,21 +2909,12 @@ export class TrafficSim {
         bestScore = score;
         best = info;
         bestAlong = along;
+        bestOffset = offset;
+        bestFacing = facing;
       }
     }
-    if (!best || bestScore > 14) {
-      this.recycle(vehicle);
-      vehicle.control = 'ambient';
-      vehicle.view.control = 'ambient';
-      return;
-    }
-    vehicle.control = 'ambient';
-    vehicle.view.control = 'ambient';
-    vehicle.laneId = best.lane.id;
-    vehicle.along = bestAlong;
-    vehicle.stuck = 0;
-    vehicle.desiredSpeed = this.desiredSpeedFor(vehicle, best);
-    this.chooseNext(vehicle, best);
+    if (!best || bestScore > 14) return null;
+    return { info: best, along: bestAlong, offset: bestOffset, facing: bestFacing };
   }
 
   /** Nearest active vehicle to a point, for the handover. */
@@ -1867,6 +2935,34 @@ export class TrafficSim {
   }
 
   /** Visits every active vehicle whose centre is within `radius` of a point. */
+  /**
+   * The same walk as `forEachNear`, but handing over the VEHICLE rather than
+   * its view, for callers inside the simulation. Private because a `Vehicle`
+   * is mutable and nothing outside may hold one.
+   */
+  private forEachNearVehicle(
+    x: number,
+    z: number,
+    radius: number,
+    visit: (vehicle: Vehicle) => void,
+  ): void {
+    const span = Math.ceil(radius / GRID_CELL);
+    const cx = Math.floor(x / GRID_CELL);
+    const cz = Math.floor(z / GRID_CELL);
+    const limit = radius * radius;
+    for (let ix = cx - span; ix <= cx + span; ix += 1) {
+      for (let iz = cz - span; iz <= cz + span; iz += 1) {
+        const cell = this.grid.get((ix + 4096) * 8192 + (iz + 4096));
+        if (!cell) continue;
+        for (const vehicle of cell) {
+          const dx = vehicle.x - x;
+          const dz = vehicle.z - z;
+          if (dx * dx + dz * dz <= limit) visit(vehicle);
+        }
+      }
+    }
+  }
+
   forEachNear(x: number, z: number, radius: number, visit: (view: VehicleView) => void): void {
     const span = Math.ceil(radius / GRID_CELL);
     const cx = Math.floor(x / GRID_CELL);

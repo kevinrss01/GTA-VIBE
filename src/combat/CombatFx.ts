@@ -35,6 +35,8 @@ import {
   type Object3D as Object3DType,
 } from 'three';
 
+import type { MaterialKey } from '../render/materials';
+
 /**
  * Bright bits alive at once: flashes, tracers, sparks and blast debris.
  *
@@ -91,7 +93,123 @@ function createFalloffTexture(): DataTexture {
   return texture;
 }
 
-export type ImpactKind = 'world' | 'metal' | 'body' | 'glass';
+/**
+ * What a round arrived on, as far as anything visible is concerned.
+ *
+ * `world` is the UNKNOWN bucket and stays the default. Most builders do not set
+ * `ColliderBox.surface` yet, and a box with no surface has to keep looking
+ * exactly as it did before this existed - see `surfaceImpact`.
+ */
+export type ImpactKind =
+  | 'world'
+  | 'stone'
+  | 'concrete'
+  | 'metal'
+  | 'glass'
+  | 'timber'
+  | 'foliage'
+  | 'body';
+
+/**
+ * The vocabulary the audio layer already speaks, which is NOT this one.
+ *
+ * `src/audio/manifest.ts` ships seven impact samples and belongs to another
+ * workstream; adding four visual materials must not oblige it to record four
+ * more. `impactSound` collapses the visual set onto the recorded set, and it
+ * gains rather than loses: `ground` and `debris` were both in the manifest and
+ * neither was ever emitted, because everything that was not metal, glass or a
+ * body arrived as one flat `world`.
+ */
+export type ImpactSound = 'world' | 'ground' | 'metal' | 'glass' | 'body' | 'debris';
+
+/** Which recorded sample a visual impact asks for. */
+export function impactSound(kind: ImpactKind, onGround = false): ImpactSound {
+  if (kind === 'body') return 'body';
+  if (kind === 'metal') return 'metal';
+  if (kind === 'glass') return 'glass';
+  // Splintered timber and torn leaves are a scatter of small pieces, which is
+  // what the debris sample is; stone and concrete are the dull hard slap the
+  // `world` sample already carries.
+  if (kind === 'timber' || kind === 'foliage') return 'debris';
+  return onGround ? 'ground' : 'world';
+}
+
+/**
+ * What a building material is, as far as a bullet is concerned.
+ *
+ * Deliberately exhaustive over `MaterialKey` rather than a lookup with a
+ * default: a new material added to the render library should make this fail to
+ * compile and be classified deliberately, not silently become pale stone dust.
+ * An ABSENT surface is a different thing entirely and stays `world`, because
+ * most builders do not set one and their impacts must not change.
+ */
+const SURFACE_IMPACT: Readonly<Record<MaterialKey, ImpactKind>> = {
+  // Ground and paving: hard, dusty, pale.
+  asphalt: 'stone',
+  asphaltWorn: 'stone',
+  roadPaint: 'stone',
+  roadPaintYellow: 'stone',
+  kerb: 'stone',
+  pavement: 'stone',
+  pavementDark: 'stone',
+  plazaStone: 'stone',
+  gravel: 'stone',
+  stoneAshlar: 'stone',
+  sand: 'stone',
+  sandWet: 'stone',
+  grass: 'foliage',
+  water: 'stone',
+  boardwalk: 'timber',
+  // Walls: rendered, cast or fired, all of which throw grey grit.
+  stuccoCream: 'concrete',
+  stuccoPeach: 'concrete',
+  stuccoMint: 'concrete',
+  stuccoRose: 'concrete',
+  stuccoSand: 'concrete',
+  stuccoBlue: 'concrete',
+  concrete: 'concrete',
+  concreteBoard: 'concrete',
+  brickRed: 'concrete',
+  brickBuff: 'concrete',
+  skyline: 'concrete',
+  tileFloor: 'concrete',
+  roofTile: 'concrete',
+  roofTar: 'concrete',
+  // Openings.
+  glass: 'glass',
+  glassDark: 'glass',
+  glassShop: 'glass',
+  lampGlass: 'glass',
+  signalLens: 'glass',
+  signEmissive: 'glass',
+  signEmissiveWarm: 'glass',
+  windowFrame: 'metal',
+  shutter: 'metal',
+  doorPainted: 'timber',
+  // Metalwork.
+  paintedMetal: 'metal',
+  corrugated: 'metal',
+  metalDark: 'metal',
+  metalLight: 'metal',
+  rust: 'metal',
+  signalHousing: 'metal',
+  // Timber and the one fabric in the library, which behaves like it: no spark,
+  // no ring, a few dull fragments.
+  timber: 'timber',
+  timberDark: 'timber',
+  canvasAwning: 'timber',
+  // Planting.
+  foliage: 'foliage',
+  foliageDark: 'foliage',
+  palmFrond: 'foliage',
+  barkPalm: 'timber',
+  barkTree: 'timber',
+};
+
+/** The impact a collider's declared surface produces, or the old default. */
+export function surfaceImpact(surface: MaterialKey | undefined): ImpactKind {
+  return surface === undefined ? 'world' : SURFACE_IMPACT[surface];
+}
 
 interface Glow {
   alive: boolean;
@@ -145,31 +263,74 @@ interface Mark {
   b: number;
 }
 
-const SPARK_COLOUR: Readonly<Record<ImpactKind, readonly [number, number, number]>> = {
-  // Struck stone throws pale dust; struck steel throws hot orange; a body
-  // throws a dull dark red, kept deliberately muted; glazing throws pale
-  // near-white chips that catch the light rather than glowing.
-  world: [0.72, 0.68, 0.6],
-  metal: [1, 0.62, 0.22],
-  body: [0.34, 0.07, 0.07],
-  glass: [0.78, 0.86, 0.9],
-};
+/**
+ * Everything one material does when a round arrives on it.
+ *
+ * One table rather than three parallel ones, because the interesting part is
+ * the CONTRAST between materials and that is only readable when a material's
+ * numbers sit on one line. Struck steel throws few, fast, hot sparks that fall;
+ * struck concrete throws a lot of slow grey grit; glazing throws pale chips
+ * that catch the light; a leaf canopy throws slow green fragments that barely
+ * fall at all.
+ *
+ * `debris` is the ember count, `speed` its launch speed in m/s, `size` its half
+ * extent in metres, `gravity` its fall in m/s² (an ember falls, a dust cloud
+ * hangs), `drag` its per-second velocity decay, and `mark` the scorch left
+ * behind. Nothing here adds a pool, a mesh or a capacity: every one of these is
+ * the same instanced quad the muzzle flash already uses.
+ */
+interface ImpactStyle {
+  readonly spark: readonly [number, number, number];
+  readonly mark: readonly [number, number, number];
+  readonly debris: number;
+  readonly speed: number;
+  readonly size: number;
+  readonly gravity: number;
+  readonly drag: number;
+  readonly markSize: number;
+}
 
-const MARK_COLOUR: Readonly<Record<ImpactKind, readonly [number, number, number]>> = {
-  world: [0.06, 0.06, 0.065],
-  metal: [0.05, 0.05, 0.055],
-  body: [0.09, 0.02, 0.02],
-  glass: [0.07, 0.08, 0.085],
-};
-
-/** How many embers each kind of impact throws. */
-const SPARK_COUNT: Readonly<Record<ImpactKind, number>> = {
-  world: 4,
-  metal: 5,
+const IMPACT_STYLE: Readonly<Record<ImpactKind, ImpactStyle>> = {
+  // The unknown bucket, and the numbers every surface used to get.
+  world: {
+    spark: [0.72, 0.68, 0.6], mark: [0.06, 0.06, 0.065],
+    debris: 4, speed: 1.8, size: 0.045, gravity: SPARK_GRAVITY, drag: 0, markSize: 0.12,
+  },
+  // Paving and ashlar: a hard crack and a puff of pale dust that hangs.
+  stone: {
+    spark: [0.78, 0.74, 0.66], mark: [0.075, 0.073, 0.07],
+    debris: 6, speed: 1.5, size: 0.06, gravity: -6, drag: 3.2, markSize: 0.14,
+  },
+  // Render, brick and cast concrete: greyer, more of it, and slower still.
+  concrete: {
+    spark: [0.66, 0.64, 0.6], mark: [0.055, 0.055, 0.058],
+    debris: 7, speed: 1.3, size: 0.07, gravity: -5, drag: 3.6, markSize: 0.16,
+  },
+  metal: {
+    spark: [1, 0.62, 0.22], mark: [0.05, 0.05, 0.055],
+    debris: 5, speed: 2.6, size: 0.04, gravity: SPARK_GRAVITY, drag: 0, markSize: 0.11,
+  },
+  glass: {
+    spark: [0.78, 0.86, 0.9], mark: [0.07, 0.08, 0.085],
+    debris: 8, speed: 2.4, size: 0.035, gravity: SPARK_GRAVITY, drag: 0.4, markSize: 0.1,
+  },
+  // Splinters: light, thrown well, and stopped quickly by the air.
+  timber: {
+    spark: [0.46, 0.33, 0.19], mark: [0.05, 0.035, 0.022],
+    debris: 5, speed: 2, size: 0.05, gravity: -10, drag: 2.2, markSize: 0.12,
+  },
+  // Torn leaves. Almost no fall, a lot of drag, and no scorch worth the name -
+  // a round through a canopy leaves the canopy looking the same.
+  foliage: {
+    spark: [0.3, 0.44, 0.18], mark: [0.05, 0.07, 0.03],
+    debris: 7, speed: 1.6, size: 0.055, gravity: -3, drag: 3.4, markSize: 0.07,
+  },
   // A hit on a person is the one the player is looking straight at when it
   // happens, and four dull specks did not read as a hit at all.
-  body: 9,
-  glass: 8,
+  body: {
+    spark: [0.34, 0.07, 0.07], mark: [0.09, 0.02, 0.02],
+    debris: 9, speed: 1.8, size: 0.045, gravity: SPARK_GRAVITY, drag: 0, markSize: 0.18,
+  },
 };
 
 /** Seconds a blood pool stays on the ground. Far longer than a bullet scuff. */
@@ -321,7 +482,12 @@ export class CombatFx {
    * Sparks and a scorch mark where a shot landed.
    *
    * `n*` is the surface normal; a body hit passes the shot direction reversed,
-   * which is close enough for four sparks that live a third of a second.
+   * which is close enough for debris that lives a third of a second.
+   *
+   * `groundY` is the height of the floor UNDER the impact and only matters for
+   * a body hit. It defaults to the old guess of 0.9 m below the wound; the
+   * caller knows the victim's foot height exactly and should pass it, because
+   * the guess put a head shot's blood pool in mid air.
    */
   impact(
     x: number,
@@ -332,9 +498,11 @@ export class CombatFx {
     nz: number,
     kind: ImpactKind,
     rand: () => number,
+    groundY = y - 0.9,
   ): void {
-    const spark = SPARK_COLOUR[kind];
-    for (let i = 0; i < SPARK_COUNT[kind]; i += 1) {
+    const style = IMPACT_STYLE[kind];
+    const spark = style.spark;
+    for (let i = 0; i < style.debris; i += 1) {
       const glow = this.takeGlow();
       glow.alive = true;
       glow.life = 0;
@@ -343,20 +511,22 @@ export class CombatFx {
       glow.y = y + ny * 0.02;
       glow.z = z + nz * 0.02;
       // Scatter around the normal: mostly back the way the shot came from.
-      const speed = 1.8 + rand() * 3.4;
+      const speed = style.speed + rand() * style.speed * 1.9;
       glow.vx = (nx + (rand() - 0.5) * 1.4) * speed;
       glow.vy = (ny + (rand() - 0.5) * 1.4) * speed + 1.2;
       glow.vz = (nz + (rand() - 0.5) * 1.4) * speed;
-      glow.width = 0.045;
-      glow.height = 0.045;
+      glow.width = style.size;
+      glow.height = style.size;
       glow.aimed = false;
+      glow.gravity = style.gravity;
+      glow.drag = style.drag;
       glow.r = spark[0];
       glow.g = spark[1];
       glow.b = spark[2];
     }
 
     const mark = this.takeMark();
-    const tint = MARK_COLOUR[kind];
+    const tint = style.mark;
     mark.alive = true;
     mark.life = 0;
     if (kind === 'body') {
@@ -366,12 +536,14 @@ export class CombatFx {
       // still be there when they walk back past it.
       mark.maxLife = BLOOD_LIFE;
       mark.x = x + (rand() - 0.5) * 0.4;
-      mark.y = y - 0.9 - rand() * 0.6;
+      // A millimetre proud of the floor, not a guessed drop below the wound: a
+      // head shot is 1.7 m up a body and the guess left the pool floating.
+      mark.y = groundY + 0.01;
       mark.z = z + (rand() - 0.5) * 0.4;
       mark.nx = 0;
       mark.ny = 1;
       mark.nz = 0;
-      mark.size = 0.18 + rand() * 0.12;
+      mark.size = style.markSize + rand() * 0.12;
     } else {
       mark.x = x + nx * 0.012;
       mark.y = y + ny * 0.012;
@@ -379,7 +551,7 @@ export class CombatFx {
       mark.nx = nx;
       mark.ny = ny;
       mark.nz = nz;
-      mark.size = 0.12 + rand() * 0.07;
+      mark.size = style.markSize + rand() * 0.07;
     }
     mark.r = tint[0];
     mark.g = tint[1];

@@ -19,10 +19,21 @@
  *   engine.scene.add(combat.group);
  *
  *   // ONCE PER FRAME, AFTER the controller and the driving layer have moved
- *   // the camera - the recoil kick is applied on top of the pose they set.
+ *   // the camera - see RECOIL below.
  *   combat.update(dt, { driving, playerX, playerY, playerZ, playerSpeed });
  *
  *   combat.dispose();
+ *
+ * RECOIL BELONGS TO WHOEVER OWNS THE AIM. Pass `recoil: controller` and the
+ * kick goes into `FirstPersonController`'s own look angles, where it is part of
+ * where the player is pointing: it climbs through a burst, has to be pulled
+ * back down, and is in the pose every shot is cast from because it is in the
+ * pose the controller writes. WITHOUT that option this system rotates the
+ * camera itself, at the TOP of `update` so the shot still leaves from the pose
+ * the player is looking at - but then `update` must run after something that
+ * writes the camera pose absolutely each frame, or the rotation accumulates.
+ * The controller and the driving layer both do; nothing else in the game poses
+ * that camera.
  *
  * ON FOOT ONLY. Firing is refused while the player is driving. The driving
  * camera is a chase boom sitting six metres behind the car, so a shot from the
@@ -44,7 +55,15 @@ import { Vector3 } from 'three';
 
 import { clamp, damp } from '../core/mathx';
 import { createRng, type Rng } from '../core/rng';
-import { ALL_WEAPONS, HEAT, WEAPONS, type PlayerState, type WeaponId } from '../player/PlayerState';
+import type { RecoilSink } from '../player/FirstPersonController';
+import {
+  ALL_WEAPONS,
+  HEAT,
+  WEAPONS,
+  type PlayerState,
+  type WeaponId,
+  type WeaponSpec,
+} from '../player/PlayerState';
 import type { ColliderBox } from '../world/build/types';
 import {
   Armoury,
@@ -55,10 +74,23 @@ import {
   zoneMultiplier,
   type Direction,
 } from './ballistics';
-import { CombatFx, type ImpactKind } from './CombatFx';
+import { CombatFx, impactSound, surfaceImpact, type ImpactKind, type ImpactSound } from './CombatFx';
 import { Projectiles, type RocketHandle } from './Projectiles';
-import { rayCylinder, rayGround, rayOrientedBox, WorldRayIndex } from './rays';
-import { EMPTY_ACTORS, type ActorSource, type ActorTarget, type LawTargets } from './targets';
+import {
+  nearestPointOnOrientedBox,
+  rayCylinder,
+  rayGround,
+  rayOrientedBox,
+  WorldRayIndex,
+  type BoxPoint,
+} from './rays';
+import {
+  EMPTY_ACTORS,
+  type ActorSource,
+  type ActorTarget,
+  type Blow,
+  type LawTargets,
+} from './targets';
 import { WeaponViewmodel, type ViewmodelSet } from './WeaponViewmodel';
 
 /** How close somebody has to be to notice a gunshot. */
@@ -86,6 +118,62 @@ const DRY_CLICK_INTERVAL = 0.34;
  * the two do not sound or look remotely alike.
  */
 const GLAZING_FROM = 0.34;
+
+/**
+ * How far a vehicle's own body reaches past the point the broad phase matches.
+ *
+ * `TrafficSystem.forEachNear` matches vehicle CENTRES, and the biggest thing in
+ * the fleet is the 6.70 x 2.14 x 2.92 m box truck, whose half diagonal is 3.81
+ * m. Asking for a radius of exactly the shot's length therefore missed every
+ * car whose nose was inside the shot and whose centre was not - which for a
+ * 4.88 m saloon is the first 2.44 m of it, and for a rocket stepping 0.77 m per
+ * frame at 46 m/s was EVERY car it ever flew at. Four metres covers the whole
+ * catalogue with room for one more shape.
+ */
+const VEHICLE_REACH = 4;
+
+/**
+ * The same correction for people, whose broad phase also matches centres.
+ *
+ * A shoulder is about 0.4 m from the spine and nobody in the city is wider, so
+ * a metre is generous; a person is a much smaller error than a box truck, but
+ * it is the same error.
+ */
+const ACTOR_REACH = 1;
+
+/**
+ * Newton-seconds a point-blank warhead delivers to a vehicle.
+ *
+ * A saloon in this game masses 1 780 kg, so this is about 3.9 m/s of shove at
+ * the seat of the blast, falling off with the same curve the damage does. Fast
+ * enough that a rocket visibly throws a parked car; slow enough that it does
+ * not launch one over a building.
+ */
+const BLAST_IMPULSE = 7000;
+
+/**
+ * Metres per second a body is thrown at by the thing that killed it.
+ *
+ * A bullet does not move a person; it drops them where they stood. A shockwave
+ * does. The receiving end caps and scales these - see `PoliceSystem.knockDown`
+ * and the crowd's own - so what matters here is only the ratio between them.
+ */
+const BULLET_THROW = 3;
+const BLAST_THROW = 12;
+
+/**
+ * Ceilings and recovery for the fallback recoil path only.
+ *
+ * `FirstPersonController` enforces its own, identical, ceiling when it is the
+ * one holding the offset; these apply when nothing was wired and this system
+ * is rotating the camera itself.
+ */
+const RECOIL_PITCH_MAX = 0.2;
+const RECOIL_YAW_MAX = 0.06;
+const RECOIL_RECOVERY = 9;
+
+/** World up, for a yaw that must not introduce roll. Never mutated. */
+const WORLD_UP = new Vector3(0, 1, 0);
 
 /**
  * Blast damage as a fraction of the peak, against distance from the seat of
@@ -124,8 +212,49 @@ export interface CombatVehicleView {
   readonly halfHeight: number;
 }
 
+/**
+ * Something arriving on a vehicle hard enough for the vehicle to notice.
+ *
+ * Structural, and structurally identical to `TrafficSystem`'s own declaration,
+ * so the traffic layer satisfies `VehicleQuery` without either module importing
+ * the other. `damage` is on the same scale the pursuit uses for its cars, where
+ * 260 is a write-off.
+ */
+export interface VehicleImpact {
+  /** World contact point - the nearest point of the box, not its centre. */
+  readonly x: number;
+  readonly y: number;
+  readonly z: number;
+  /** Unit push direction in the horizontal plane. */
+  readonly dirX: number;
+  readonly dirZ: number;
+  /** Newton-seconds. */
+  readonly impulse: number;
+  readonly damage: number;
+}
+
 export interface VehicleQuery {
   forEachNear(x: number, z: number, radius: number, visit: (view: CombatVehicleView) => void): void;
+  /**
+   * Damages and SHOVES one vehicle. Returns whether the id was recognised.
+   *
+   * For a blast, and only for a blast. The traffic layer rate limits this at
+   * one impulse per vehicle per 0.22 s, because a contact between two cars
+   * lasts many frames and re-integrating it would launch a hatchback over a
+   * building - which is right, and which is exactly why a carbine emptying a
+   * magazine at 9 rounds a second must not come through here. See
+   * `applyDamage`.
+   */
+  applyImpact?(vehicleId: number, hit: VehicleImpact): boolean;
+  /**
+   * Damage with no impulse behind it: gunfire. Not rate limited.
+   *
+   * BOTH ARE OPTIONAL, so every existing test double - and any fleet that only
+   * wants to be shot AT rather than damaged - keeps working. Without them a
+   * round still registers as a hit and still draws its impact; the car simply
+   * does not care, which is what the whole fleet did before.
+   */
+  applyDamage?(vehicleId: number, amount: number): boolean;
 }
 
 /** What the crowd adapter adds on top of a plain `ActorSource`. */
@@ -158,9 +287,24 @@ export interface CombatSystemOptions {
   readonly seed?: string | undefined;
   /** Fires for every shot that leaves the barrel, so audio can play something. */
   readonly onShot?: ((weapon: WeaponId) => void) | undefined;
-  /** Fires for every projectile that arrives somewhere. */
+  /**
+   * Where the weapon's kick goes. `FirstPersonController` is one.
+   *
+   * WIRE THIS. Without it the kick is applied to the camera here instead, which
+   * is correct - the shot is still cast from the pose the player is looking at,
+   * see `update` - but it cannot survive the controller's next absolute write,
+   * so the aim itself never climbs and a burst has nothing to control.
+   */
+  readonly recoil?: RecoilSink | undefined;
+  /**
+   * Fires for every projectile that arrives somewhere.
+   *
+   * Reports the recorded sound the impact wants rather than the visual
+   * material, because the two vocabularies are not the same size: see
+   * `impactSound`.
+   */
   readonly onImpact?:
-    | ((kind: ImpactKind, x: number, y: number, z: number) => void)
+    | ((kind: ImpactSound, x: number, y: number, z: number) => void)
     | undefined;
   /** Handling the weapon rather than firing it: drawing, stowing, an empty gun. */
   readonly onHandling?: ((kind: 'draw' | 'holster' | 'dry' | 'reload') => void) | undefined;
@@ -237,6 +381,44 @@ interface Candidate {
   police: boolean;
 }
 
+/**
+ * Everything one cast needs to borrow, owned rather than shared.
+ *
+ * There are two casts in this system and they are NOT nested in a predictable
+ * order for ever: the hitscan path runs from `pullTrigger`, and the rocket
+ * probe runs from inside `projectiles.update`. Both used to write the same
+ * `aim`, the same `direction`, the same `hit` and the same candidate arrays,
+ * and the only thing that made that safe was that `projectiles.update` happens
+ * to be called before the trigger is polled. Two of these, one per caller, so
+ * the ordering stops being load bearing.
+ */
+interface CastScratch {
+  aimX: number;
+  aimY: number;
+  aimZ: number;
+  readonly direction: Direction;
+  readonly hit: Hit;
+  readonly candidates: Candidate[];
+  candidateCount: number;
+  readonly vehicles: CombatVehicleView[];
+}
+
+function createScratch(): CastScratch {
+  return {
+    aimX: 0,
+    aimY: 0,
+    aimZ: -1,
+    direction: { x: 0, y: 0, z: 0 },
+    hit: {
+      t: 0, kind: 'none', actor: -1, vehicleId: -1, footY: 0, height: 0,
+      vehicleY: 0, vehicleHalf: 0, nx: 0, ny: 1, nz: 0, box: null,
+    },
+    candidates: [],
+    candidateCount: 0,
+    vehicles: [],
+  };
+}
+
 export interface CombatStats {
   readonly shotsFired: number;
   readonly pelletsFired: number;
@@ -275,6 +457,11 @@ export class CombatSystem {
    * Nothing fires while this is true.
    */
   private stowed = false;
+  /**
+   * The kick, when there is nowhere better to put it.
+   *
+   * Used ONLY when no `recoil` sink was supplied. See `applyOwnRecoil`.
+   */
   private recoilPitch = 0;
   private recoilYaw = 0;
   private dryClick = 0;
@@ -292,22 +479,29 @@ export class CombatSystem {
   private paused = false;
   private disposed = false;
 
-  private readonly direction: Direction = { x: 0, y: 0, z: 0 };
-  private readonly hit: Hit = {
-    t: 0, kind: 'none', actor: -1, vehicleId: -1, footY: 0, height: 0,
-    vehicleY: 0, vehicleHalf: 0, nx: 0, ny: 1, nz: 0, box: null,
-  };
-  private readonly candidates: Candidate[] = [];
-  private candidateCount = 0;
-  private readonly vehicleCandidates: CombatVehicleView[] = [];
+  /** The hitscan path's scratch, and the rocket probe's. Never shared. */
+  private readonly shotCast = createScratch();
+  private readonly probeCast = createScratch();
   private readonly hurtCivilians: number[] = [];
   private readonly hurtOfficers: number[] = [];
 
   private readonly eye = new Vector3();
   private readonly aim = new Vector3();
+  /** The viewmodel clearance probe's own direction; it runs every frame. */
+  private readonly clearAim = new Vector3();
   private readonly muzzle = new Vector3();
   private readonly right = new Vector3();
   private readonly up = new Vector3();
+  /** Reused so a burst, or a blast in a car park, allocates nothing. */
+  private readonly blow: { dirX: number; dirZ: number; speed: number } = {
+    dirX: 0, dirZ: 0, speed: 0,
+  };
+  private readonly contact: BoxPoint = { x: 0, y: 0, z: 0, distance: 0 };
+  private readonly vehicleHit: {
+    x: number; y: number; z: number;
+    dirX: number; dirZ: number;
+    impulse: number; damage: number;
+  } = { x: 0, y: 0, z: 0, dirX: 0, dirZ: 0, impulse: 0, damage: 0 };
 
   private counters = {
     shotsFired: 0,
@@ -520,8 +714,9 @@ export class CombatSystem {
   }
 
   /**
-   * One frame. Must run AFTER the controller and the driving layer, because
-   * the recoil kick is applied on top of the camera pose they wrote.
+   * One frame. Must run AFTER the controller and the driving layer: without a
+   * `recoil` sink the kick is applied on top of the camera pose they wrote,
+   * and it is their absolute write that keeps it from accumulating.
    */
   update(dt: number, ctx: CombatContext): void {
     if (this.disposed) return;
@@ -532,6 +727,13 @@ export class CombatSystem {
     this.witnesses?.refresh(dt);
     this.armoury.update(dt);
     if (this.dryClick > 0) this.dryClick = Math.max(0, this.dryClick - dt);
+    // BEFORE the trigger is polled. When the kick lives here rather than in the
+    // controller it is a rotation applied on top of the controller's absolute
+    // write, and the whole point is that the shot leaves from the pose the
+    // player is looking at - so the pose has to exist before anything is cast
+    // from it. Doing this afterwards, which is what shipped, rotated the frame
+    // the player saw relative to the bullet that left in it.
+    this.applyOwnRecoil(dt, ctx.driving);
     this.projectiles.update(dt);
 
     if (!this.paused && this.trigger && !ctx.driving) {
@@ -548,13 +750,6 @@ export class CombatSystem {
     // a partly used magazine up before trouble starts.
     const equipped = this.options.player.equipped;
     if (equipped && !ctx.driving) this.armoury.autoReload(equipped);
-
-    this.recoilPitch = damp(this.recoilPitch, 0, 9, dt);
-    this.recoilYaw = damp(this.recoilYaw, 0, 9, dt);
-    if (!ctx.driving && (this.recoilPitch !== 0 || this.recoilYaw !== 0)) {
-      this.options.camera.rotateX(this.recoilPitch);
-      this.options.camera.rotateY(this.recoilYaw);
-    }
 
     const camera = this.options.camera;
     // Guarded rather than optional-chained: `clearanceAhead` casts a ray, and a
@@ -584,6 +779,10 @@ export class CombatSystem {
     this.viewmodel?.dispose();
     this.projectiles.dispose();
     this.fx.dispose();
+    // The group outlives this object - the caller added it to a scene and may
+    // not remove it - and holding `this` on its userData kept the whole combat
+    // layer, its effect pools and its options object reachable for ever.
+    delete this.group.userData.combat;
   }
 
   // -- firing ---------------------------------------------------------------
@@ -611,6 +810,14 @@ export class CombatSystem {
     const spec = WEAPONS[id];
     const camera = this.options.camera;
     camera.updateMatrixWorld();
+    // FROM THE CAMERA, sway and all, and deliberately not from an un-swayed
+    // "true eye". The crosshair is the camera's own centre ray, so a round cast
+    // from the camera's position along the camera's direction lands exactly
+    // where the crosshair is - by construction, at every range. Subtracting the
+    // walk sway from the origin while the RENDERED camera still carries it
+    // would introduce the parallax it looks like it removes. Measured, the sway
+    // is at most 0.012 m: `amplitude` peaks at 0.035 and the lateral term is
+    // 0.35 of it (`FirstPersonController.applyCamera`).
     this.eye.setFromMatrixPosition(camera.matrixWorld);
     camera.getWorldDirection(this.aim);
     this.right.set(1, 0, 0).applyQuaternion(camera.quaternion);
@@ -635,19 +842,22 @@ export class CombatSystem {
     // heat - is the hitscan path and does not apply to it: a rocket's
     // consequences happen wherever and whenever it lands, which is `detonate`.
     if (spec.muzzleSpeed !== undefined) {
-      this.fireProjectile(spec.muzzleSpeed, mx, my, mz);
+      this.fireProjectile(spec, mx, my, mz);
       this.counters.shotsFired += 1;
       if (this.witnessed()) player.addHeat(HEAT.gunshot);
       this.fx.muzzle(mx, my, mz, 1.9);
-      const blastKick = recoilKick(spec);
-      this.recoilPitch = clamp(this.recoilPitch + blastKick, 0, 0.2);
+      this.kick(recoilKick(spec), 0);
       this.viewmodel?.punch(2.4);
       this.options.onShot?.(id);
       return true;
     }
 
     const maxT = spec.rangeM * FALLOFF_END;
-    this.gatherCandidates(this.eye.x, this.eye.y, this.eye.z, spec.rangeM * FALLOFF_END, spec.spreadRad);
+    const cast = this.shotCast;
+    cast.aimX = this.aim.x;
+    cast.aimY = this.aim.y;
+    cast.aimZ = this.aim.z;
+    this.gatherCandidates(cast, this.eye.x, this.eye.y, this.eye.z, maxT, spec.spreadRad);
 
     // Asked BEFORE the shot is resolved. Whether the street saw a gun go off
     // cannot depend on who is still standing a millisecond later, or shooting
@@ -661,27 +871,34 @@ export class CombatSystem {
     let hitPolice = false;
     let hitPoliceVehicle = false;
 
+    const direction = cast.direction;
     for (let pellet = 0; pellet < outcome.pellets; pellet += 1) {
-      spreadDirection(this.aim.x, this.aim.y, this.aim.z, spec.spreadRad, this.rng, this.direction);
-      const hit = this.castOne(this.eye.x, this.eye.y, this.eye.z, this.direction, maxT);
+      spreadDirection(this.aim.x, this.aim.y, this.aim.z, spec.spreadRad, this.rng, direction);
+      const hit = this.castOne(cast, this.eye.x, this.eye.y, this.eye.z, maxT);
       this.counters.pelletsFired += 1;
 
-      const endX = this.eye.x + this.direction.x * hit.t;
-      const endY = this.eye.y + this.direction.y * hit.t;
-      const endZ = this.eye.z + this.direction.z * hit.t;
+      const endX = this.eye.x + direction.x * hit.t;
+      const endY = this.eye.y + direction.y * hit.t;
+      const endZ = this.eye.z + direction.z * hit.t;
       this.fx.tracer(mx, my, mz, endX, endY, endZ);
 
       if (hit.kind === 'none') continue;
       this.counters.hits += 1;
 
       let impact: ImpactKind = 'world';
+      // Where the blood pool goes. For anything that is not a person this is
+      // unused; for a person it is their own feet, which is exact.
+      let floorY = endY;
       const base = damageAtRange(spec, hit.t);
 
       if (hit.kind === 'civilian' || hit.kind === 'police') {
         impact = 'body';
+        floorY = hit.footY;
         const damage = base * zoneMultiplier(endY, hit.footY, hit.height);
         const source = hit.kind === 'civilian' ? this.civilians : (this.options.law ?? EMPTY_ACTORS);
-        const result = source.damage(hit.actor, damage);
+        // A shot person falls the way the round was travelling, which is the
+        // only thing here that knows which way that was.
+        const result = source.damage(hit.actor, damage, this.aimBlow(direction, BULLET_THROW));
         // A victim wounded by one pellet and killed by the next is ONE offence,
         // the worse of the two, so the wounding is withdrawn when the killing
         // lands. Without this a shotgun charged both for the same person.
@@ -695,12 +912,31 @@ export class CombatSystem {
           list.push(hit.actor);
         }
         if (hit.kind === 'police') hitPolice = true;
-      } else if (hit.kind === 'policeVehicle') {
+      } else if (hit.kind === 'policeVehicle' || hit.kind === 'vehicle') {
         impact = this.vehicleSurface(hit, endY);
-        hitPoliceVehicle = true;
-        this.options.law?.damageVehicle(hit.vehicleId, base);
-      } else if (hit.kind === 'vehicle') {
-        impact = this.vehicleSurface(hit, endY);
+        // The sheet metal takes the round whoever is driving. `damageVehicle`
+        // is the PURSUIT's own integrity - whether that unit is still in the
+        // chase - and is a different quantity from the state of the bodywork,
+        // so a patrol car pays both and an ordinary car pays the one that
+        // exists for it. No impulse: a bullet dents a car, it does not move
+        // one, and the impulse path is rate limited against exactly this.
+        this.options.vehicles?.applyDamage?.(hit.vehicleId, base);
+        if (hit.kind === 'policeVehicle') {
+          hitPoliceVehicle = true;
+          this.options.law?.damageVehicle(hit.vehicleId, base);
+        }
+      } else if (hit.kind === 'world' && hit.box) {
+        // The one line that made every building, kerb, lamp post and shopfront
+        // in the city throw identical pale stone dust.
+        //
+        // NON-SOLID BOXES - steps, low platforms - are not in this index and a
+        // round still passes through them. Including them would be more
+        // truthful for a bullet, and it is NOT done here on purpose: the index
+        // is built once in `main.ts` and shared with `PoliceSystem`'s line of
+        // sight, so adding the walkable boxes would also change who can see the
+        // player from behind a step. That is a decision for the wiring, not for
+        // this system, and it needs its own measurement.
+        impact = surfaceImpact(hit.box.surface);
       }
 
       this.fx.impact(
@@ -712,8 +948,9 @@ export class CombatSystem {
         hit.nz,
         impact,
         () => this.rng.next(),
+        floorY,
       );
-      this.options.onImpact?.(impact, endX, endY, endZ);
+      this.options.onImpact?.(impactSound(impact, hit.kind === 'ground'), endX, endY, endZ);
     }
 
     // -- consequences -------------------------------------------------------
@@ -738,8 +975,7 @@ export class CombatSystem {
 
     this.fx.muzzle(mx, my, mz, 0.7 + spec.damage * 0.02);
     const kick = recoilKick(spec);
-    this.recoilPitch = clamp(this.recoilPitch + kick, 0, 0.16);
-    this.recoilYaw = clamp(this.recoilYaw + (this.rng.next() - 0.5) * kick * 0.9, -0.06, 0.06);
+    this.kick(kick, (this.rng.next() - 0.5) * kick * 0.9);
     this.viewmodel?.punch(Math.max(0.5, spec.damage / 26));
     this.options.onShot?.(id);
     return true;
@@ -753,17 +989,18 @@ export class CombatSystem {
    * instead of the whole street eight times.
    */
   private gatherCandidates(
+    cast: CastScratch,
     ox: number,
     oy: number,
     oz: number,
     maxT: number,
     spreadRad: number,
   ): void {
-    this.candidateCount = 0;
-    this.vehicleCandidates.length = 0;
-    const ax = this.aim.x;
-    const ay = this.aim.y;
-    const az = this.aim.z;
+    cast.candidateCount = 0;
+    cast.vehicles.length = 0;
+    const ax = cast.aimX;
+    const ay = cast.aimY;
+    const az = cast.aimZ;
     // Half-width of the corridor the pattern can reach at its far end, plus a
     // body radius and a little slack.
     const corridor = Math.tan(spreadRad) * maxT + 1.2;
@@ -787,7 +1024,7 @@ export class CombatSystem {
       const pz = dz - az * along;
       const perpendicular = Math.hypot(px, py, pz);
       if (perpendicular > corridor + radius + height * 0.5) return;
-      const slot = this.candidates[this.candidateCount] ?? {
+      const slot = cast.candidates[cast.candidateCount] ?? {
         id: 0, x: 0, y: 0, z: 0, radius: 0, height: 0, police: false,
       };
       slot.id = id;
@@ -797,17 +1034,20 @@ export class CombatSystem {
       slot.radius = radius;
       slot.height = height;
       slot.police = police;
-      this.candidates[this.candidateCount] = slot;
-      this.candidateCount += 1;
+      cast.candidates[cast.candidateCount] = slot;
+      cast.candidateCount += 1;
     };
 
     const visitActor = (police: boolean) => (target: ActorTarget): void => {
       consider(target.id, target.x, target.y, target.z, target.radius, target.height, police);
     };
-    this.civilians.forEachActor(ox, oz, maxT, visitActor(false));
-    this.options.law?.forEachActor(ox, oz, maxT, visitActor(true));
+    // BOTH broad phases are asked for the shot's length PLUS the body's own
+    // reach, because both match centres. The narrow phase below is exact and
+    // is not touched: this only decides who gets to be tested at all.
+    this.civilians.forEachActor(ox, oz, maxT + ACTOR_REACH, visitActor(false));
+    this.options.law?.forEachActor(ox, oz, maxT + ACTOR_REACH, visitActor(true));
 
-    this.options.vehicles?.forEachNear(ox, oz, maxT, (view) => {
+    this.options.vehicles?.forEachNear(ox, oz, maxT + VEHICLE_REACH, (view) => {
       const dx = view.x - ox;
       const dy = view.y - oy;
       const dz = view.z - oz;
@@ -818,13 +1058,14 @@ export class CombatSystem {
       const pz = dz - az * along;
       const reach = Math.hypot(view.halfLength, view.halfWidth, view.halfHeight);
       if (Math.hypot(px, py, pz) > corridor + reach) return;
-      this.vehicleCandidates.push(view);
+      cast.vehicles.push(view);
     });
   }
 
-  /** Nearest thing along one pellet's path. Writes and returns `this.hit`. */
-  private castOne(ox: number, oy: number, oz: number, dir: Direction, maxT: number): Hit {
-    const hit = this.hit;
+  /** Nearest thing along one pellet's path. Writes and returns `cast.hit`. */
+  private castOne(cast: CastScratch, ox: number, oy: number, oz: number, maxT: number): Hit {
+    const hit = cast.hit;
+    const dir = cast.direction;
     hit.t = maxT;
     hit.kind = 'none';
     hit.actor = -1;
@@ -834,8 +1075,8 @@ export class CombatSystem {
     hit.ny = -dir.y;
     hit.nz = -dir.z;
 
-    for (let i = 0; i < this.candidateCount; i += 1) {
-      const c = this.candidates[i];
+    for (let i = 0; i < cast.candidateCount; i += 1) {
+      const c = cast.candidates[i];
       if (!c) continue;
       const t = rayCylinder(ox, oy, oz, dir.x, dir.y, dir.z, c.x, c.y, c.z, c.radius, c.height, hit.t);
       if (t < 0 || t >= hit.t) continue;
@@ -850,7 +1091,7 @@ export class CombatSystem {
       hit.box = null;
     }
 
-    for (const view of this.vehicleCandidates) {
+    for (const view of cast.vehicles) {
       const t = rayOrientedBox(
         ox, oy, oz, dir.x, dir.y, dir.z,
         view.x, view.y, view.z, view.yaw,
@@ -898,6 +1139,84 @@ export class CombatSystem {
   }
 
   /**
+   * The weapon's kick, wherever it belongs.
+   *
+   * `pitch` is positive upward. The controller is the right owner - a kick it
+   * holds is part of the aim, climbs through a burst and has to be pulled back
+   * down - and the local fallback keeps the ray and the rendered pose in
+   * agreement when nothing was wired.
+   */
+  private kick(pitch: number, yaw: number): void {
+    const sink = this.options.recoil;
+    if (sink) {
+      sink.addRecoil(pitch, yaw);
+      return;
+    }
+    this.recoilPitch = clamp(this.recoilPitch + pitch, -RECOIL_PITCH_MAX, RECOIL_PITCH_MAX);
+    this.recoilYaw = clamp(this.recoilYaw + yaw, -RECOIL_YAW_MAX, RECOIL_YAW_MAX);
+  }
+
+  /**
+   * Rotates the camera by the accumulated kick, when nobody else will.
+   *
+   * Silent when a `recoil` sink exists, because the controller has already
+   * composed the offset into the pose it wrote and doing it twice would double
+   * the climb.
+   */
+  private applyOwnRecoil(dt: number, driving: boolean): void {
+    if (this.options.recoil) return;
+    this.recoilPitch = damp(this.recoilPitch, 0, RECOIL_RECOVERY, dt);
+    this.recoilYaw = damp(this.recoilYaw, 0, RECOIL_RECOVERY, dt);
+    if (driving || (this.recoilPitch === 0 && this.recoilYaw === 0)) return;
+    const camera = this.options.camera;
+    camera.rotateX(this.recoilPitch);
+    // About WORLD up rather than the camera's own. The controller's pose is
+    // Ry(yaw)*Rx(pitch); Ry_world(dy) * pose * Rx_local(dp) is exactly
+    // Ry(yaw + dy)*Rx(pitch + dp), whereas a local yaw on a pitched camera
+    // introduces roll.
+    if (this.recoilYaw !== 0) camera.rotateOnWorldAxis(WORLD_UP, this.recoilYaw);
+    camera.updateMatrixWorld();
+  }
+
+  /** The shot direction as a blow, flattened and normalised. Reused. */
+  private aimBlow(direction: Direction, speed: number): Blow {
+    const flat = Math.hypot(direction.x, direction.z);
+    this.blow.dirX = flat > 1e-4 ? direction.x / flat : 0;
+    this.blow.dirZ = flat > 1e-4 ? direction.z / flat : 0;
+    this.blow.speed = speed;
+    return this.blow;
+  }
+
+  /**
+   * Hands one vehicle a blast's damage and its shove.
+   *
+   * A no-op against a fleet with no `applyImpact`, which is every test double
+   * and was every fleet until the traffic layer grew one.
+   */
+  private blastVehicle(
+    id: number,
+    x: number,
+    y: number,
+    z: number,
+    dirX: number,
+    dirZ: number,
+    damage: number,
+    impulse: number,
+  ): void {
+    const fleet = this.options.vehicles;
+    if (!fleet?.applyImpact || id < 0 || damage <= 0) return;
+    const hit = this.vehicleHit;
+    hit.x = x;
+    hit.y = y;
+    hit.z = z;
+    hit.dirX = dirX;
+    hit.dirZ = dirZ;
+    hit.impulse = impulse;
+    hit.damage = damage;
+    fleet.applyImpact(id, hit);
+  }
+
+  /**
    * Glazing or bodywork.
    *
    * A vehicle is one oriented box to the ray test, so the only thing that can
@@ -911,19 +1230,44 @@ export class CombatSystem {
   }
 
   /**
-   * Sends a rocket downrange.
+   * Sends a rocket downrange, at whatever the crosshair is on.
    *
-   * The aim is taken from the camera rather than from the muzzle so the rocket
-   * goes where the crosshair is, not where a barrel held at the shoulder
-   * happens to point - those differ by about two degrees, which is a metre and
-   * a half at thirty metres and reads as the weapon being inaccurate.
+   * A ROCKET LEAVES A TUBE, NOT AN EYE. The launch point is the muzzle, which
+   * is about 0.2 m below and to the right of the camera; firing it along the
+   * CAMERA's direction therefore sent it down a line parallel to the crosshair
+   * ray and 0.2 m off it, at every range, for ever. That is a miss on anything
+   * narrower than a car and it reads as the weapon being broken.
+   *
+   * So the two are converged: one cast finds what the crosshair is actually
+   * pointing at, and the rocket is aimed from the tube AT THAT POINT. Beyond
+   * the last thing in the way it converges at the weapon's own range, which is
+   * far enough that the residual parallax is smaller than the warhead.
+   *
+   * One cast per launch, and the launcher holds one round and reloads for 3.6
+   * seconds, so this is not a per-frame cost by any measure.
    */
-  private fireProjectile(speed: number, mx: number, my: number, mz: number): void {
-    spreadDirection(
-      this.aim.x, this.aim.y, this.aim.z,
-      WEAPONS.launcher.spreadRad, this.rng, this.direction,
+  private fireProjectile(spec: WeaponSpec, mx: number, my: number, mz: number): void {
+    const cast = this.probeCast;
+    const reach = spec.rangeM * FALLOFF_END;
+    cast.aimX = this.aim.x;
+    cast.aimY = this.aim.y;
+    cast.aimZ = this.aim.z;
+    cast.direction.x = this.aim.x;
+    cast.direction.y = this.aim.y;
+    cast.direction.z = this.aim.z;
+    this.gatherCandidates(cast, this.eye.x, this.eye.y, this.eye.z, reach, 0);
+    const crosshair = this.castOne(cast, this.eye.x, this.eye.y, this.eye.z, reach);
+    const range = crosshair.kind === 'none' ? reach : Math.max(1, crosshair.t);
+    const toX = this.eye.x + this.aim.x * range - mx;
+    const toY = this.eye.y + this.aim.y * range - my;
+    const toZ = this.eye.z + this.aim.z * range - mz;
+
+    spreadDirection(toX, toY, toZ, spec.spreadRad, this.rng, cast.direction);
+    this.projectiles.launch(
+      mx, my, mz,
+      cast.direction.x, cast.direction.y, cast.direction.z,
+      spec.muzzleSpeed ?? 46,
     );
-    this.projectiles.launch(mx, my, mz, this.direction.x, this.direction.y, this.direction.z, speed);
   }
 
   /**
@@ -942,12 +1286,15 @@ export class CombatSystem {
     dz: number,
     maxT: number,
   ): number {
-    this.aim.set(dx, dy, dz);
-    this.gatherCandidates(ox, oy, oz, maxT, 0);
-    this.direction.x = dx;
-    this.direction.y = dy;
-    this.direction.z = dz;
-    const hit = this.castOne(ox, oy, oz, this.direction, maxT);
+    const cast = this.probeCast;
+    cast.aimX = dx;
+    cast.aimY = dy;
+    cast.aimZ = dz;
+    cast.direction.x = dx;
+    cast.direction.y = dy;
+    cast.direction.z = dz;
+    this.gatherCandidates(cast, ox, oy, oz, maxT, 0);
+    const hit = this.castOne(cast, ox, oy, oz, maxT);
     return hit.kind === 'none' ? -1 : hit.t;
   }
 
@@ -987,7 +1334,7 @@ export class CombatSystem {
       source: ActorSource,
       police: boolean,
     ): void => {
-      source.forEachActor(x, z, radius, (target) => {
+      source.forEachActor(x, z, radius + ACTOR_REACH, (target) => {
         // Measured to the middle of the body, not to the feet: somebody
         // standing at the lip of the radius is otherwise untouched by a blast
         // that visibly engulfs them.
@@ -996,9 +1343,16 @@ export class CombatSystem {
         const dz = target.z - z;
         const distance = Math.hypot(dx, dy, dz);
         if (distance > radius) return;
-        const damage = peak * blastFalloff(distance / radius);
+        const share = blastFalloff(distance / radius);
+        const damage = peak * share;
         if (damage <= 0) return;
-        const result = source.damage(target.id, damage);
+        // Thrown outward from the seat of the blast. A body at the very centre
+        // has no direction to be thrown in and simply drops.
+        const flat = Math.hypot(dx, dz);
+        this.blow.dirX = flat > 1e-4 ? dx / flat : 0;
+        this.blow.dirZ = flat > 1e-4 ? dz / flat : 0;
+        this.blow.speed = BLAST_THROW * share;
+        const result = source.damage(target.id, damage, this.blow);
         if (result === 'killed') {
           if (police) officersKilled += 1;
           else civiliansKilled += 1;
@@ -1014,12 +1368,37 @@ export class CombatSystem {
     if (this.options.law) strike(this.options.law, true);
 
     let hitPoliceVehicle = false;
-    this.options.vehicles?.forEachNear(x, z, radius, (view) => {
+    // EVERY vehicle, not only the police ones, and measured to the nearest
+    // point of the body rather than to its centre. Both of those were wrong:
+    // a rocket that landed against a van's bumper measured itself ten metres
+    // away from the van, and an ordinary parked car was never asked at all.
+    this.options.vehicles?.forEachNear(x, z, radius + VEHICLE_REACH, (view) => {
+      const contact = nearestPointOnOrientedBox(
+        x, y, z,
+        view.x, view.y, view.z, view.yaw,
+        view.halfLength, view.halfWidth, view.halfHeight,
+        this.contact,
+      );
+      if (contact.distance > radius) return;
+      const share = blastFalloff(contact.distance / radius);
+      if (share <= 0) return;
+      // Pushed along the line from the blast to the vehicle's centre: pushing
+      // from the contact point would send a car struck square on its flank
+      // nowhere at all, because that line is only the thickness of the panel.
+      const dx = view.x - x;
+      const dz = view.z - z;
+      const flat = Math.hypot(dx, dz);
+      this.blastVehicle(
+        view.id,
+        contact.x, contact.y, contact.z,
+        flat > 1e-4 ? dx / flat : 1,
+        flat > 1e-4 ? dz / flat : 0,
+        peak * share,
+        BLAST_IMPULSE * share,
+      );
       if (!view.police) return;
-      const distance = Math.hypot(view.x - x, view.y - y, view.z - z);
-      if (distance > radius) return;
       hitPoliceVehicle = true;
-      this.options.law?.damageVehicle(view.id, peak * blastFalloff(distance / radius));
+      this.options.law?.damageVehicle(view.id, peak * share);
     });
 
     for (let i = 0; i < civiliansHurt; i += 1) player.addHeat(HEAT.civilianHurt);
@@ -1058,14 +1437,17 @@ export class CombatSystem {
    */
   private clearanceAhead(): number {
     const camera = this.options.camera;
-    camera.getWorldDirection(this.aim);
+    // Its OWN vector. This runs every frame, from inside the same `update`
+    // that fires the weapon, and it used to write the aim the shot was cast
+    // from - safe only because it happened to run afterwards.
+    camera.getWorldDirection(this.clearAim);
     const world = this.options.world.cast(
       camera.position.x,
       camera.position.y,
       camera.position.z,
-      this.aim.x,
-      this.aim.y,
-      this.aim.z,
+      this.clearAim.x,
+      this.clearAim.y,
+      this.clearAim.z,
       CLEARANCE_PROBE,
     );
     return world ? world.t : Infinity;

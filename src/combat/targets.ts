@@ -37,6 +37,30 @@ export interface ActorTarget {
 /** What a hit did to whoever took it. */
 export type DamageResult = 'none' | 'hurt' | 'killed';
 
+/**
+ * Which way the blow that landed was travelling, and how hard.
+ *
+ * A body has to fall AWAY from whatever hit it, and a source that owns its own
+ * agents - `PoliceSystem` does; `CrowdTargets` does not - needs the direction
+ * to decide whether they go over backwards or onto their face. `speed` is the
+ * speed of whatever delivered the hit in m/s, not the damage: it is what the
+ * body is thrown at a share of, so a bullet nudges and a shockwave throws.
+ *
+ * Optional on `damage` rather than a second method: every existing caller and
+ * every existing test double keeps compiling, and a source that has nowhere to
+ * put a direction simply ignores it.
+ *
+ * Transient, like `ActorTarget`: the caller reuses one object across a burst
+ * and across every victim of one blast, so read it during the call and do not
+ * retain it.
+ */
+export interface Blow {
+  /** Unit direction of travel in the horizontal plane. */
+  readonly dirX: number;
+  readonly dirZ: number;
+  readonly speed: number;
+}
+
 export interface ActorSource {
   /**
    * Visits every live body whose centre is within `radius` of `(x, z)`.
@@ -44,7 +68,7 @@ export interface ActorSource {
    */
   forEachActor(x: number, z: number, radius: number, visit: (target: ActorTarget) => void): void;
   /** Applies damage to one actor and says what happened. */
-  damage(id: number, amount: number): DamageResult;
+  damage(id: number, amount: number, blow?: Blow): DamageResult;
 }
 
 /** An `ActorSource` with nobody in it. Keeps wiring optional. */

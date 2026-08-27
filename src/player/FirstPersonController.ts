@@ -41,6 +41,17 @@ const SHAKE_DECAY = 0.85;
 const SHAKE_RADIANS = 0.046;
 
 /**
+ * Ceilings on the accumulated recoil offset, radians.
+ *
+ * A held burst adds a kick per round and these are what stop a carbine walking
+ * the crosshair into the sky: about 11 degrees of climb and 3.4 either side.
+ */
+const RECOIL_PITCH_MAX = 0.2;
+const RECOIL_YAW_MAX = 0.06;
+/** How fast the offset returns to zero. Higher settles sooner. */
+const RECOIL_RECOVERY = 9;
+
+/**
  * How far around the player traffic is fetched each frame, in metres.
  *
  * A box truck's half diagonal is about 3.9 m and a running player covers 0.1 m
@@ -131,6 +142,20 @@ export interface ControllerState {
   readonly grounded: boolean;
   readonly surface: SurfaceId;
   readonly indoors: boolean;
+  /** Recoil currently added to the look angles, radians. See `addRecoil`. */
+  readonly recoilPitch: number;
+  readonly recoilYaw: number;
+}
+
+/**
+ * Somewhere a weapon can put its kick.
+ *
+ * Declared here rather than in the combat layer so the controller owns the
+ * shape of its own input, and narrow enough that the combat layer never gets a
+ * handle on the controller itself.
+ */
+export interface RecoilSink {
+  addRecoil(pitch: number, yaw: number): void;
 }
 
 export interface ControllerOptions {
@@ -151,6 +176,21 @@ export class FirstPersonController {
   private readonly velocity = new Vector3();
   private yaw: number;
   private pitch = 0;
+  /**
+   * Recoil, as an offset the absolute camera write composes in.
+   *
+   * IT IS PART OF THE AIM, not a picture of one. The controller writes the
+   * camera quaternion absolutely every frame from `pitch`/`yaw`, so a kick
+   * applied to the camera AFTER that write - which is what the combat layer
+   * used to do - is discarded on the next frame and, worse, is not in the pose
+   * the shot was cast from: the frame the player looked at was rotated
+   * relative to the bullet that left in it. Held here instead, the rendered
+   * pose and the pose anything casts from `camera.matrixWorld` are the same
+   * pose by construction, the kick accumulates through a burst, and it
+   * recovers on its own.
+   */
+  private recoilPitch = 0;
+  private recoilYaw = 0;
   private shakeAmount = 0;
   private shakePhase = 0;
   private verticalVelocity = 0;
@@ -419,6 +459,27 @@ export class FirstPersonController {
     this.shakeAmount = Math.max(this.shakeAmount, clamp(strength, 0, 1));
   }
 
+  /**
+   * Kicks the aim. `pitch` is positive upward, `yaw` positive to the left.
+   *
+   * Unlike `shake`, this DOES move where the player is pointing: it is added
+   * to the look angles the camera and every shot are built from, so a burst
+   * really does climb and really does have to be pulled back down. It is an
+   * offset rather than a change to `pitch`/`yaw` themselves so that it can
+   * recover, which is what makes a controlled burst possible at all.
+   */
+  addRecoil(pitch: number, yaw: number): void {
+    if (!Number.isFinite(pitch) || !Number.isFinite(yaw)) return;
+    this.recoilPitch = clamp(this.recoilPitch + pitch, -RECOIL_PITCH_MAX, RECOIL_PITCH_MAX);
+    this.recoilYaw = clamp(this.recoilYaw + yaw, -RECOIL_YAW_MAX, RECOIL_YAW_MAX);
+  }
+
+  /** Drops the accumulated kick outright. Used on respawn. */
+  clearRecoil(): void {
+    this.recoilPitch = 0;
+    this.recoilYaw = 0;
+  }
+
   private applyCamera(dt: number): void {
     const speed = Math.hypot(this.velocity.x, this.velocity.z);
     // A very small bob: enough to feel like walking, far short of nausea.
@@ -433,6 +494,13 @@ export class FirstPersonController {
       this.position.y + EYE_HEIGHT + this.eyeOffset,
       this.position.z + this.right.z * sway,
     );
+    // Recovery first, so the offset written this frame is the one anything
+    // casting from this camera this frame will see.
+    this.recoilPitch = damp(this.recoilPitch, 0, RECOIL_RECOVERY, dt);
+    this.recoilYaw = damp(this.recoilYaw, 0, RECOIL_RECOVERY, dt);
+    const aimPitch = clamp(this.pitch + this.recoilPitch, -PITCH_LIMIT, PITCH_LIMIT);
+    const aimYaw = this.yaw + this.recoilYaw;
+
     if (this.shakeAmount > 0) {
       this.shakeAmount = Math.max(0, this.shakeAmount - dt / SHAKE_DECAY);
       this.shakePhase += dt;
@@ -444,10 +512,10 @@ export class FirstPersonController {
       const yawShake =
         (Math.sin(this.shakePhase * 38.7) + Math.sin(this.shakePhase * 61.9)) * 0.5 * amount;
       const rollShake = Math.sin(this.shakePhase * 23.5) * amount * 0.7;
-      this.euler.set(this.pitch + pitchShake, this.yaw + yawShake, rollShake, 'YXZ');
+      this.euler.set(aimPitch + pitchShake, aimYaw + yawShake, rollShake, 'YXZ');
     } else {
       this.shakePhase = 0;
-      this.euler.set(this.pitch, this.yaw, 0, 'YXZ');
+      this.euler.set(aimPitch, aimYaw, 0, 'YXZ');
     }
     this.camera.quaternion.setFromEuler(this.euler);
   }
@@ -466,6 +534,8 @@ export class FirstPersonController {
       grounded: this.grounded,
       surface: this.surface,
       indoors: this.indoors,
+      recoilPitch: this.recoilPitch,
+      recoilYaw: this.recoilYaw,
     };
   }
 
@@ -497,6 +567,9 @@ export class FirstPersonController {
     this.velocity.set(0, 0, 0);
     this.verticalVelocity = 0;
     this.grounded = true;
+    // A move this abrupt is a respawn or a vantage point; carrying a burst's
+    // accumulated kick across it would leave the new view tilted at the sky.
+    this.clearRecoil();
     if (heading !== undefined) this.yaw = heading;
   }
 
@@ -514,6 +587,7 @@ export class FirstPersonController {
     this.velocity.set(0, 0, 0);
     this.verticalVelocity = 0;
     this.grounded = true;
+    this.clearRecoil();
     if (heading !== undefined) this.yaw = heading;
   }
 

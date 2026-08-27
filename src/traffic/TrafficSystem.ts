@@ -31,16 +31,22 @@ import type { QualityLevel } from '../render/Lighting';
 import type { CityGround } from '../world/CityGround';
 import type { CityPlan } from '../world/CityPlan';
 import { TrafficRenderer } from './TrafficRenderer';
-import { TrafficSim, type Vehicle } from './TrafficSim';
+import { TrafficSim, type TrafficCollision, type Vehicle } from './TrafficSim';
 import { createVehicleMaterial } from './VehicleMaterial';
 import type { VehicleModelSet } from './VehicleModels';
 import type {
   ChassisSpec,
+  ImpactReport,
   TrafficContext,
   TrafficObstacle,
   VehicleHandle,
+  VehicleImpact,
   VehicleView,
 } from './types';
+
+export { VEHICLE_INTEGRITY, impactDamage } from './types';
+export type { ImpactReport, VehicleImpact } from './types';
+export type { TrafficCollision } from './TrafficSim';
 
 export interface TrafficSystemOptions {
   readonly plan: CityPlan;
@@ -121,6 +127,15 @@ export class TrafficSystem {
   private quality: QualityLevel;
   private disposed = false;
 
+  /**
+   * Notified for every vehicle impact in the game, wherever it was resolved -
+   * a knocked car, a wreck hitting a wall, the player's own car connecting
+   * with something. One subscription so audio does not have to find and follow
+   * four different systems. Rewritten in place; read it, do not keep it.
+   */
+  onImpact: ((info: ImpactReport) => void) | null = null;
+  private readonly impact = { x: 0, y: 0, z: 0, intensity: 0, kind: 'vehicle' as 'vehicle' | 'world' };
+
   constructor(options: TrafficSystemOptions) {
     this.quality = options.quality;
     const perVehicle = options.laneMetresPerVehicle ?? DENSITY[options.quality];
@@ -145,6 +160,9 @@ export class TrafficSystem {
     });
     this.renderer.rebuild(this.sim.vehicles);
     this.group = this.renderer.group;
+    this.sim.impactListener = (x, y, z, intensity, kind): void => {
+      this.reportImpact(x, y, z, intensity, kind);
+    };
   }
 
   /**
@@ -204,11 +222,15 @@ export class TrafficSystem {
       this.playerObstacle.z = ctx.z;
       this.obstacles.push(this.playerObstacle);
     }
-    // A player-driven car is an obstacle to everyone else. Three circles along
-    // its length approximate the box well enough for a car to queue behind it.
+    // A car the traffic AI is not driving is an obstacle to everyone else -
+    // the player's, a pursuit unit's, and a wreck lying where it stopped.
+    // Three circles along its length approximate the box well enough for a car
+    // to queue behind it. Publishing the wrecks is what keeps the rest of the
+    // traffic from driving through one; without it a crash in a live lane is
+    // invisible to every driver behind it.
     let driverIndex = 0;
     for (const vehicle of this.sim.vehicles) {
-      if (!vehicle.active || vehicle.control !== 'player') continue;
+      if (!vehicle.active || vehicle.control === 'ambient') continue;
       const fx = -Math.sin(vehicle.yaw);
       const fz = -Math.cos(vehicle.yaw);
       const halfLength = vehicle.blueprint.length * 0.5;
@@ -245,7 +267,8 @@ export class TrafficSystem {
    */
   takeControl(id: number): VehicleHandle | null {
     const vehicle = this.sim.vehicles.find((v) => v.id === id && v.active);
-    if (!vehicle || vehicle.control === 'player') return null;
+    // A car that is mid-crash has no pose to hand over and nothing to drive.
+    if (!vehicle || vehicle.control !== 'ambient') return null;
     return this.makeHandle(vehicle);
   }
 
@@ -284,6 +307,88 @@ export class TrafficSystem {
     };
     this.handles.set(vehicle.id, handle);
     return handle;
+  }
+
+  // -- impacts --------------------------------------------------------------
+
+  /**
+   * Applies one collision to one vehicle. Returns true if it took the hit.
+   *
+   * This is the seam every system that can hit a car goes through: the player's
+   * own collision resolve, a pursuit unit shunting traffic, an explosion. The
+   * impulse is converted with the vehicle's real chassis mass and the moment of
+   * the contact point about its centre, so an off-centre hit spins it, a
+   * central one does not, and a lateral one high enough on the body takes it
+   * over. Past a threshold the car leaves the traffic AI and finishes the
+   * collision as a free body. See `TrafficSim.applyImpact`.
+   *
+   * A hit is ignored for a fifth of a second afterwards, so a contact that
+   * persists across frames is one collision rather than a hundred.
+   */
+  applyImpact(vehicleId: number, hit: VehicleImpact): boolean {
+    if (this.disposed) return false;
+    return this.sim.applyImpact(vehicleId, hit);
+  }
+
+  /**
+   * Structural damage with no impulse behind it - gunfire, fire, blast at a
+   * distance. Not rate limited, because a rifle is not.
+   *
+   * Ordinary cars and patrol cars share this one model, on the one scale:
+   * `VEHICLE_INTEGRITY` points, zero is a write-off. Read the result back off
+   * `VehicleView.integrity`.
+   */
+  applyDamage(vehicleId: number, amount: number): boolean {
+    if (this.disposed) return false;
+    return this.sim.applyDamage(vehicleId, amount);
+  }
+
+  /**
+   * Collects the impulse banked for a vehicle whose pose is written from
+   * outside, in newton seconds, or null when nothing hit it.
+   *
+   * The simulation cannot move a car it does not own, so when traffic runs into
+   * the player's - or a pursuit unit's - it records the exchange here and lets
+   * the owner decide what it does to the car. Poll it once a frame.
+   */
+  takeImpulse(vehicleId: number): { x: number; z: number; yaw: number; damage: number } | null {
+    return this.sim.takeImpulse(vehicleId);
+  }
+
+  /** The chassis of one vehicle, for anything that has to do momentum with it. */
+  chassisOf(id: number): ChassisSpec | null {
+    const vehicle = this.sim.vehicles.find((v) => v.id === id && v.active);
+    return vehicle ? vehicle.blueprint.chassis : null;
+  }
+
+  /**
+   * Gives free bodies the static world to bounce off.
+   *
+   * Installed after construction: the collision world is built from the baked
+   * city and this system from the plan, so neither can precede the other.
+   * Without it a knocked car still slides, spins and settles - it just does not
+   * notice walls.
+   */
+  setCollision(collision: TrafficCollision | null): void {
+    this.sim.setCollision(collision);
+  }
+
+  /** Publishes an impact somebody else resolved. See `onImpact`. */
+  reportImpact(
+    x: number,
+    y: number,
+    z: number,
+    intensity: number,
+    kind: 'vehicle' | 'world',
+  ): void {
+    const listener = this.onImpact;
+    if (!listener || intensity <= 0) return;
+    this.impact.x = x;
+    this.impact.y = y;
+    this.impact.z = z;
+    this.impact.intensity = Math.min(1, intensity);
+    this.impact.kind = kind;
+    listener(this.impact);
   }
 
   // -- diagnostics ----------------------------------------------------------

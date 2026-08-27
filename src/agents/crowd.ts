@@ -1139,7 +1139,14 @@ export class Crowd {
    * was. `PedestrianSystem.downAt` is the public face of this; it exists so a
    * shot civilian goes down exactly the way a struck one does.
    */
-  downNearest(x: number, z: number, radius: number, fatal: boolean): boolean {
+  downNearest(
+    x: number,
+    z: number,
+    radius: number,
+    fatal: boolean,
+    dirX?: number,
+    dirZ?: number,
+  ): boolean {
     let best: Pedestrian | null = null;
     let bestDistance = radius * radius;
     const span = Math.ceil(radius / CELL);
@@ -1163,9 +1170,22 @@ export class Crowd {
       }
     }
     if (!best) return false;
-    // Dropped where they stand: a bullet carries no useful shove at this scale,
-    // so the direction only decides which way they topple.
-    this.knockDown(best, -Math.sin(best.heading), -Math.cos(best.heading), 0, fatal);
+    /*
+     * Dropped where they stand: a bullet carries no useful shove at this
+     * scale, so the direction only decides which WAY they topple - forwards
+     * onto the face if it came from behind, backwards if it came from in
+     * front. `knockDown` works that out from the blow against their facing.
+     *
+     * The caller supplies the shot's direction of travel when it knows it.
+     * Falling back to the victim's own heading means everybody folds forwards,
+     * which is what this did before the shot direction was plumbed through and
+     * reads as a single canned animation the moment two people go down.
+     */
+    const known = dirX !== undefined && dirZ !== undefined;
+    const length = known ? Math.hypot(dirX, dirZ) : 0;
+    const bx = length > 1e-4 ? (dirX as number) / length : -Math.sin(best.heading);
+    const bz = length > 1e-4 ? (dirZ as number) / length : -Math.cos(best.heading);
+    this.knockDown(best, bx, bz, 0, fatal);
     return true;
   }
 

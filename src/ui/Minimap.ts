@@ -36,6 +36,8 @@ import {
   type Street,
 } from '../world/CityPlan';
 import { shorelineX } from '../world/elevation';
+import { RUNWAY, TERMINAL } from '../world/airport/layout';
+import { pavedRects } from '../world/airport/surfaces';
 
 // ---------------------------------------------------------------------------
 // Palette
@@ -62,6 +64,15 @@ export const MINIMAP_PALETTE = {
   block: '#171d22',
   park: '#1e2a23',
   plaza: '#2d353b',
+  /**
+   * The airfield platform. A shade cooler and lighter than a city block, which
+   * is what 210,000 square metres of concrete and mown grass looks like next to
+   * a street grid; kept inside the palette's 30-point channel spread so it
+   * stays as desaturated as every other ground colour.
+   */
+  airfield: '#1a2126',
+  /** Runway, taxiway and apron, drawn over the airfield. */
+  airside: '#2b3238',
   /** Carriageway. Darker than the pavement it sits inside. */
   road: '#333c44',
   /** Wider carriageways read a shade brighter so the arterials stand out. */
@@ -103,6 +114,7 @@ export const DISTRICT_LABELS: Readonly<Record<DistrictId, string>> = {
   core: 'Meridian Core',
   civic: 'Lantern Park',
   ridge: 'Ridge Terraces',
+  airport: 'Meridian Bay Regional',
 };
 
 // ---------------------------------------------------------------------------
@@ -132,8 +144,35 @@ export const MAP_MARGIN = 28;
  * Pixels per metre in the offscreen static layer. Chosen so the layer is sharp
  * when downsampled into the ~190 px dial and still acceptable when scaled up to
  * the expanded map, without the memory cost of a 4 px/m raster.
+ *
+ * It is a CEILING, not the scale: see `staticScaleFor`.
  */
 export const STATIC_SCALE = 3.2;
+
+/**
+ * Ceiling on the offscreen static layer, in pixels.
+ *
+ * 3 megapixels is 12 MB of RGBA, which is a sane raster to hold for the whole
+ * session. It matters because the map covers the plan, and the plan grew from
+ * 427 by 362 m to 694 by 1,191 m when Meridian Bay Regional was added: at a
+ * flat 3.2 px/m that is 2,221 by 3,811 px, 8.5 megapixels, 34 MB - allocated
+ * eagerly in the constructor, on a device that may not have it.
+ */
+const STATIC_PIXEL_BUDGET = 3_000_000;
+
+/**
+ * Pixels per metre for a given map, capped by the budget above.
+ *
+ * At the enlarged bounds this returns 1.94 px/m. That is still more than
+ * either view asks for: the dial shows about 120 m across ~190 CSS px, which
+ * is 1.6 px/m, and the expanded map fits 1,191 m into at most 780 px, which is
+ * 0.65. The cap costs nothing visible and saves 22 MB.
+ */
+export function staticScaleFor(bounds: MapBounds): number {
+  const area = bounds.width * bounds.depth;
+  if (area <= 0) return STATIC_SCALE;
+  return Math.min(STATIC_SCALE, Math.sqrt(STATIC_PIXEL_BUDGET / area));
+}
 
 /** Field of view of the wedge drawn from the player marker. */
 export const FOV_DEGREES = 70;
@@ -307,6 +346,8 @@ export class Minimap {
    */
   private waypoint: { readonly x: number; readonly z: number } | null = null;
   private readonly bounds: MapBounds;
+  /** Pixels per metre in `staticLayer`, capped against the pixel budget. */
+  private readonly staticScale: number;
   private readonly size: number;
   private readonly metresPerPixel: number;
 
@@ -339,12 +380,13 @@ export class Minimap {
   constructor(plan: CityPlan, options?: MinimapOptions) {
     this.plan = plan;
     this.bounds = mapBoundsFor(plan);
+    this.staticScale = staticScaleFor(this.bounds);
     this.size = Math.max(120, Math.round(options?.size ?? DEFAULT_SIZE));
     this.metresPerPixel = Math.max(0.4, options?.metresPerPixel ?? DEFAULT_METRES_PER_PIXEL);
 
     this.staticLayer = document.createElement('canvas');
-    this.staticLayer.width = Math.ceil(this.bounds.width * STATIC_SCALE);
-    this.staticLayer.height = Math.ceil(this.bounds.depth * STATIC_SCALE);
+    this.staticLayer.width = Math.ceil(this.bounds.width * this.staticScale);
+    this.staticLayer.height = Math.ceil(this.bounds.depth * this.staticScale);
     this.buildStaticLayer(context2d(this.staticLayer));
 
     this.element = document.createElement('div');
@@ -489,9 +531,9 @@ export class Minimap {
     const side = this.dial.width;
     if (side === 0) return;
     const radius = side * 0.5;
-    const span = this.size * this.metresPerPixel * STATIC_SCALE * this.dpr;
+    const span = this.size * this.metresPerPixel * this.staticScale * this.dpr;
     // Source crop in static-layer pixels, centred on the player.
-    const centre = worldToMap(this.playerX, this.playerZ, this.bounds);
+    const centre = worldToMap(this.playerX, this.playerZ, this.bounds, this.staticScale);
     const sourceSpan = span / this.dpr;
 
     ctx.save();
@@ -520,7 +562,7 @@ export class Minimap {
     const originY = centre.y - sourceSpan * 0.5;
     const k = side / sourceSpan;
     const project = (wx: number, wz: number): MapPoint => {
-      const m = worldToMap(wx, wz, this.bounds);
+      const m = worldToMap(wx, wz, this.bounds, this.staticScale);
       return { x: (m.x - originX) * k, y: (m.y - originY) * k };
     };
     this.drawMarkers(ctx, project, this.dpr, {
@@ -597,7 +639,7 @@ export class Minimap {
   // -- static raster --------------------------------------------------------
 
   private toStatic(x: number, z: number): MapPoint {
-    return worldToMap(x, z, this.bounds);
+    return worldToMap(x, z, this.bounds, this.staticScale);
   }
 
   private fillRect(ctx: CanvasRenderingContext2D, rect: Rect, colour: string): void {
@@ -646,6 +688,7 @@ export class Minimap {
     }
 
     for (const block of this.plan.blocks) this.drawBlock(ctx, block);
+    this.drawAirside(ctx);
     for (const parcel of this.plan.parcels) this.drawParcel(ctx, parcel);
     // NOTE: markers are deliberately NOT baked here. The static layer is
     // 3.2 px per metre and is then scaled to whichever view is drawing it, so
@@ -680,8 +723,45 @@ export class Minimap {
         ? MINIMAP_PALETTE.park
         : block.kind === 'plaza'
           ? MINIMAP_PALETTE.plaza
-          : MINIMAP_PALETTE.block;
+          : block.kind === 'airfield'
+            ? MINIMAP_PALETTE.airfield
+            : MINIMAP_PALETTE.block;
     this.fillRect(ctx, block.rect, colour);
+  }
+
+  /**
+   * Runway, taxiway, apron and terminal, drawn over the airfield block.
+   *
+   * Read straight out of `airport/plan.ts` rather than restated, so the shape
+   * on the map is the shape on the ground. Without it the airport is a grey
+   * rectangle 200 m across and the player has no way to tell which end of it
+   * the runway is.
+   */
+  private drawAirside(ctx: CanvasRenderingContext2D): void {
+    ctx.fillStyle = MINIMAP_PALETTE.airside;
+    for (const paved of pavedRects()) {
+      if (paved.key !== 'concrete') continue;
+      const a = this.toStatic(paved.rect.minX, paved.rect.minZ);
+      const b = this.toStatic(paved.rect.maxX, paved.rect.maxZ);
+      ctx.fillRect(a.x, a.y, b.x - a.x, b.y - a.y);
+    }
+    // The runway centreline, so its direction is unmistakable at dial scale.
+    const a = this.toStatic(RUNWAY.centreX, RUNWAY.northZ);
+    const b = this.toStatic(RUNWAY.centreX, RUNWAY.southZ);
+    ctx.strokeStyle = MINIMAP_PALETTE.label;
+    ctx.lineWidth = Math.max(1, this.staticScale * 0.6);
+    ctx.setLineDash([this.staticScale * 8, this.staticScale * 6]);
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    // The terminal, in the enterable accent: it is the one building here the
+    // player can walk into.
+    const t0 = this.toStatic(TERMINAL.minX, TERMINAL.minZ);
+    const t1 = this.toStatic(TERMINAL.maxX, TERMINAL.maxZ);
+    ctx.fillStyle = MINIMAP_PALETTE.enterable;
+    ctx.fillRect(t0.x, t0.y, t1.x - t0.x, t1.y - t0.y);
   }
 
   private drawParcel(ctx: CanvasRenderingContext2D, parcel: Parcel): void {
@@ -757,7 +837,12 @@ export class Minimap {
     for (const landmark of this.plan.landmarks) {
       const p = clamp(project(landmark.x, landmark.z));
       if (p.off) continue; // Landmarks do not need an off-screen arrow.
-      drawLandmarkPin(ctx, p.x, p.y, 6 * unit);
+      // The terminal is a building the player walks into, so it takes the same
+      // ring every other enterable building has rather than a landmark
+      // diamond - the ring is the map's one piece of taught vocabulary and it
+      // would be a waste to have the biggest enterable building opt out of it.
+      if (landmark.kind === 'terminal') drawDoorPin(ctx, p.x, p.y, 5.5 * unit);
+      else drawLandmarkPin(ctx, p.x, p.y, 6 * unit);
     }
 
     for (const parcel of this.plan.parcels) {

@@ -13,8 +13,16 @@
  * That irregularity is what stops the result reading as a generated chessboard.
  */
 
-import { createRng, type Rng } from '../core/rng';
+import { createRng, hash2, type Rng } from '../core/rng';
 import { clamp, rectCenter, rectDepth, rectWidth, type Rect, type Vec2 } from '../core/mathx';
+import {
+  AIRFIELD,
+  AIRPORT_STREETS,
+  RUNWAY,
+  TERMINAL,
+  TOWER,
+  type AirportRect,
+} from './airport/layout';
 import { landElevation } from './elevation';
 
 export const CITY_SEED = 'meridian-bay-01';
@@ -28,7 +36,9 @@ export type DistrictId =
   | 'oldQuarter'
   | 'core'
   | 'civic'
-  | 'ridge';
+  | 'ridge'
+  /** Meridian Bay Regional, south of the city across open ground. */
+  | 'airport';
 
 export type StreetKind = 'promenade' | 'arterial' | 'secondary' | 'service';
 
@@ -61,7 +71,17 @@ export interface Alley {
   readonly openings: readonly Facing[];
 }
 
-export type BlockKind = 'buildings' | 'park' | 'plaza';
+export type BlockKind =
+  | 'buildings'
+  | 'park'
+  | 'plaza'
+  /**
+   * The airfield platform. It is a block only so that `districtAt` has
+   * something geographic to answer with out there; nothing subdivides it,
+   * nothing scatters on it, and `buildBlockGround` skips it, because the
+   * airport builder draws every square metre of its own ground.
+   */
+  | 'airfield';
 
 /** Pavement height at each corner of a block; the datum for its interior. */
 export interface CornerLevels {
@@ -96,6 +116,45 @@ export interface CityBlock {
  */
 export function blockSurfaceY(_block: CityBlock, x: number, z: number): number {
   return landElevation(x, z) + KERB_HEIGHT;
+}
+
+/**
+ * Two service aprons per block, placed from the block's own hash so they land
+ * in the same spot every build.
+ *
+ * Lives here, not in the geometry builder, because `CityGround.sample` has to
+ * report the same surface the builder draws. It did not: the builder laid a
+ * dark paved alley and two worn-tarmac aprons across every courtyard block and
+ * the sampler called the whole block interior gravel, so 19,033 half-metre
+ * sample points of visible hard standing crunched underfoot. One table, read by
+ * both, is the only way that stays fixed.
+ */
+export function blockAprons(rect: Rect): Rect[] {
+  const aprons: Rect[] = [];
+  for (let i = 0; i < 2; i += 1) {
+    const u = hash2(rect.minX + i * 11, rect.minZ, 71);
+    const v = hash2(rect.minZ + i * 13, rect.maxX, 72);
+    const w = 4.5 + hash2(rect.maxX, rect.minZ + i, 73) * 4.5;
+    const d = 4.0 + hash2(rect.minX, rect.maxZ + i, 74) * 4.0;
+    const x0 = rect.minX + u * Math.max(0, rect.maxX - rect.minX - w);
+    const z0 = rect.minZ + v * Math.max(0, rect.maxZ - rect.minZ - d);
+    aprons.push({ minX: x0, minZ: z0, maxX: x0 + w, maxZ: z0 + d });
+  }
+  return aprons;
+}
+
+/** What a courtyard block is surfaced with at a point. */
+export type CourtyardSurface = 'pavement' | 'asphalt' | 'gravel';
+
+export function courtyardSurfaceAt(block: CityBlock, x: number, z: number): CourtyardSurface {
+  const alley = block.alley?.rect;
+  if (alley && x > alley.minX && x < alley.maxX && z > alley.minZ && z < alley.maxZ) {
+    return 'pavement';
+  }
+  for (const apron of blockAprons(block.rect)) {
+    if (x > apron.minX && x < apron.maxX && z > apron.minZ && z < apron.maxZ) return 'asphalt';
+  }
+  return 'gravel';
 }
 
 export type ArchetypeId =
@@ -146,7 +205,15 @@ export type InteriorKind =
 export interface Landmark {
   readonly id: string;
   readonly name: string;
-  readonly kind: 'lighthouse' | 'clockTower' | 'fountain' | 'ferryTerminal' | 'watertower';
+  readonly kind:
+    | 'lighthouse'
+    | 'clockTower'
+    | 'fountain'
+    | 'ferryTerminal'
+    | 'watertower'
+    | 'terminal'
+    | 'controlTower'
+    | 'runway';
   readonly x: number;
   readonly z: number;
   readonly y: number;
@@ -528,6 +595,9 @@ const DISTRICT_ARCHETYPES: Readonly<
   core: { ids: ['midriseOffice', 'glassTower', 'brickWalkup', 'civicStone'], weights: [6, 3, 2, 1] },
   civic: { ids: ['civicStone', 'midriseOffice', 'marketHall', 'brickWalkup'], weights: [3, 3, 1, 3] },
   ridge: { ids: ['terraceHouse', 'apartmentSlab', 'brickWalkup'], weights: [6, 3, 2] },
+  // The airfield authors its own buildings; nothing is ever subdivided out
+  // here, so this entry exists only to satisfy the exhaustive record.
+  airport: { ids: ['warehouse'], weights: [1] },
 };
 
 // ---------------------------------------------------------------------------
@@ -1082,6 +1152,182 @@ function buildLandmarks(): Landmark[] {
   ];
 }
 
+// ---------------------------------------------------------------------------
+// Meridian Bay Regional
+//
+// Appended to the plan, never inserted into it. `getCityPlan` draws the whole
+// city from ONE `createRng(seed)` stream, and the recorded incident above
+// `ENTERABLE_TARGETS` is what happens when something is inserted mid-stream:
+// buildings move across the map. Nothing here touches that stream. The airport
+// has its own (`${seed}:airport`), it is built AFTER `buildParcels` has taken
+// its last draw, and its streets are concatenated after `buildParcels` has
+// already chosen every parcel's frontage - so adding them cannot change which
+// street a city building fronts onto.
+//
+// `plan.xLines` and `plan.zLines` keep pointing at the original tables for the
+// same reason: `buildCircuit` reads `X_LINES[0]` and `X_LINES[last]`, so an
+// airport street appended to either would silently redefine the city's
+// pedestrian circuit.
+// ---------------------------------------------------------------------------
+
+/**
+ * The landside road network.
+ *
+ * Two of these are the survey's own: Airport Approach in from South Circuit,
+ * and Airport Way across the terminal frontage. The rest exist because those
+ * two on their own are a T-junction, not a network - Airport Way would meet
+ * exactly one other street, which `tests/cityPlan.test.ts` rejects, and the car
+ * park, the tower and the hangars would have no carriageway at all.
+ *
+ * Every one of them lies on ground that the platform or its causeway has graded
+ * dead level, so none of them carries a cross-fall; the widths taper with their
+ * job, from the 14.4 m arrival road down to the 9.2 m hangar road.
+ */
+/**
+ * How far an airport street runs PAST the junction at each of its ends.
+ *
+ * A street whose `from` lands exactly on a crossing street's centreline gets a
+ * terminus node at the same coordinate as the junction node, and
+ * `buildRoadNetwork` treats them as two different places: the zero-length lane
+ * between them is dropped, and the street's inbound carriageway then ends at a
+ * terminus that no junction feeds. `TrafficSim` recovers the continuation by
+ * matching nodes by position - see the note in `tests/traffic.test.ts` about
+ * the eighteen lanes on the city's outer ring - but `PursuitField` walks the
+ * raw graph, and measured on the first pass NONE of the airport's 24 lanes
+ * could reach the city: a police unit could drive in and never drive out.
+ *
+ * Running 0.4 m past the junction fixes it without touching the shared graph.
+ * It is under the half-metre `buildRoadNetwork` needs to emit a lane, so the
+ * terminus lane is dropped instead of the junction one and every airport lane
+ * chain begins and ends on a real junction node. It is also well inside the
+ * junction footprint, so nothing is drawn differently.
+ */
+const TERMINUS_PAD = 0.4;
+
+function airportStreets(): Street[] {
+  const { approach, way } = AIRPORT_STREETS;
+  const road = (
+    id: string,
+    name: string,
+    kind: StreetKind,
+    axis: 'x' | 'z',
+    position: number,
+    from: number,
+    to: number,
+    roadHalf: number,
+    sidewalk: number,
+  ): Street => ({
+    id,
+    name,
+    kind,
+    axis,
+    position,
+    from: from - TERMINUS_PAD,
+    to: to + TERMINUS_PAD,
+    roadHalf,
+    sidewalk,
+    lanes: 2,
+    boardwalk: false,
+  });
+
+  return [
+    road(
+      'airport-approach',
+      'Airport Approach',
+      'secondary',
+      'x',
+      approach.position,
+      approach.from,
+      approach.to,
+      approach.roadHalf,
+      approach.sidewalk,
+    ),
+    road(
+      'airport-way',
+      'Airport Way',
+      'secondary',
+      'z',
+      way.position,
+      way.from,
+      way.to,
+      way.roadHalf,
+      way.sidewalk,
+    ),
+    /*
+     * The drop-off loop across the terminal's north face, and the southern loop
+     * for the car park and the hangars.
+     *
+     * PAVEMENT WIDTHS ARE NOT FREE HERE. `buildPavementGraph` puts a corner
+     * station `sidewalk / 2` past each junction and a crossing station a fixed
+     * 1.6 m past it, merges the two when they land within 0.25 m, and refuses
+     * to build any link shorter than 0.6 m. A sidewalk of 2.4 m puts them
+     * 0.4 m apart - too far to merge, too close to link - and the chain is cut
+     * in two at every junction. Measured on the first pass: 92 stranded links
+     * and eight separate islands of airport pavement, none of them reachable
+     * from the city. Every sidewalk on the airport is therefore between 2.7 and
+     * 3.7 m, which is where the city's own widths all sit.
+     */
+    road('forecourt-west', 'Forecourt West', 'service', 'x', 166, 262, 336, 5.0, 2.8),
+    road('forecourt-east', 'Forecourt East', 'service', 'x', 200, 262, 336, 5.0, 2.8),
+    road('forecourt-south', 'Terminal Frontage', 'service', 'z', 336, 166, 200, 4.5, 2.8),
+    road('car-park-road', 'Car Park Road', 'service', 'x', 180, 576, 700, 5.0, 3.0),
+    road('car-park-entry', 'Car Park Entry', 'service', 'z', 576, 141, 180, 4.6, 2.8),
+    road('hangar-road', 'Hangar Road', 'service', 'z', 700, 141, 180, 4.6, 2.8),
+  ];
+}
+
+function airportBlock(id: string, rect: AirportRect, kind: BlockKind): CityBlock {
+  const plain: Rect = { minX: rect.minX, maxX: rect.maxX, minZ: rect.minZ, maxZ: rect.maxZ };
+  const corners = blockCornerLevels(plain);
+  return {
+    id,
+    district: 'airport',
+    kind,
+    rect: plain,
+    corners,
+    padElevation: (corners.nw + corners.ne + corners.sw + corners.se) / 4,
+    alley: null,
+    // Outside the city grid entirely, so there is no column or row to give.
+    column: -1,
+    row: -1,
+  };
+}
+
+function airportBlocks(): CityBlock[] {
+  return [airportBlock('airport-field', AIRFIELD, 'airfield')];
+}
+
+function airportLandmarks(): Landmark[] {
+  const terminalX = (TERMINAL.minX + TERMINAL.maxX) / 2;
+  const terminalZ = (TERMINAL.minZ + TERMINAL.maxZ) / 2;
+  return [
+    {
+      id: 'airport-terminal',
+      name: 'Meridian Bay Regional',
+      kind: 'terminal',
+      x: terminalX,
+      z: terminalZ,
+      y: landElevation(terminalX, terminalZ),
+    },
+    {
+      id: 'airport-tower',
+      name: 'Meridian Tower',
+      kind: 'controlTower',
+      x: TOWER.x,
+      z: TOWER.z,
+      y: landElevation(TOWER.x, TOWER.z),
+    },
+    {
+      id: 'airport-runway',
+      name: 'Runway 18/36',
+      kind: 'runway',
+      x: RUNWAY.centreX,
+      z: (RUNWAY.northZ + RUNWAY.southZ) / 2,
+      y: RUNWAY.elevation,
+    },
+  ];
+}
+
 let cached: CityPlan | null = null;
 
 /** Builds (and memoises) the city plan. Deterministic for a given seed. */
@@ -1091,15 +1337,17 @@ export function getCityPlan(seed: string = CITY_SEED): CityPlan {
   const rng = createRng(seed);
   const streets: Street[] = [...X_LINES, ...Z_LINES];
   const blocks = buildBlocks(rng);
+  // Every draw the city takes has been taken by the time this returns. The
+  // airport is appended below and draws from nothing.
   const parcels = buildParcels(blocks, streets, rng);
   const circuit = buildCircuit();
 
   const plan: CityPlan = {
     seed,
-    streets,
-    blocks,
+    streets: [...streets, ...airportStreets()],
+    blocks: [...blocks, ...airportBlocks()],
     parcels,
-    landmarks: buildLandmarks(),
+    landmarks: [...buildLandmarks(), ...airportLandmarks()],
     circuit,
     circuitLength: circuitLengthOf(circuit),
     // Player starts on the promenade beside the ferry terminal, looking east

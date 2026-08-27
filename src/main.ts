@@ -31,6 +31,7 @@ import { TrafficSystem } from './traffic/TrafficSystem';
 import { SignalHeads } from './city/SignalHeads';
 import { StreetAudio } from './audio/StreetAudio';
 import { CombatAudio, type FlightSound } from './audio/CombatAudio';
+import { PoliceAudio } from './audio/PoliceAudio';
 import { HEAT, MAX_HEALTH, PlayerState, WEAPONS, type WeaponId } from './player/PlayerState';
 import { GunShop } from './shop/GunShop';
 import { Furnishings } from './world/furnishings/Furnishings';
@@ -42,6 +43,14 @@ import { RespawnDirector } from './combat/Respawn';
 import { defaultViewmodels } from './combat/WeaponViewmodel';
 import type { RocketHandle } from './combat/Projectiles';
 import { PoliceSystem } from './police/PoliceSystem';
+import { AIRCRAFT, AircraftSystem, FLIGHT_CONTROLS, Flying, airQaSection } from './air';
+import { RUNWAY, TERMINAL, TERMINAL_FLOOR } from './world/airport/layout';
+import { GATE_SEATS, TERMINAL_QUEUES } from './world/airport/plan';
+import { buildAirport } from './world/airport';
+import { loadAirportModels } from './world/airport/models';
+import { TerminalCrowd } from './agents/travellers';
+import { insetRect } from './core/mathx';
+import { AircraftAudio } from './audio/AircraftAudio';
 import { loadVehicleModels } from './traffic/VehicleModels';
 import { CollisionWorld } from './player/Collision';
 import { FirstPersonController } from './player/FirstPersonController';
@@ -57,7 +66,7 @@ import { DamageFeedback } from './ui/DamageFeedback';
 import { Hud } from './ui/Hud';
 import { LoadingScreen } from './ui/LoadingScreen';
 import { Minimap } from './ui/Minimap';
-import { PauseMenu } from './ui/PauseMenu';
+import { PauseMenu, loadSettings } from './ui/PauseMenu';
 
 /**
  * Yields to the browser so the loading screen can repaint between phases.
@@ -80,6 +89,21 @@ function nextFrame(): Promise<void> {
   });
 }
 
+/**
+ * Idle and maximum engine speed per powerplant family, matching
+ * `Flying.engineRpm`. Only used to normalise for the audio mixer; see the
+ * conversion where `onEngine` is wired.
+ */
+const RPM_RANGE: Readonly<Record<'piston' | 'turboprop' | 'turbofan', { idle: number; max: number }>> =
+  {
+    piston: { idle: 700, max: 2700 },
+    turboprop: { idle: 1000, max: 1900 },
+    turbofan: { idle: 5000, max: 22000 },
+  };
+
+/** Mid-field, for "how far from the airport am I" in the aircraft mixer. */
+const airfieldMidZ = (RUNWAY.northZ + RUNWAY.southZ) * 0.5;
+
 const DISTRICT_NAMES: Readonly<Record<string, string>> = {
   harbourside: 'Harbourside',
   cannery: 'The Cannery',
@@ -87,6 +111,7 @@ const DISTRICT_NAMES: Readonly<Record<string, string>> = {
   core: 'Meridian Core',
   civic: 'Lantern Park',
   ridge: 'Ridge Terraces',
+  airport: 'Meridian Bay Regional',
 };
 
 /**
@@ -159,7 +184,25 @@ async function boot(): Promise<void> {
     if (parcel.enterable) buildInterior(parcel, sink);
   }
 
-  loading.setProgress(0.72, 'Dressing the streets');
+  loading.setProgress(0.70, 'Grading the airfield');
+  await nextFrame();
+  /*
+   * Everything airside in one call: the platform, the runway and its markings,
+   * the taxiway, the apron, the terminal shell and its interior, the tower,
+   * the hangars, the fence and the lighting.
+   *
+   * It runs BEFORE `buildEnvironment` for the same reason the street builders
+   * do - `buildTerrain` sinks its quads under whatever hard surface the city
+   * has already claimed, and the airfield is a very large hard surface.
+   *
+   * The airport's ROADS are not here. They are ordinary `Street` records in
+   * `plan.streets`, so the loops above have already paved them, and the road
+   * network, the pavement graph, the signal heads and the minimap pick them up
+   * with no special case at all.
+   */
+  buildAirport(plan, ground, sink);
+
+  loading.setProgress(0.76, 'Dressing the streets');
   await nextFrame();
   scatterStreetProps(plan, sink);
   buildEnvironment(sink, ground);
@@ -208,11 +251,20 @@ async function boot(): Promise<void> {
   const streetModels = await loadStreetPropModels(import.meta.env.BASE_URL);
   for (const [key, parts] of streetModels.parts) propGeometry.set(key, parts as PropPart[]);
 
+  // The airside equipment takes the same route: overwrite the procedural entry
+  // before the city is baked, and it inherits per-chunk instancing, culling
+  // and shadows for nothing. The terminal's own furniture arrives with its own
+  // PBR materials and cannot go through the palette, so it comes back as a
+  // group of meshes instead - exactly what `Furnishings` does for the city.
+  const airportModels = await loadAirportModels(import.meta.env.BASE_URL);
+  for (const [key, parts] of airportModels.parts) propGeometry.set(key, parts as PropPart[]);
+
   loading.setProgress(0.92, 'Baking the city');
   await nextFrame();
 
   const { group, chunks } = sink.bake(materials, propGeometry);
   engine.scene.add(group);
+  engine.scene.add(airportModels.interior);
 
   // The fountain is a single landmark rather than an instanced prop, so it is
   // placed directly once its real size is known.
@@ -278,6 +330,13 @@ async function boot(): Promise<void> {
     models: vehicleModels,
   });
   engine.scene.add(traffic.group);
+  /*
+   * A car knocked out of its lane is integrated as a free body, and a free
+   * body needs walls. Without this it still spins, rolls and settles
+   * correctly, but it slides through buildings on the way. The sim's own
+   * option is optional precisely so every headless test can run without one.
+   */
+  traffic.setCollision(collision);
 
   /**
    * Vehicles as the crowd wants to see them.
@@ -353,6 +412,16 @@ async function boot(): Promise<void> {
     host: audio,
     surfaceAt: (x: number, z: number) => ground.sample(x, z).surface,
   });
+  /*
+   * Every crash in the game goes through one place.
+   *
+   * The simulation resolves the collision and reports it; the audio layer
+   * decides what it sounds like. Keeping the two apart is what lets a struck
+   * ambient car, the player ramming a bollard and a blast throwing a van all
+   * sound like the same physics rather than three unrelated systems.
+   */
+  traffic.onImpact = (info) => streetAudio.impact(info);
+
   const interactions = new InteractionSystem(sink.interactions);
   const minimap = new Minimap(plan);
   const parcelsById = new Map<string, Parcel>(plan.parcels.map((p) => [p.id, p]));
@@ -362,6 +431,7 @@ async function boot(): Promise<void> {
     quality = level;
     engine.setQuality(level);
     pedestrians.setQuality(level);
+    terminal.setQuality(level);
     traffic.setQuality(level);
     lighting.applyQuality(level);
     lighting.setLightRequests(sink.lights);
@@ -376,6 +446,7 @@ async function boot(): Promise<void> {
     },
     onResume: () => {
       pause.hide();
+      setGamePaused(false);
       controller.requestPointerLock();
     },
     onQualityChange: setQuality,
@@ -389,9 +460,10 @@ async function boot(): Promise<void> {
       ambience: audio.getVolume('ambience'),
     },
     onVolumeChange: (channel, value) => audio.setVolume(channel, value),
+    onSensitivityChange: (radiansPerPixel) => controller.setSensitivity(radiansPerPixel),
     onResume: () => {
       pause.hide();
-      controller.setPaused(false);
+      setGamePaused(false);
       controller.requestPointerLock();
     },
     onMusicToggle: (enabled) => {
@@ -401,6 +473,15 @@ async function boot(): Promise<void> {
     },
     onQualityChange: setQuality,
   });
+
+  // The look-speed slider persists itself; the controller has to be told once
+  // at start-up or the saved value only takes effect after the menu is opened.
+  controller.setSensitivity(loadSettings().sensitivity);
+
+  // The Controls tab lists what the player can actually press, including in
+  // the air. Passed in rather than imported by the menu, so the UI layer keeps
+  // no dependency on the flight model.
+  pause.setControlSections([{ title: 'In the air', hints: FLIGHT_CONTROLS }]);
 
   document.body.appendChild(hud.element);
   document.body.appendChild(minimap.element);
@@ -426,6 +507,97 @@ async function boot(): Promise<void> {
   };
   void shop.load();
 
+  /*
+   * The airfield's aircraft, and the one the player can take.
+   *
+   * Deliberately NOT a twelfth `VehicleKind`. The traffic simulation is lane
+   * discipline on a rail with `settleBody` writing `y` from the terrain every
+   * frame, and its own tests cap every vehicle at 7.5 m long and 2.3 m wide -
+   * so an aeroplane could not be one of them without either breaking those
+   * invariants or never leaving the ground. `src/air` is a separate free-body
+   * system that shares only the collision world and the ground sampler.
+   */
+  const aircraft = new AircraftSystem({
+    baseUrl: import.meta.env.BASE_URL,
+    groundY: (x: number, z: number) => ground.sample(x, z).y,
+  });
+  engine.scene.add(aircraft.group);
+  void aircraft.load();
+
+  const flying = new Flying({
+    aircraft,
+    collision,
+    camera: engine.camera,
+    controller,
+    domElement: canvas,
+    groundY: (x: number, z: number) => ground.sample(x, z).y,
+    // Where a pilot may be put down on foot. The bay is in bounds and is not
+    // somewhere to step out onto.
+    standable: (x: number, z: number) =>
+      ground.isInBounds(x, z) && ground.sample(x, z).surface !== 'water',
+  });
+
+  /*
+   * The aircraft's own noise, translated at the seam.
+   *
+   * The two layers deliberately disagree about `rpm` and neither is wrong:
+   * the flight model reports a REAL engine speed, because a piston at 2,700
+   * and a fan at 22,000 are different machines, while the mixer wants a 0..1
+   * fraction so one crossfade curve serves all three families. Converting
+   * here - rather than making either side speak the other's units - keeps the
+   * flight model free of audio concerns and the mixer free of aerodynamics.
+   *
+   * The ranges are `Flying.engineRpm`'s own, and are asserted below so a
+   * change to either side fails a test rather than quietly desaturating the
+   * engine note.
+   */
+  const airAudio = new AircraftAudio(audio);
+  flying.onEngine = (info) => {
+    const range = RPM_RANGE[AIRCRAFT[info.type].engine];
+    airAudio.engine({
+      // One aircraft is flown at a time, so the id is a constant; the mixer
+      // uses it only to keep a voice attached to the same machine.
+      id: 0,
+      x: info.x,
+      y: info.y,
+      z: info.z,
+      rpm: (info.rpm - range.idle) / (range.max - range.idle),
+      throttle: info.throttle,
+      airspeed: info.airspeed,
+      type: info.type,
+      onGround: info.onGround,
+    });
+  };
+  flying.onTouchdown = (x, y, z, verticalSpeed) => airAudio.touchdown(x, y, z, verticalSpeed);
+  flying.onImpact = (x, y, z, severity) => airAudio.impact(x, y, z, severity);
+
+  /*
+   * The travellers inside the terminal.
+   *
+   * A separate system from the street crowd, and it has to be: the pavement
+   * graph is built only from street pavements and crossings, `Crowd.project`
+   * hard-clamps every agent into its link corridor, and `tests/pedestrians`
+   * asserts over three thousand samples that no walkable link is ever inside a
+   * building. The city crowd cannot go indoors by construction.
+   *
+   * It costs nothing until the player is near the building: `update` returns
+   * before it simulates and the group is switched off, so the city pays no
+   * draw calls and no CPU for it from downtown.
+   */
+  const terminal = new TerminalCrowd({
+    // The walkable floor, inset past the walls.
+    region: insetRect(TERMINAL, 1.6),
+    // The city's own collider set. It filters to the boxes that matter.
+    obstacles: sink.colliders,
+    seats: GATE_SEATS,
+    queues: TERMINAL_QUEUES,
+    floorY: TERMINAL_FLOOR,
+    baseUrl: import.meta.env.BASE_URL,
+    quality: 'high',
+  });
+  engine.scene.add(terminal.group);
+  void terminal.load();
+
   const furnishings = new Furnishings(plan, import.meta.env.BASE_URL);
   engine.scene.add(furnishings.group);
   void furnishings.load();
@@ -436,8 +608,10 @@ async function boot(): Promise<void> {
   // walking on with the hit merely recorded. Struck and shot people share one
   // `down` state inside the crowd.
   const civilians = new CrowdTargets(pedestrians.group, {
-    removeAt: (x: number, y: number, z: number) => {
-      pedestrians.downAt(x, y, z);
+    removeAt: (x: number, y: number, z: number, dirX?: number, dirZ?: number) => {
+      // The direction the round was travelling, so a civilian shot in the back
+      // falls forwards and one shot in the chest goes over backwards.
+      pedestrians.downAt(x, y, z, undefined, dirX, dirZ);
     },
   });
 
@@ -458,6 +632,16 @@ async function boot(): Promise<void> {
   // Gunfire, impacts, blasts and the sound of being hit. A third layer on the
   // director's own buses, like `StreetAudio`, so the volume sliders reach it.
   const combatAudio = new CombatAudio(audio);
+  /*
+   * Police cars sound like police cars.
+   *
+   * A pursuit unit is an ordinary traffic vehicle the police system has taken
+   * control of, so without this layer it was voiced by `StreetAudio` as one
+   * more car in the street. This gives it its own engine and a siren that is
+   * spatial, Doppler-shifted and attenuates with distance - recognisable from
+   * a street away without becoming a sound that follows the player around.
+   */
+  const policeAudio = new PoliceAudio(audio);
   const damageFeedback = new DamageFeedback();
   hud.element.append(damageFeedback.element);
 
@@ -472,6 +656,12 @@ async function boot(): Promise<void> {
     law: police,
     hud,
     seed: plan.seed,
+    // Recoil belongs to whoever owns the camera angles. The controller writes
+    // the camera quaternion ABSOLUTELY every frame from its own pitch and yaw,
+    // so a kick applied to the camera afterwards was thrown away on the next
+    // frame - and, worse, was applied AFTER the shot had already been cast, so
+    // the frame the player saw was rotated relative to the bullet that frame.
+    recoil: controller,
     viewmodels: defaultViewmodels(import.meta.env.BASE_URL),
     rocketUrl: `${import.meta.env.BASE_URL}models/weapons/rocket.glb`,
     onShot: (weapon) => combatAudio.shot(weapon),
@@ -536,7 +726,12 @@ async function boot(): Promise<void> {
     plan,
     player,
     dialogue,
-    onObjective: (objective) => hud.setObjective(objective.title, objective.detail),
+    onObjective: (objective) => {
+      hud.setObjective(objective.title, objective.detail);
+      // The Mission tab is the same objective, readable while paused - which
+      // is when a player who has lost the thread actually goes looking.
+      pause.setObjective(objective.title, objective.detail);
+    },
     onWaypoint: (waypoint) => minimap.setWaypoint(waypoint),
     onBanner: (title, detail) => hud.setBanner(title, detail),
     onPaid: () => audio.playOneShot('ui-tick'),
@@ -612,21 +807,54 @@ async function boot(): Promise<void> {
     window.setTimeout(() => audio.playOneShot('door-close'), 420);
   };
 
-  // A driver has no feet on the pavement. The controller is paused while
-  // driving, but its velocity DAMPS to zero rather than snapping there, so it
-  // can still cross the footstep threshold for a moment after getting in -
-  // which is audible as walking while sitting in a car.
   controller.onFootstep = (surface, running) => {
-    if (driving.driving) return;
-    audio.footstep(surface, running);
+    // A driver has no feet on the pavement, and neither does a pilot. The
+    // controller is paused in both, but its velocity DAMPS to zero rather than
+    // snapping there, so it can still cross the footstep threshold for a
+    // moment after getting in - which is audible as walking while seated.
+    if (driving.driving || flying.flying) return;
+    /*
+     * `onRoad` is the AUTHORITATIVE answer to "is this a carriageway", and it
+     * is why the third argument exists. The surface alone is a classification
+     * of the ground; open ground beyond the street grid used to be decided by
+     * a hash that came up grass three times in five and re-rolled every four
+     * metres, so a player walking on visible tarmac at a junction apron heard
+     * grass. The mixer now takes the flag rather than re-deriving it.
+     */
+    const here = ground.sample(controller.state.x, controller.state.z);
+    audio.footstep(surface, running, here.onRoad);
   };
 
   // -- pause / pointer lock --------------------------------------------------
 
+  /**
+   * The one place the game stops, and the one place it starts again.
+   *
+   * `Engine.setPaused` is the whole of it for the simulation: every system in
+   * this file is driven from `engine.onUpdate`, so not calling it freezes
+   * physics, traffic, the crowd, aircraft, projectiles, mission timers,
+   * animation and the audio listener together, and no system needs to know a
+   * pause exists. The engine keeps RENDERING, so the world stays on screen
+   * behind the menu without advancing, and it holds its simulation clock still
+   * - which matters because the traffic signals and pedestrian crossings phase
+   * off that clock as an ABSOLUTE time, so handing them wall-clock seconds
+   * after a two-minute pause would jump every light in the city on the first
+   * resumed frame.
+   *
+   * The controller is paused as well, because it owns pointer-lock look and
+   * would otherwise keep turning the camera from a mouse the menu is using.
+   */
+  const setGamePaused = (paused: boolean): void => {
+    engine.setPaused(paused);
+    controller.setPaused(paused);
+    audio.setGamePaused(paused);
+    hud.setPointerLocked(paused ? false : document.pointerLockElement === canvas);
+  };
+
   const showPause = (): void => {
+    if (pause.visible) return;
     pause.show();
-    controller.setPaused(true);
-    hud.setPointerLocked(false);
+    setGamePaused(true);
   };
 
   document.addEventListener('pointerlockchange', () => {
@@ -637,7 +865,11 @@ async function boot(): Promise<void> {
     if (!locked && hadPointerLock && !shop.open) showPause();
     if (locked) {
       hadPointerLock = true;
-      controller.setPaused(false);
+      // Regaining the lock must NOT restart the world on its own. The menu is
+      // the only thing that may do that, through its Resume or its close
+      // button - otherwise a stray click behind the overlay silently unpauses
+      // a game the player is still reading.
+      if (!pause.visible) setGamePaused(false);
     }
   });
 
@@ -657,9 +889,18 @@ async function boot(): Promise<void> {
         driving.exit();
         return;
       }
+      if (flying.flying) {
+        // Refuses in the air and while still rolling; the player stays put
+        // and the prompt keeps saying so.
+        if (flying.exit()) traffic.setPlayerIsObstacle(true);
+        return;
+      }
       if (!interactions.focused) {
         const at = controller.state;
-        driving.tryEnter(at.x, at.z);
+        if (driving.tryEnter(at.x, at.z)) return;
+        // An aircraft last: a car parked on the apron is the nearer thing and
+        // should still win.
+        if (flying.tryEnter(at.x, at.z)) traffic.setPlayerIsObstacle(false);
       }
       return;
     }
@@ -691,14 +932,28 @@ async function boot(): Promise<void> {
     materials.update(elapsed);
     controller.update(dt);
     driving.update(dt);
+    // Before the aircraft system and before anything reads the camera: the
+    // flight model poses the camera boom, and the systems that stream around
+    // the viewer have to follow the aeroplane, not the body left on the apron.
+    flying.update(dt);
     const walkState = controller.state;
     const drive = driving.state;
+    const air = flying.state;
     // While driving, the car IS the player as far as the rest of the game is
     // concerned: the camera, the audio listener, the minimap and the systems
     // that stream around the viewer all follow it.
-    const state = drive.driving
-      ? { ...walkState, x: drive.x, y: drive.y, z: drive.z, yaw: drive.yaw, speed: Math.abs(drive.speed) }
-      : walkState;
+    const state = air.flying
+      ? { ...walkState, x: air.x, y: air.y, z: air.z, yaw: air.yaw, speed: air.groundSpeed }
+      : drive.driving
+        ? {
+            ...walkState,
+            x: drive.x,
+            y: drive.y,
+            z: drive.z,
+            yaw: drive.yaw,
+            speed: Math.abs(drive.speed),
+          }
+        : walkState;
 
     // One clock for signals, crossings and gaits: `elapsed` is what
     // `signalFor`/`walkSignal` read, so people and traffic never disagree
@@ -728,10 +983,14 @@ async function boot(): Promise<void> {
       playerSpeed: state.speed,
       forwardX: listenerForward.x,
       forwardZ: listenerForward.z,
-      driving: drive.driving,
+      // A pilot is no more arrestable on foot than a driver is.
+      driving: drive.driving || air.flying,
     });
     combat.update(dt, {
-      driving: drive.driving,
+      // Flying counts as driving here. `CombatSystem` uses this flag to put
+      // the viewmodel away and refuse the trigger, and both are just as right
+      // in a cockpit as behind a wheel - there are no hands free either way.
+      driving: drive.driving || air.flying,
       playerX: state.x,
       playerY: state.y,
       playerZ: state.z,
@@ -744,7 +1003,17 @@ async function boot(): Promise<void> {
     hud.setHealth(player.health, MAX_HEALTH);
     hud.tick(dt);
     dialogue.update(dt);
-    mission.update(dt);
+    mission.update(dt, {
+      x: state.x,
+      y: state.y,
+      z: state.z,
+      // Only when actually in an aircraft. The mission's flying stages test
+      // for the presence of this, so handing it a resting object on foot
+      // would let somebody "land" by standing still on the apron.
+      flight: air.flying
+        ? { altitude: air.altitudeAgl, speed: air.groundSpeed, onGround: air.onGround }
+        : undefined,
+    });
     for (const person of missionCast) person.character.update(dt);
     damageFeedback.update(dt, {
       health: player.health / MAX_HEALTH,
@@ -754,6 +1023,17 @@ async function boot(): Promise<void> {
       z: state.z,
     });
 
+    aircraft.update(dt, state.x, state.z);
+    airAudio.update(dt, {
+      x: state.x,
+      y: state.y,
+      z: state.z,
+      indoors: state.indoors,
+      inCockpit: air.flying,
+      airfieldDistance: Math.hypot(state.x - RUNWAY.centreX, state.z - airfieldMidZ),
+    });
+
+    terminal.update(dt, { x: state.x, y: state.y, z: state.z, time: elapsed });
     shop.update(dt, { x: state.x, z: state.z });
     furnishings.update(state.x, state.z);
 
@@ -809,11 +1089,20 @@ async function boot(): Promise<void> {
       crowd: pedestrians.group,
     });
 
+    policeAudio.update(dt, {
+      x: state.x,
+      y: state.y,
+      z: state.z,
+      indoors: state.indoors,
+      // Reused scratch, consumed inside this call and never retained.
+      units: police.pursuitAudio,
+    });
+
     // Chunk visibility is cheap but pointless to recompute every frame.
     chunkTimer += dt;
     if (chunkTimer > 0.25) {
       chunkTimer = 0;
-      updateChunks(chunks, state.x, state.z, quality);
+      updateChunks(chunks, state.x, state.z, quality, air.flying ? air.altitudeAgl : 0);
     }
 
     statsTimer += dt;
@@ -836,7 +1125,13 @@ async function boot(): Promise<void> {
     }
 
     // One place decides the prompt, so a door and a car can never fight over it.
-    if (drive.driving) {
+    if (air.flying) {
+      hud.setInteractionPrompt(
+        air.onGround && air.groundSpeed < 1.5
+          ? 'Press E to get out'
+          : `${Math.round(air.airspeed * 1.94384)} kt · ${Math.round(air.altitudeAgl)} m`,
+      );
+    } else if (drive.driving) {
       hud.setInteractionPrompt('Press E to get out');
     } else if (interactions.focused) {
       // A mission override of '' means "say nothing here right now", which is
@@ -845,7 +1140,12 @@ async function boot(): Promise<void> {
       hud.setInteractionPrompt(override === null ? interactions.focused.prompt : override || null);
     } else {
       const car = driving.candidateAt(state.x, state.z);
-      hud.setInteractionPrompt(car ? `Press E to drive the ${car.kind}` : null);
+      if (car) {
+        hud.setInteractionPrompt(`Press E to drive the ${car.kind}`);
+      } else {
+        const plane = flying.candidateAt(state.x, state.z);
+        hud.setInteractionPrompt(plane ? `Press E to board the ${plane.label}` : null);
+      }
     }
 
     const street = nearestStreetName(plan, state.x, state.z);
@@ -925,14 +1225,20 @@ async function boot(): Promise<void> {
     signals.dispose();
     streetAudio.dispose();
     combatAudio.dispose();
+    policeAudio.dispose();
     damageFeedback.dispose();
     dialogue.dispose();
     mission.dispose();
     for (const person of missionCast) person.character.dispose();
     shop.dispose();
+    terminal.dispose();
+    airportModels.dispose();
     furnishings.dispose();
     combat.dispose();
     police.dispose();
+    flying.dispose();
+    aircraft.dispose();
+    airAudio.dispose();
     for (const chunk of chunks) chunk.dispose();
   });
 
@@ -1177,6 +1483,29 @@ async function boot(): Promise<void> {
       get crowd(): unknown {
         return pedestrians.stats;
       },
+      /**
+       * Aircraft and flight, for automated QA.
+       *
+       * `place(type, x, z, heading?, altitude?)` puts the player in a trimmed
+       * cruise at an altitude, so an airborne check does not have to fly a
+       * take-off first - the same reason `look` exists for the camera.
+       */
+      air: airQaSection(aircraft, flying),
+      /** Airport terminal population, for automated QA. */
+      get travellers(): unknown {
+        return terminal.stats;
+      },
+      /** Whether the world is currently frozen behind a menu. */
+      get paused(): boolean {
+        return engine.isPaused;
+      },
+      /**
+       * Simulated seconds. Frozen while paused, which is the cheapest way for
+       * a test to PROVE the pause rather than eyeballing a screenshot.
+       */
+      get simulatedTime(): number {
+        return engine.simulatedTime;
+      },
       get counts() {
         return {
           parcels: plan.parcels.length,
@@ -1197,17 +1526,35 @@ function updateChunks(
   x: number,
   z: number,
   quality: QualityLevel,
+  altitude = 0,
 ): void {
   // Fog swallows the far side of the city, so chunks past the fade distance can
   // stop submitting draw calls entirely.
-  const visibleRange = quality === 'low' ? 260 : quality === 'medium' ? 340 : 460;
+  const base = quality === 'low' ? 260 : quality === 'medium' ? 340 : 460;
+  /*
+   * ALTITUDE HAS TO WIDEN THIS.
+   *
+   * `distanceTo` is a plan-view distance, which is right for somebody walking
+   * down a street with buildings either side of them and wrong the moment they
+   * are looking down at the city from a thousand feet: at ground level a chunk
+   * 500 m away is behind fog and behind other buildings, and from the air it
+   * is the middle of the view. Leaving the range alone made the world switch
+   * itself off in a ring around the aircraft.
+   *
+   * A straight sum rather than anything cleverer: the horizon really does grow
+   * about linearly with height at these distances, and the cost is bounded
+   * because the whole city is a handful of merged chunks - at 300 m every one
+   * of them is drawn, which is the intended answer.
+   */
+  const visibleRange = base + Math.min(altitude, 400) * 2.6;
+  // Shadows are not widened. A shadow map stretched over the whole city is
+  // pure blur, and nothing casting one is legible from that height anyway.
   const shadowRange = quality === 'low' ? 0 : 110;
   for (const chunk of chunks) {
     const distance = chunk.distanceTo(x, z);
     chunk.setVisible(distance < visibleRange);
     chunk.setShadowsEnabled(distance < shadowRange);
   }
-
 }
 
 function nearestStreetName(

@@ -58,11 +58,30 @@ import { clamp, damp } from '../core/mathx';
 import { createRng, type Rng } from '../core/rng';
 import { ACTOR_HEALTH } from '../combat/ballistics';
 import { hasLineOfSight, type WorldRayIndex } from '../combat/rays';
-import type { ActorTarget, DamageResult, LawTargets } from '../combat/targets';
+import type { ActorTarget, Blow, DamageResult, LawTargets } from '../combat/targets';
 import type { PlayerState } from '../player/PlayerState';
 import type { CollisionWorld } from '../player/Collision';
 import type { VehicleHandle, VehicleKind, VehicleView } from '../traffic/types';
 import { Beacons, type BeaconPose } from './Beacons';
+
+/**
+ * One pursuit car, as the audio layer wants to hear it.
+ *
+ * Declared here and structurally compatible with `PursuitUnit` in
+ * `src/audio/PoliceAudio.ts` rather than imported from it: the police
+ * simulation must not depend on the audio layer, and this way either can be
+ * tested without the other.
+ */
+export interface PursuitAudioUnit {
+  readonly id: number;
+  readonly x: number;
+  readonly y: number;
+  readonly z: number;
+  readonly siren: boolean;
+  readonly speed: number;
+  readonly vx: number;
+  readonly vz: number;
+}
 import { makeOfficer, OfficerRig, type OfficerPose } from './OfficerRig';
 import {
   ABANDON_DISTANCE,
@@ -128,6 +147,45 @@ const REVERSE_SPEED = 4.5;
 const LOST_PATIENCE = 22;
 /** Seconds an officer presses into something before going round it. */
 const BLOCKED_PATIENCE = 1;
+
+// -- bodies -----------------------------------------------------------------
+//
+// A SHOT OFFICER IS A BODY, NOT A DELETION. `damage` used to set the state to
+// 'down' and `updateOfficers` spliced them out of the array in the same call -
+// and `update` runs `updateOfficers` BEFORE `writeVisuals`, so a killed officer
+// was never once drawn on the ground. They vanished on the frame they died.
+//
+// The numbers below are the crowd's, for the civilians it already lays in the
+// road: see `THROW_SHARE`, `THROW_MAX`, `THROW_DRAG`, `CASUALTY_TIME` and
+// `LOD_NEAR` in `src/agents/crowd.ts`. They are duplicated rather than imported
+// because `src/agents` is another workstream's, and a body in the street has to
+// read as one game whoever it was.
+
+/** Fraction of the striking speed a body is thrown at. */
+const THROW_SHARE = 0.55;
+/** Fastest a body is thrown, m/s. Above this it looks like a rag doll. */
+const THROW_MAX = 6;
+/** How quickly a thrown body scrubs off speed on the ground, per second. */
+const THROW_DRAG = 4.5;
+/** Seconds a body lies in the street before its slot may be reused. */
+const CASUALTY_TIME = 60;
+/**
+ * How far the player has to be before a body is allowed to disappear.
+ *
+ * The crowd's `LOD_NEAR`. A casualty is scenery until the player has walked
+ * away from them; nobody may watch a body blink out.
+ */
+const BODY_KEEP_RANGE = 42;
+/**
+ * Bodies kept at once, across the whole response.
+ *
+ * The officer mesh has room for `MAX_OFFICERS` live officers plus this, so a
+ * body never costs a living officer their instance slot. Beyond it the oldest
+ * body is dropped, which by then is the one furthest from the fight.
+ */
+const MAX_BODIES = 6;
+/** Below this a sliding body has stopped. */
+const SLIDE_STOP = 0.05;
 /** How long one detour lasts, and how far off the direct line it goes. */
 const DETOUR_SECONDS = 2.4;
 const DETOUR_ANGLE = 1.15;
@@ -161,6 +219,9 @@ interface Officer extends OfficerPose {
   /** Seconds the arrest conditions have held continuously. */
   held: number;
   seesPlayer: boolean;
+  /** Where a thrown body is still sliding to. Zero for anybody on their feet. */
+  vx: number;
+  vz: number;
 }
 
 interface Unit {
@@ -248,6 +309,8 @@ export interface PoliceStats {
   readonly dispatched: number;
   readonly arrests: number;
   readonly officersDown: number;
+  /** Bodies still lying in the street. Diagnostics and automated QA. */
+  readonly bodies: number;
   readonly vehiclesWrecked: number;
   readonly unmarked: number;
   /** Which officer mesh is live. `procedural` means the bake failed to load. */
@@ -270,6 +333,8 @@ export class PoliceSystem implements LawTargets {
   private readonly units: Unit[] = [];
   private readonly officers: Officer[] = [];
   private readonly beaconPoses: BeaconPose[] = [];
+  /** Reused by `pursuitAudio`. Never retained by the caller. */
+  private readonly audioUnits: PursuitAudioUnit[] = [];
   /** Reused so writing the rig allocates nothing per frame. */
   private readonly onFoot: Officer[] = [];
   private dispatchTimer = 0;
@@ -316,7 +381,9 @@ export class PoliceSystem implements LawTargets {
     this.rng = createRng(options.seed ?? 'meridian-police');
     this.field = new PursuitField(options.network);
     this.effects = options.effects ?? null;
-    this.rig = new OfficerRig(MAX_OFFICERS, options.quality !== 'low');
+    // Room for every live officer AND every body, so a casualty on the
+    // pavement can never push a living officer out of the instance buffer.
+    this.rig = new OfficerRig(MAX_OFFICERS + MAX_BODIES, options.quality !== 'low');
     this.beacons = new Beacons(MAX_UNITS);
 
     const group = new Group();
@@ -346,14 +413,14 @@ export class PoliceSystem implements LawTargets {
     }
   }
 
-  damage(id: number, amount: number): DamageResult {
+  damage(id: number, amount: number, blow?: Blow): DamageResult {
     const officer = this.officers.find((o) => o.id === id);
     if (!officer || officer.state === 'down' || amount <= 0) return 'none';
     officer.health -= amount;
     this.makeHostile();
     if (officer.health > 0) return 'hurt';
-    officer.state = 'down';
     officer.health = 0;
+    this.knockDown(officer, blow);
     this.counters.officersDown += 1;
     return 'killed';
   }
@@ -428,6 +495,7 @@ export class PoliceSystem implements LawTargets {
       stars: this.options.player.wanted,
       units: this.units.length,
       officers: this.officers.filter((o) => o.state === 'chasing').length,
+      bodies: this.bodyCount,
       pursued: this.pursuedNow,
       officerModel: this.rig.ready ? 'baked' : 'procedural',
       dispatchIn: this.remainingDelay(),
@@ -619,8 +687,12 @@ export class PoliceSystem implements LawTargets {
     handle.setPose({ x: unit.x, z: unit.z, yaw: unit.yaw, speed: unit.speed });
 
     const crew = officersPerCar(stars);
+    // LIVE officers, not entries in the array: bodies stay in it for a minute
+    // and must not count against the city's ability to send anybody else.
+    let live = this.officers.length - this.bodyCount;
     for (let i = 0; i < crew; i += 1) {
-      if (this.officers.length >= MAX_OFFICERS) break;
+      if (live >= MAX_OFFICERS) break;
+      live += 1;
       const look = makeOfficer(this.nextOfficerId * 37 + unit.id);
       const officer: Officer = {
         id: this.nextOfficerId,
@@ -636,6 +708,11 @@ export class PoliceSystem implements LawTargets {
         detourSide: i % 2 === 0 ? 1 : -1,
         held: 0,
         seesPlayer: false,
+        vx: 0,
+        vz: 0,
+        down: false,
+        downFor: 0,
+        fallSign: 1,
         x: unit.x,
         y: this.options.heightAt(unit.x, unit.z),
         z: unit.z,
@@ -901,18 +978,18 @@ export class PoliceSystem implements LawTargets {
     const player = this.options.player;
     const hostile = this.hostileUntil > ctx.time || shootsOnSight(stars);
 
+    // BODIES FIRST, AND IN THEIR OWN PASS. The live-officer loop below returns
+    // outright when somebody makes an arrest, and a corpse must not stop
+    // falling because the player got cuffed on the other side of the street.
     for (let i = this.officers.length - 1; i >= 0; i -= 1) {
       const officer = this.officers[i];
-      if (!officer) continue;
+      if (!officer || officer.state !== 'down') continue;
+      if (this.stepDown(officer, dt, ctx)) this.officers.splice(i, 1);
+    }
 
-      if (officer.state === 'down') {
-        officer.seesPlayer = false;
-        this.officers.splice(i, 1);
-        const crew = officer.unit.officers;
-        const at = crew.indexOf(officer);
-        if (at >= 0) crew.splice(at, 1);
-        continue;
-      }
+    for (let i = this.officers.length - 1; i >= 0; i -= 1) {
+      const officer = this.officers[i];
+      if (!officer || officer.state === 'down') continue;
 
       if (officer.state === 'riding') {
         // Riding officers travel with the car and are not shootable; the car is.
@@ -1049,6 +1126,125 @@ export class PoliceSystem implements LawTargets {
     }
   }
 
+  // -- bodies ---------------------------------------------------------------
+
+  /** Bodies currently lying in the street. */
+  private get bodyCount(): number {
+    let n = 0;
+    for (const officer of this.officers) if (officer.state === 'down') n += 1;
+    return n;
+  }
+
+  /**
+   * Lays an officer down, thrown the way the blow was travelling.
+   *
+   * The crowd's `knockDown`, for the people who wear uniforms: topple away from
+   * wherever the blow came from - shoved the way they were already facing goes
+   * onto the face, shoved against it goes over backwards - and slide.
+   *
+   * They come OFF THE CREW here and stay in `this.officers`. That is the whole
+   * of how a body outlives the car it arrived in: `retire` walks the crew, and
+   * a body is no longer on it.
+   */
+  private knockDown(officer: Officer, blow?: Blow): void {
+    officer.state = 'down';
+    officer.down = true;
+    officer.downFor = 0;
+    officer.aim = 0;
+    officer.aiming = 0;
+    officer.gait = 0;
+    officer.held = 0;
+    officer.blocked = 0;
+    officer.detour = 0;
+    officer.seesPlayer = false;
+    officer.speed = 0;
+
+    const dirX = blow?.dirX ?? 0;
+    const dirZ = blow?.dirZ ?? 0;
+    // `heading` is the direction the model FACES, which is -(sin, cos).
+    const facingX = -Math.sin(officer.heading);
+    const facingZ = -Math.cos(officer.heading);
+    officer.fallSign = dirX * facingX + dirZ * facingZ > 0 ? -1 : 1;
+    const thrown = Math.min(THROW_MAX, Math.max(0, blow?.speed ?? 0) * THROW_SHARE);
+    officer.vx = dirX * thrown;
+    officer.vz = dirZ * thrown;
+
+    const crew = officer.unit.officers;
+    const at = crew.indexOf(officer);
+    if (at >= 0) crew.splice(at, 1);
+
+    this.trimBodies();
+  }
+
+  /**
+   * One frame of being dead. Returns true when the body may be taken away.
+   *
+   * Deliberately not routed through the walking update: a body has no target,
+   * no arrest to make and no opinion about cover, and putting it through that
+   * code would have it crawl toward the player on its back.
+   */
+  private stepDown(officer: Officer, dt: number, ctx: PoliceContext): boolean {
+    officer.downFor += dt;
+
+    const speed = Math.hypot(officer.vx, officer.vz);
+    if (speed > SLIDE_STOP) {
+      const drag = Math.max(0, 1 - THROW_DRAG * dt);
+      officer.vx *= drag;
+      officer.vz *= drag;
+      // Resolved against the world like a walking officer is: being shot is
+      // not a licence to slide through a wall.
+      const moved = this.options.collision.move(
+        officer.x,
+        officer.z,
+        officer.vx * dt,
+        officer.vz * dt,
+        officer.y,
+        OFFICER_HEIGHT,
+        OFFICER_RADIUS,
+      );
+      officer.x = moved.x;
+      officer.z = moved.z;
+      officer.y = this.options.heightAt(officer.x, officer.z);
+    } else if (officer.vx !== 0 || officer.vz !== 0) {
+      officer.vx = 0;
+      officer.vz = 0;
+      // One last sample, so a body that came to rest on a kerb is on the kerb.
+      officer.y = this.options.heightAt(officer.x, officer.z);
+    }
+
+    if (officer.downFor <= CASUALTY_TIME) return false;
+    // A minute is up, but a body still does not disappear while it is being
+    // looked at. It goes when the player has walked away from it.
+    const distance = Math.hypot(officer.x - ctx.playerX, officer.z - ctx.playerZ);
+    return distance > BODY_KEEP_RANGE;
+  }
+
+  /**
+   * Keeps the number of bodies bounded.
+   *
+   * The oldest goes first, which in a running firefight is the one furthest
+   * from where the fight now is. Without a cap a long chase would fill the
+   * officer mesh with corpses.
+   */
+  private trimBodies(): void {
+    let bodies = this.bodyCount;
+    while (bodies > MAX_BODIES) {
+      let oldest = -1;
+      let age = -1;
+      for (let i = 0; i < this.officers.length; i += 1) {
+        const officer = this.officers[i];
+        if (!officer || officer.state !== 'down') continue;
+        if (officer.downFor > age) {
+          age = officer.downFor;
+          oldest = i;
+        }
+      }
+      if (oldest < 0) return;
+      this.officers.splice(oldest, 1);
+      bodies -= 1;
+    }
+  }
+
   private fireAtPlayer(officer: Officer, stars: number, ctx: PoliceContext): void {
     const muzzleY = officer.y + OFFICER_EYE * 0.86;
     const targetY = ctx.playerY + 1.1;
@@ -1096,7 +1292,10 @@ export class PoliceSystem implements LawTargets {
       if (!gone) continue;
 
       // Officers whose car is retired leave with it; their agent is ours, so
-      // unlike a civilian they really do disappear.
+      // unlike a civilian they really do disappear. A BODY DOES NOT: it was
+      // taken off the crew the moment it went down, so retiring the car it
+      // arrived in cannot make it vanish out from under the player. Bodies
+      // leave on their own terms, in `stepDown`.
       for (const officer of unit.officers) {
         const at = this.officers.indexOf(officer);
         if (at >= 0) this.officers.splice(at, 1);
@@ -1156,6 +1355,40 @@ export class PoliceSystem implements LawTargets {
     return hasLineOfSight(world, x, y, z, ctx.playerX - px, eyeY, ctx.playerZ - pz);
   }
 
+  /**
+   * Live pursuit units, for the audio layer.
+   *
+   * The same loop `writeVisuals` runs for the beacons, and for the same
+   * reason: `unitReport` allocates and rounds and says so in its own comment,
+   * so it cannot be called at 120 Hz. This reuses one scratch array and is
+   * safe to read every frame - but the array is REUSED, so a caller must
+   * consume it during the frame and never retain it.
+   *
+   * `siren` follows the light bar. A unit that is driving or holding station
+   * on a live pursuit has both on; one that has been stood down or wrecked has
+   * neither, and is voiced as an ordinary engine.
+   */
+  get pursuitAudio(): readonly PursuitAudioUnit[] {
+    this.audioUnits.length = 0;
+    for (const unit of this.units) {
+      const view = unit.handle.view;
+      const lit = unit.state === 'driving' || unit.state === 'holding';
+      this.audioUnits.push({
+        id: unit.id,
+        x: unit.x,
+        y: view.y,
+        z: unit.z,
+        siren: lit,
+        speed: Math.abs(unit.speed),
+        // Forward is the game's own convention, so the Doppler shift agrees
+        // with which way the car is actually pointing.
+        vx: -Math.sin(unit.yaw) * unit.speed,
+        vz: -Math.cos(unit.yaw) * unit.speed,
+      });
+    }
+    return this.audioUnits;
+  }
+
   private writeVisuals(time: number): void {
     this.beaconPoses.length = 0;
     for (const unit of this.units) {
@@ -1172,8 +1405,13 @@ export class PoliceSystem implements LawTargets {
     }
     this.beacons.write(this.beaconPoses, time);
     this.onFoot.length = 0;
+    // Living officers first, so if the buffer ever did run short it is a body
+    // that is dropped and not somebody still shooting.
     for (const officer of this.officers) {
       if (officer.state === 'chasing') this.onFoot.push(officer);
+    }
+    for (const officer of this.officers) {
+      if (officer.state === 'down') this.onFoot.push(officer);
     }
     this.rig.write(this.onFoot, time);
   }

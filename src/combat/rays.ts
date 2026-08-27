@@ -137,6 +137,61 @@ export function rayOrientedBox(
   );
 }
 
+/** Where on a box a point is nearest, and how far away that is. */
+export interface BoxPoint {
+  x: number;
+  y: number;
+  z: number;
+  /** Metres from the query point to the box. Zero when the point is inside. */
+  distance: number;
+}
+
+/**
+ * The point of a yaw-rotated box nearest an arbitrary point in space.
+ *
+ * A BLAST IS NOT MEASURED CENTRE TO CENTRE. A box truck is 6.7 m long, so its
+ * centre is 3.35 m from its own bumper: a warhead landing on that bumper is
+ * 3.35 m from the vehicle by the centre measure and inside a 9.5 m radius by
+ * over a third of its falloff. The same arithmetic is what decides where the
+ * shockwave pushed the body, so the contact point comes back too.
+ *
+ * Written into `out` so a detonation walking a street of parked cars does not
+ * allocate. Axis convention matches `rayOrientedBox`: local X is across the
+ * vehicle (`halfWidth`) and local Z runs nose to tail (`halfLength`).
+ */
+export function nearestPointOnOrientedBox(
+  px: number,
+  py: number,
+  pz: number,
+  cx: number,
+  cy: number,
+  cz: number,
+  yaw: number,
+  halfLength: number,
+  halfWidth: number,
+  halfHeight: number,
+  out: BoxPoint,
+): BoxPoint {
+  const sin = Math.sin(yaw);
+  const cos = Math.cos(yaw);
+  const rx = px - cx;
+  const rz = pz - cz;
+  const lx = rx * cos - rz * sin;
+  const ly = py - cy;
+  const lz = rx * sin + rz * cos;
+
+  const qx = lx < -halfWidth ? -halfWidth : lx > halfWidth ? halfWidth : lx;
+  const qy = ly < -halfHeight ? -halfHeight : ly > halfHeight ? halfHeight : ly;
+  const qz = lz < -halfLength ? -halfLength : lz > halfLength ? halfLength : lz;
+
+  out.distance = Math.hypot(lx - qx, ly - qy, lz - qz);
+  // Back out of the box's frame: the inverse of the rotation above.
+  out.x = cx + qx * cos + qz * sin;
+  out.y = cy + qy;
+  out.z = cz - qx * sin + qz * cos;
+  return out;
+}
+
 /**
  * A standing person: a vertical cylinder from `footY` to `footY + height`.
  *

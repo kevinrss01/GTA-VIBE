@@ -126,6 +126,23 @@ export const PROP_SPECS: Readonly<Record<PropKey, PropSpec>> = {
   cafeTable: { width: 0.72, depth: 0.72, height: 0.74, collider: { halfX: 0.3, halfZ: 0.3, top: 0.74 } },
   cafeChair: { width: 0.44, depth: 0.44, height: 0.88, collider: null },
   newsBox: { width: 0.55, depth: 0.47, height: 1.07, collider: { halfX: 0.27, halfZ: 0.23, top: 1.07 } },
+  /*
+   * Airside ground equipment.
+   *
+   * Sized from the real machines, because the whole point of parking a tug
+   * beside an aircraft is scale: a baggage tug is 2.9 m long and just under
+   * 2 m tall, air stairs reach a 2.1 m sill on a turboprop, and a bowser is a
+   * 7 m truck. The heights are what the generated models are fitted to; the
+   * widths and depths are then the models' own proportions and are what the
+   * scatterer spaces.
+   */
+  airStairs: { width: 2.0, depth: 4.2, height: 3.4, collider: { halfX: 1.0, halfZ: 2.1, top: 3.4 } },
+  baggageTug: { width: 1.5, depth: 2.9, height: 1.9, collider: { halfX: 0.75, halfZ: 1.45, top: 1.9 } },
+  baggageCart: { width: 1.6, depth: 3.1, height: 1.6, collider: { halfX: 0.8, halfZ: 1.55, top: 1.6 } },
+  fuelBowser: { width: 2.5, depth: 7.0, height: 2.9, collider: { halfX: 1.25, halfZ: 3.5, top: 2.9 } },
+  gpuCart: { width: 1.2, depth: 2.0, height: 1.3, collider: { halfX: 0.6, halfZ: 1.0, top: 1.3 } },
+  /* The sock itself is out of reach; only the mast is worth colliding with. */
+  windsock: { width: 1.2, depth: 3.4, height: 6.5, collider: { halfX: 0.14, halfZ: 0.14, top: 6.5 } },
   mooringBollard: {
     width: 0.6,
     depth: 0.6,
@@ -1219,6 +1236,103 @@ function mooringBollard(set: PartSet): void {
   );
 }
 
+/**
+ * Airside ground equipment, as procedural massing.
+ *
+ * Every one of these is replaced at runtime by a generated model - see
+ * `airport/models.ts` - so what is wanted here is the silhouette that reads
+ * correctly if the download fails, not detail. A tug is a box on wheels with a
+ * cab; a bowser is a tank on a chassis; air stairs are a flight and a rail.
+ */
+function wheels(set: PartSet, halfX: number, halfZ: number, radius: number): void {
+  for (const sx of [-1, 1] as const) {
+    for (const sz of [-1, 1] as const) {
+      const g = new CylinderGeometry(radius, radius, 0.22, 8);
+      g.rotateZ(Math.PI / 2);
+      g.translate(sx * halfX, radius, sz * halfZ);
+      set.add('metalDark', g);
+    }
+  }
+}
+
+function airStairs(set: PartSet): void {
+  const steps = 9;
+  for (let i = 0; i < steps; i += 1) {
+    const y = 0.45 + (i * 2.5) / steps;
+    const z = 1.7 - (i * 3.0) / steps;
+    set.add('metalLight', boxOn(1.5, 0.06, 0.34, 0, y, z));
+  }
+  set.add('metalLight', boxOn(1.8, 0.12, 1.2, 0, 3.28, -1.5)); // top platform
+  for (const sx of [-1, 1] as const) {
+    set.add('metalLight', box(0.07, 3.4, 0.07, sx * 0.85, 1.7, -1.5));
+    set.add('metalLight', box(0.06, 0.06, 3.6, sx * 0.85, 2.05, 0.2));
+  }
+  set.add('paintedMetal', boxOn(1.9, 0.5, 4.0, 0, 0.28, 0));
+  wheels(set, 0.85, 1.7, 0.28);
+}
+
+function baggageTug(set: PartSet): void {
+  set.add('paintedMetal', boxOn(1.4, 0.55, 2.8, 0, 0.3, 0));
+  set.add('paintedMetal', boxOn(1.2, 0.9, 1.1, 0, 0.85, -0.6));
+  set.add('glassDark', boxOn(1.1, 0.55, 0.06, 0, 1.0, -1.14));
+  set.add('metalDark', boxOn(0.9, 0.06, 0.9, 0, 1.85, -0.6));
+  for (const sx of [-1, 1] as const) set.add('metalDark', box(0.06, 0.95, 0.06, sx * 0.5, 1.38, -0.6));
+  wheels(set, 0.62, 1.05, 0.3);
+}
+
+function baggageCart(set: PartSet): void {
+  set.add('metalDark', boxOn(1.5, 0.12, 3.0, 0, 0.42, 0));
+  set.add('canvasAwning', boxOn(1.5, 0.08, 3.0, 0, 1.5, 0));
+  for (const sx of [-1, 1] as const) {
+    for (const sz of [-1, 1] as const) {
+      set.add('metalLight', box(0.06, 1.0, 0.06, sx * 0.7, 1.0, sz * 1.4));
+    }
+    set.add('metalLight', boxOn(0.08, 0.5, 2.9, sx * 0.72, 0.54, 0));
+  }
+  wheels(set, 0.62, 1.15, 0.21);
+}
+
+function fuelBowser(set: PartSet): void {
+  set.add('paintedMetal', boxOn(2.2, 0.6, 6.6, 0, 0.42, 0));
+  const tank = new CylinderGeometry(1.05, 1.05, 4.4, 12);
+  tank.rotateX(Math.PI / 2);
+  tank.translate(0, 2.0, 0.7);
+  set.add('metalLight', tank);
+  set.add('paintedMetal', boxOn(2.0, 1.5, 1.7, 0, 1.02, -2.6));
+  set.add('glassDark', boxOn(1.85, 0.7, 0.06, 0, 1.75, -3.42));
+  set.add('metalDark', boxOn(1.0, 0.9, 0.5, 0, 1.02, 3.0));
+  wheels(set, 0.95, 2.3, 0.42);
+}
+
+function gpuCart(set: PartSet): void {
+  set.add('paintedMetal', boxOn(1.1, 0.85, 1.8, 0, 0.24, 0));
+  set.add('metalDark', boxOn(0.95, 0.2, 1.5, 0, 1.09, 0));
+  for (let i = 0; i < 4; i += 1) {
+    set.add('metalDark', box(0.04, 0.6, 1.4, -0.56 + i * 0.03, 0.62, 0));
+  }
+  set.add('metalDark', box(0.06, 0.9, 0.06, 0, 0.7, -1.0));
+  set.add('rust', boxOn(0.16, 0.16, 0.9, 0.36, 1.29, 0.3));
+  wheels(set, 0.5, 0.72, 0.18);
+}
+
+function windsock(set: PartSet): void {
+  set.add('metalLight', cyl(0.07, 0.11, 6.0, 8, 0, 0, 0));
+  set.add('metalDark', boxOn(1.0, 0.08, 1.0, 0, 0, 0));
+  // Frangible collar and the swivel head.
+  set.add('metalDark', cyl(0.13, 0.13, 0.14, 8, 0, 0.55, 0));
+  set.add('metalDark', cyl(0.09, 0.09, 0.3, 8, 0, 6.0, 0));
+  // The sock: five tapering bands, alternating, hanging away downwind.
+  const bands = 5;
+  for (let i = 0; i < bands; i += 1) {
+    const t0 = i / bands;
+    const r = 0.42 - t0 * 0.24;
+    const g = new CylinderGeometry(r * 0.86, r, 0.64, 10, 1, true);
+    g.rotateX(Math.PI / 2);
+    g.translate(0, 6.15 - t0 * 0.5, 0.4 + i * 0.62);
+    set.add(i % 2 === 0 ? 'canvasAwning' : 'stuccoCream', g);
+  }
+}
+
 const BUILDERS: Readonly<Record<PropKey, (set: PartSet) => void>> = {
   streetLamp,
   bollard,
@@ -1247,6 +1361,12 @@ const BUILDERS: Readonly<Record<PropKey, (set: PartSet) => void>> = {
   busShelter,
   phoneKiosk,
   newsStand,
+  airStairs,
+  baggageTug,
+  baggageCart,
+  fuelBowser,
+  gpuCart,
+  windsock,
 };
 
 /**

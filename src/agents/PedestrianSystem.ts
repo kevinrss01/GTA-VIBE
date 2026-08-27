@@ -361,8 +361,17 @@ export class PedestrianSystem {
    * about one. Returns false when nobody was close enough - the pool slot may
    * have been recycled between the shot and the call.
    */
-  downAt(x: number, _y: number, z: number, radius = DOWN_SEARCH): boolean {
-    return this.crowd.downNearest(x, z, radius, true);
+  downAt(
+    x: number,
+    _y: number,
+    z: number,
+    radius = DOWN_SEARCH,
+    dirX?: number,
+    dirZ?: number,
+  ): boolean {
+    // `dirX`/`dirZ` are the SHOT's direction of travel, not a direction to the
+    // shooter. Omitted, the crowd falls back to the victim's own facing.
+    return this.crowd.downNearest(x, z, radius, true, dirX, dirZ);
   }
 
   /**

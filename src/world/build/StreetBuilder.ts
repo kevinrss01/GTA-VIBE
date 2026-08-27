@@ -30,8 +30,10 @@ import { BufferAttribute, BufferGeometry, Matrix4 } from 'three';
 import { hash2 } from '../../core/rng';
 import type { MaterialKey } from '../../render/materials';
 import {
+  blockAprons,
   blockSurfaceY,
   corridorHalfWidth,
+  courtyardSurfaceAt,
   KERB_HEIGHT,
   type CityBlock,
   type CityPlan,
@@ -1077,6 +1079,10 @@ function approach(
  * gravel paths `CityGround.sample` reports underfoot.
  */
 export function buildBlockGround(block: CityBlock, _plan: CityPlan, sink: GeometrySink): void {
+  // The airfield platform is a block only so `districtAt` has an answer out
+  // there. Its ground belongs to the airport builder, which draws runway,
+  // taxiway, apron and grass to their own survey.
+  if (block.kind === 'airfield') return;
   const buffer = new SurfaceBuffer();
   const { rect } = block;
   const lift = (x: number, z: number): number => blockSurfaceY(block, x, z) - landElevation(x, z);
@@ -1105,35 +1111,25 @@ function buildCourtyardGround(
   const hardX = alley ? [alley.rect.minX, alley.rect.maxX] : [];
   const hardZ = alley ? [alley.rect.minZ, alley.rect.maxZ] : [];
 
-  // Two service aprons per block, placed from the block's own hash so they land
-  // in the same spot every build.
-  const aprons: WorldRect[] = [];
-  for (let i = 0; i < 2; i += 1) {
-    const u = hash2(rect.minX + i * 11, rect.minZ, 71);
-    const v = hash2(rect.minZ + i * 13, rect.maxX, 72);
-    const w = 4.5 + hash2(rect.maxX, rect.minZ + i, 73) * 4.5;
-    const d = 4.0 + hash2(rect.minX, rect.maxZ + i, 74) * 4.0;
-    const x0 = rect.minX + u * Math.max(0, rect.maxX - rect.minX - w);
-    const z0 = rect.minZ + v * Math.max(0, rect.maxZ - rect.minZ - d);
-    const apron = { x0, z0, x1: x0 + w, z1: z0 + d };
-    aprons.push(apron);
-    hardX.push(apron.x0, apron.x1);
-    hardZ.push(apron.z0, apron.z1);
+  // The aprons come from `blockAprons`, which `CityGround.sample` also reads:
+  // one table, so the tarmac drawn here is the tarmac heard underfoot.
+  for (const apron of blockAprons(rect)) {
+    hardX.push(apron.minX, apron.maxX);
+    hardZ.push(apron.minZ, apron.maxZ);
   }
+
+  const surfaceKeys: Readonly<Record<'pavement' | 'asphalt' | 'gravel', MaterialKey>> = {
+    pavement: 'pavementDark',
+    asphalt: 'asphaltWorn',
+    gravel: 'gravel',
+  };
 
   const xBreaks = breaks(rect.minX, rect.maxX, hardX, RUN_STEP);
   const zBreaks = breaks(rect.minZ, rect.maxZ, hardZ, RUN_STEP);
-  fillGrid(buffer, xBreaks, zBreaks, (x, z) => {
-    if (alley && x > alley.rect.minX && x < alley.rect.maxX && z > alley.rect.minZ && z < alley.rect.maxZ) {
-      return { key: 'pavementDark', lift: lift(x, z) };
-    }
-    for (const apron of aprons) {
-      if (x > apron.x0 && x < apron.x1 && z > apron.z0 && z < apron.z1) {
-        return { key: 'asphaltWorn', lift: lift(x, z) };
-      }
-    }
-    return { key: 'gravel', lift: lift(x, z) };
-  });
+  fillGrid(buffer, xBreaks, zBreaks, (x, z) => ({
+    key: surfaceKeys[courtyardSurfaceAt(block, x, z)],
+    lift: lift(x, z),
+  }));
 }
 
 function buildPlazaGround(

@@ -28,7 +28,7 @@
 import { InstancedMesh, type Object3D } from 'three';
 
 import { ACTOR_HEALTH } from './ballistics';
-import type { ActorSource, ActorTarget, DamageResult } from './targets';
+import type { ActorSource, ActorTarget, Blow, DamageResult } from './targets';
 
 /** Shoulder radius used for hit tests, scaled by the person's own build. */
 const BODY_RADIUS = 0.32;
@@ -60,7 +60,9 @@ export interface CrowdTargetOptions {
    * Optional hook for a crowd that can be told somebody died. Called once, with
    * the world position of the body. Without it the agent keeps walking.
    */
-  readonly removeAt?: ((x: number, y: number, z: number) => void) | undefined;
+  readonly removeAt?:
+    | ((x: number, y: number, z: number, dirX?: number, dirZ?: number) => void)
+    | undefined;
 }
 
 export class CrowdTargets implements ActorSource {
@@ -68,7 +70,9 @@ export class CrowdTargets implements ActorSource {
   private readonly bodies: Body[] = [];
   private readonly casualties: Casualty[] = [];
   private bodyCount = 0;
-  private readonly removeAt: ((x: number, y: number, z: number) => void) | undefined;
+  private readonly removeAt:
+    | ((x: number, y: number, z: number, dirX?: number, dirZ?: number) => void)
+    | undefined;
 
   /** `group` is `PedestrianSystem.group`. Nothing in it is mutated. */
   constructor(private readonly group: Object3D, options: CrowdTargetOptions = {}) {
@@ -197,7 +201,7 @@ export class CrowdTargets implements ActorSource {
     }
   }
 
-  damage(id: number, amount: number): DamageResult {
+  damage(id: number, amount: number, blow?: Blow): DamageResult {
     const body = this.bodies[id];
     if (!body || id >= this.bodyCount || amount <= 0) return 'none';
     let record = this.recordAt(body.x, body.z);
@@ -211,7 +215,10 @@ export class CrowdTargets implements ActorSource {
     if (record.health > 0) return 'hurt';
     record.down = true;
     record.health = 0;
-    this.removeAt?.(body.x, body.y, body.z);
+    // The blow decides which way they topple. `ActorSource.damage` has
+    // always offered it; this implementation used to drop it on the floor,
+    // so every civilian folded forwards whichever side the shot came from.
+    this.removeAt?.(body.x, body.y, body.z, blow?.dirX, blow?.dirZ);
     return 'killed';
   }
 

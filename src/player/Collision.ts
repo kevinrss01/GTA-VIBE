@@ -92,6 +92,28 @@ export type VehicleSource = (
   sink: VehicleBoxSink,
 ) => void;
 
+/**
+ * Where a move was refused by a vehicle, and by which one.
+ *
+ * `moveBox` reports the geometry of a refusal and nothing else - it has no
+ * opinion about what a collision means. The caller owns the record, passes the
+ * same one every frame so nothing allocates, and reads it after the call:
+ * `id` is -1 when the move was refused by the world or not at all.
+ *
+ * This exists because a car that hits another car has to be able to push it,
+ * and the only thing that knows which car was hit is the test that refused
+ * the step. `MovingBox` carries no back-reference to the traffic system's own
+ * `Vehicle`, and does not need one: the id is enough to name it again.
+ */
+export interface VehicleContact {
+  id: number;
+  /** World contact point: the point on that vehicle nearest the mover's centre. */
+  x: number;
+  /** Mid-height of the two bodies' vertical overlap - roughly bumper height. */
+  y: number;
+  z: number;
+}
+
 /** One vehicle as collision sees it. Pooled and rewritten in place. */
 interface MovingBox {
   id: number;
@@ -361,7 +383,13 @@ export class CollisionWorld {
     return true;
   }
 
-  /** The same test against the dynamic set: one oriented box against others. */
+  /**
+   * The same test against the dynamic set: one oriented box against others.
+   *
+   * `contact`, when given, is filled in with the vehicle that refused the move
+   * and where it was touched. Additive and optional: every existing caller
+   * passes nothing and gets the same boolean it always did.
+   */
   private blockedBoxByVehicle(
     x: number,
     z: number,
@@ -373,6 +401,7 @@ export class CollisionWorld {
     headY: number,
     fromX?: number,
     fromZ?: number,
+    contact?: VehicleContact,
   ): boolean {
     for (let i = 0; i < this.movingCount; i += 1) {
       const body = this.moving[i];
@@ -386,9 +415,41 @@ export class CollisionWorld {
       ) {
         continue;
       }
+      if (contact) CollisionWorld.writeContact(body, x, z, feetY, headY, contact);
       return true;
     }
     return false;
+  }
+
+  /**
+   * The point on one vehicle nearest a position, and the height the two bodies
+   * share.
+   *
+   * Clamping into the vehicle's own forward/lateral axes is exact rather than
+   * conservative, because those axes are orthonormal - the same argument as in
+   * `circleHitsVehicle`. What comes out is a point on the struck car's shell,
+   * which is what decides whether a hit spins it or shunts it square.
+   */
+  private static writeContact(
+    body: MovingBox,
+    x: number,
+    z: number,
+    feetY: number,
+    headY: number,
+    out: VehicleContact,
+  ): void {
+    const dx = x - body.x;
+    const dz = z - body.z;
+    const along = dx * body.fx + dz * body.fz;
+    const across = dx * -body.fz + dz * body.fx;
+    const clampedAlong =
+      along < -body.halfLength ? -body.halfLength : along > body.halfLength ? body.halfLength : along;
+    const clampedAcross =
+      across < -body.halfWidth ? -body.halfWidth : across > body.halfWidth ? body.halfWidth : across;
+    out.id = body.id;
+    out.x = body.x + body.fx * clampedAlong - body.fz * clampedAcross;
+    out.z = body.z + body.fz * clampedAlong + body.fx * clampedAcross;
+    out.y = (Math.max(feetY, body.bottom) + Math.min(headY, body.top)) * 0.5;
   }
 
   /** Separating axis test between one oriented footprint and one vehicle. */
@@ -604,16 +665,33 @@ export class CollisionWorld {
     feetY: number,
     height: number,
     vehicles = false,
+    contact?: VehicleContact,
   ): { x: number; z: number; feetY: number } {
     const fx = -Math.sin(yaw);
     const fz = -Math.cos(yaw);
     let ny = feetY;
+    // Cleared on entry, so a caller that reuses one record across sub-steps
+    // never reads a stale hit. It ends the call holding the last vehicle that
+    // refused a candidate, which is the one the mover is up against.
+    if (contact) contact.id = -1;
 
     const clear = (cx: number, cz: number, atY: number): boolean =>
       !this.blockedBox(cx, cz, yaw, halfLength, halfWidth, atY, atY + height, x, z) &&
       !(
         vehicles &&
-        this.blockedBoxByVehicle(cx, cz, fx, fz, halfLength, halfWidth, atY, atY + height, x, z)
+        this.blockedBoxByVehicle(
+          cx,
+          cz,
+          fx,
+          fz,
+          halfLength,
+          halfWidth,
+          atY,
+          atY + height,
+          x,
+          z,
+          contact,
+        )
       );
 
     let nx = x;

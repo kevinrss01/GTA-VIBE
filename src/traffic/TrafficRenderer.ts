@@ -221,21 +221,32 @@ export class TrafficRenderer {
       if (!batch || batch.count >= batch.capacity) continue;
 
       const blueprint = vehicle.blueprint;
-      position.set(vehicle.x, vehicle.y, vehicle.z);
+      // `bodyLift` is how far a rolled shell has to come off its own origin to
+      // rest on the road; it is zero for every car on its wheels. The Euler
+      // order is YXZ, so the Z component is a rotation about the body's own
+      // longitudinal axis - roll - which is what lets a car end up on its roof
+      // with no change to the geometry or the draw.
+      position.set(vehicle.x, vehicle.y + vehicle.bodyLift, vehicle.z);
 
-      chassisQuat.setFromEuler(bodyEuler.set(vehicle.groundPitch, vehicle.yaw, vehicle.groundRoll));
+      chassisQuat.setFromEuler(
+        bodyEuler.set(
+          vehicle.groundPitch + vehicle.crashPitch,
+          vehicle.yaw,
+          vehicle.groundRoll + vehicle.crashRoll,
+        ),
+      );
       bodyQuat.setFromEuler(
         bodyEuler.set(
-          vehicle.groundPitch + vehicle.bodyPitch,
+          vehicle.groundPitch + vehicle.bodyPitch + vehicle.crashPitch,
           vehicle.yaw,
-          vehicle.groundRoll + vehicle.bodyRoll,
+          vehicle.groundRoll + vehicle.bodyRoll + vehicle.crashRoll,
         ),
       );
 
       outMatrix.compose(position, bodyQuat, scale);
       const slot = batch.count;
       batch.mesh.setMatrixAt(slot, outMatrix);
-      batch.tint.setXYZ(slot, vehicle.paint[0], vehicle.paint[1], vehicle.paint[2]);
+      TrafficRenderer.writeTint(batch.tint, slot, vehicle.paint, vehicle.damage);
       batch.lights.setXYZW(slot, vehicle.braking ? 1 : 0, vehicle.headlights, 0, 0);
       batch.count = slot + 1;
 
@@ -281,7 +292,7 @@ export class TrafficRenderer {
         outMatrix.multiplyMatrices(chassisMatrix, localMatrix);
         const wheelSlot = wheels.count;
         wheels.mesh.setMatrixAt(wheelSlot, outMatrix);
-        wheels.tint.setXYZ(wheelSlot, vehicle.rim[0], vehicle.rim[1], vehicle.rim[2]);
+        TrafficRenderer.writeTint(wheels.tint, wheelSlot, vehicle.rim, vehicle.damage);
         wheels.lights.setXYZW(wheelSlot, 0, 0, 0, 0);
         wheels.count = wheelSlot + 1;
       }
@@ -296,6 +307,38 @@ export class TrafficRenderer {
       this.drawnWheels = this.wheels.count;
       TrafficRenderer.flush(this.wheels);
     }
+  }
+
+  /**
+   * Per-instance paint, aged by how badly the shell is damaged.
+   *
+   * Damage is shown in the colour the renderer was already writing rather than
+   * with a second mesh, a decal or a material swap, so a wrecked car costs the
+   * same three floats an undamaged one does: no extra draw call, no extra
+   * geometry, nothing to build when a car is hit. Bent panels lose their gloss
+   * before they lose their hue, so the paint is desaturated towards its own
+   * luminance first and darkened second - a written-off red car reads as a
+   * scorched dark red rather than as a grey one.
+   */
+  private static writeTint(
+    attribute: InstancedBufferAttribute,
+    slot: number,
+    paint: readonly [number, number, number],
+    damage: number,
+  ): void {
+    if (damage <= 0) {
+      attribute.setXYZ(slot, paint[0], paint[1], paint[2]);
+      return;
+    }
+    const luminance = paint[0] * 0.2126 + paint[1] * 0.7152 + paint[2] * 0.0722;
+    const flat = Math.min(1, damage) * 0.55;
+    const dim = 1 - Math.min(1, damage) * 0.45;
+    attribute.setXYZ(
+      slot,
+      (paint[0] + (luminance - paint[0]) * flat) * dim,
+      (paint[1] + (luminance - paint[1]) * flat) * dim,
+      (paint[2] + (luminance - paint[2]) * flat) * dim,
+    );
   }
 
   /**

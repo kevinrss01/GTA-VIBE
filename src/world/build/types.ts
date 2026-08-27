@@ -26,6 +26,16 @@ export interface ColliderBox {
   readonly top: number;
   /** Solid boxes block movement; `false` marks a walkable platform such as a step. */
   readonly solid: boolean;
+  /**
+   * What this box is MADE OF, when the builder happens to know.
+   *
+   * Optional, and most builders leave it off. It exists so a bullet striking a
+   * shopfront can throw glass rather than the same pale stone dust every other
+   * surface throws, and so a footstep on a hangar floor is not decided by
+   * guessing from the terrain underneath it. Nothing about collision reads it -
+   * a box with no surface behaves exactly as it always did.
+   */
+  readonly surface?: MaterialKey;
 }
 
 /** A shared prop placed many times through an InstancedMesh. */
@@ -56,7 +66,14 @@ export type PropKey =
   | 'mooringBollard'
   | 'busShelter'
   | 'phoneKiosk'
-  | 'newsStand';
+  | 'newsStand'
+  /* Airside ground equipment and the airfield's own furniture. */
+  | 'airStairs'
+  | 'baggageTug'
+  | 'baggageCart'
+  | 'fuelBowser'
+  | 'gpuCart'
+  | 'windsock';
 
 /** A point light the world wants; the renderer decides how many it can afford. */
 export interface LightRequest {
@@ -138,4 +155,10 @@ export const ALL_PROP_KEYS: readonly PropKey[] = [
   'busShelter',
   'phoneKiosk',
   'newsStand',
+  'airStairs',
+  'baggageTug',
+  'baggageCart',
+  'fuelBowser',
+  'gpuCart',
+  'windsock',
 ];

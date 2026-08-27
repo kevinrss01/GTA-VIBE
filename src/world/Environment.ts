@@ -21,6 +21,8 @@ import { BufferAttribute, BufferGeometry, Matrix4, PlaneGeometry, Vector3 } from
 
 import { createRng, hash2 } from '../core/rng';
 import { clamp, smoothstep } from '../core/mathx';
+import { isHardSurface, type SurfaceId } from './CityGround';
+import { inAirportSite } from './airport/plan';
 import {
   groundElevation,
   landElevation,
@@ -81,6 +83,7 @@ function finish(w: QuadWriter): BufferGeometry | null {
  */
 function buildTerrain(sink: GeometrySink, ground: CityGround): void {
   const grass = newWriter();
+  const gravel = newWriter();
   const sand = newWriter();
   const sandWet = newWriter();
 
@@ -92,15 +95,15 @@ function buildTerrain(sink: GeometrySink, ground: CityGround): void {
    * on the beach hovering six centimetres in the air: they are placed on the
    * height `CityGround` reports, while the mesh under them had been pushed
    * down. Outside the city the two now agree exactly.
+   *
+   * The airfield block is excluded from the block test on purpose: it covers
+   * 210,000 square metres of which two thirds is mown grass that the airport
+   * builder does NOT pave, and sinking all of it would have put every windsock,
+   * sign and fence post on the airfield six centimetres in the air.
    */
-  const sinkAt = (x: number, z: number): number => {
-    const surface = ground.sample(x, z).surface;
-    const covered =
-      surface === 'asphalt' ||
-      surface === 'pavement' ||
-      surface === 'boardwalk' ||
-      surface === 'plaza' ||
-      ground.blockAt(x, z) !== null;
+  const sinkAt = (surface: SurfaceId, x: number, z: number): number => {
+    const block = ground.blockAt(x, z);
+    const covered = isHardSurface(surface) || (block !== null && block.kind !== 'airfield');
     return covered ? 0.06 : 0;
   };
 
@@ -122,22 +125,40 @@ function buildTerrain(sink: GeometrySink, ground: CityGround): void {
       // seabed is never visible through the water at this depth.
       if (height < SEA_LEVEL - 2.6) continue;
 
-      const sink = sinkAt(cx, cz);
+      const surface = ground.sample(cx, cz).surface;
+      const sink = sinkAt(surface, cx, cz);
       a.set(x, groundElevation(x, z) - sink, z);
       b.set(x1, groundElevation(x1, z) - sink, z);
       c.set(x1, groundElevation(x1, z1) - sink, z1);
       d.set(x, groundElevation(x, z1) - sink, z1);
 
+      /*
+       * The material comes from the SAMPLER, not from a second rule of its own.
+       *
+       * It used to be chosen here by distance from the shore, and the sampler
+       * chose independently: the mesh drew sand 18 m inland while the sampler
+       * called it grass past 9 m, and the mesh drew grass over open ground the
+       * sampler was calling gravel two fifths of the time. Both are the same
+       * class of bug - two authorities for one fact - and reading the sampler
+       * makes the surface underfoot the surface on screen by construction.
+       *
+       * A covered quad is never seen, so it keeps the cheap grass writer.
+       */
       const shore = shorelineX(cz);
       const fromShore = cx - shore;
-      // Damp sand in the tidal band, dry sand above it, scrub inland.
-      const writer = fromShore < 5 ? sandWet : fromShore < 18 ? sand : grass;
+      let writer = grass;
+      if (sink === 0) {
+        if (surface === 'sand') writer = fromShore < 5 ? sandWet : sand;
+        else if (surface === 'gravel') writer = gravel;
+      }
       pushQuad(writer, a, b, c, d, 8);
     }
   }
 
   const grassGeometry = finish(grass);
   if (grassGeometry) sink.add('grass', grassGeometry);
+  const gravelGeometry = finish(gravel);
+  if (gravelGeometry) sink.add('gravel', gravelGeometry);
   const sandGeometry = finish(sand);
   if (sandGeometry) sink.add('sand', sandGeometry);
   const wetGeometry = finish(sandWet);
@@ -171,7 +192,15 @@ function buildSeawall(sink: GeometrySink): void {
   const c = new Vector3();
   const d = new Vector3();
 
-  for (let z = WORLD_BOUNDS.minZ + 10; z < WORLD_BOUNDS.maxZ - 10; z += 4) {
+  /*
+   * The wall exists to retain the promenade, and the promenade runs from
+   * z = -152 to 132. Running it the full length of the enlarged world bounds
+   * would have put 800 m of ashlar retaining wall down the empty south-west
+   * beach, holding nothing up, at 25 triangles a metre.
+   */
+  const from = WORLD_BOUNDS.minZ + 10;
+  const to = 186;
+  for (let z = from; z < to; z += 4) {
     const z1 = z + 4;
     // A straight retaining line at the promenade edge, not one that follows the
     // waterline. The wall is what holds the promenade up; letting it wander
@@ -555,29 +584,47 @@ export function buildDistantSkyline(sink: GeometrySink): void {
       haze: 0.72,
       shapes: ['block', 'slab', 'stepped', 'gabled', 'tower'],
     },
-    // The south bank, seen down the long streets.
+    /*
+     * The south bank, and the east ridge beyond the airfield.
+     *
+     * Both MOVED when the world bounds grew for Meridian Bay Regional. The
+     * south arc used to sit at cz = 575 with a 200 m radius, which put its
+     * buildings between z = 375 and 495 - that is the airport forecourt, and
+     * "distant skyline" standing on the terminal roof is not distant. The east
+     * arc at cx = 585 was 115 m outside the new bounds against a 150 m
+     * standoff.
+     *
+     * `clearOfCity` would have pushed both out on its own, but it scales a
+     * point away from the world CENTRE, and for an arc that is nearly centred
+     * that direction is meaningless: measured, the old south arc scattered
+     * west over the bay and clumped into the far-shore downtown. Re-sited by
+     * hand instead, so each still reads as a horizon rather than a handful.
+     *
+     * Distances are chosen against the fog, which is FogExp2 at 0.0016: the
+     * south band sits 280-480 m off the runway's south end, which is 20 to 40
+     * per cent hazed, and the east band 235 m off the platform edge.
+     */
     {
-      cx: 20,
-      cz: 575,
-      radius: 200,
+      cx: 120,
+      cz: 1620,
+      radius: 340,
       from: 3.58,
       to: 5.86,
       jitter: 44,
-      count: 20,
+      count: 22,
       heights: [13, 74],
       footprint: [13, 26],
       haze: 0.86,
       shapes: ['slab', 'stepped', 'tower', 'block', 'stack'],
     },
-    // Beyond the ridge to the east: low, and mostly hidden by the hill.
     {
-      cx: 585,
-      cz: -20,
-      radius: 195,
-      from: 2.05,
-      to: 4.23,
+      cx: 900,
+      cz: 60,
+      radius: 320,
+      from: 1.9,
+      to: 4.38,
       jitter: 40,
-      count: 16,
+      count: 20,
       heights: [10, 44],
       footprint: [12, 24],
       haze: 0.5,
@@ -619,13 +666,36 @@ function scatterOutskirtVegetation(sink: GeometrySink, ground: CityGround): void
   const matrix = new Matrix4();
   const scale = new Vector3();
 
-  for (let i = 0; i < 620; i += 1) {
+  /*
+   * The count scales with the area rather than being a flat 620: the world grew
+   * from 175,000 square metres of outskirt to 845,000 when the airfield was
+   * added, and the same 620 plants over it would have thinned the ridge and the
+   * headland to a fifth of the planting they were tuned at.
+   */
+  /*
+   * Attempts scale with the square root of the area, not with the area.
+   *
+   * The world grew from 175,000 square metres of outskirt to 845,000 when the
+   * airfield was added. Planting it at the original density is 1,523 more
+   * instanced plants, which takes the world from 2,076 prop instances to 3,599
+   * against a measured ceiling of 4,000 - most of it spent on the empty
+   * south-west quarter, which is sea, beach and ground no route goes near.
+   * The square root keeps the ridge and the headland looking planted while
+   * thinning the far field, at 1,102 attempts instead of 2,995.
+   */
+  const area = (WORLD_BOUNDS.maxX - WORLD_BOUNDS.minX) * (WORLD_BOUNDS.maxZ - WORLD_BOUNDS.minZ);
+  const attempts = Math.round(620 * Math.sqrt(area / 174_832));
+
+  for (let i = 0; i < attempts; i += 1) {
     const x = rng.range(WORLD_BOUNDS.minX + 12, WORLD_BOUNDS.maxX - 12);
     const z = rng.range(WORLD_BOUNDS.minZ + 12, WORLD_BOUNDS.maxZ - 12);
 
     // Only outside the loop road, and only on dry land above the beach.
     const insideCity = x > -168 && x < 172 && z > -160 && z < 140;
     if (insideCity) continue;
+    // An airfield is mown, and a tree on the runway strip is an obstacle
+    // clearance failure before it is a rendering one.
+    if (inAirportSite(x, z)) continue;
     if (x < shorelineX(z) + 18) continue;
 
     // Sample through CityGround, not the raw terrain: a point that looks like
