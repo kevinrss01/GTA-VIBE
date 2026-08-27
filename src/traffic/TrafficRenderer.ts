@@ -251,13 +251,18 @@ export class TrafficRenderer {
       const frontAxleZ = mount ? -mount.frontZ : chassis.frontAxle;
       const rearAxleZ = mount ? mount.rearZ : chassis.wheelbase - chassis.frontAxle;
       const halfTrack = mount ? mount.halfTrack : chassis.track / 2;
-      wheelScale.set(blueprint.wheelWidth * 0.5, blueprint.wheelRadius, blueprint.wheelRadius);
+      // The arch the model was cut with, when there is one: a wheel drawn at
+      // the simulation's radius inside a generated arch of a different size is
+      // what put a visible ring of wheel-well liner around every wheel.
+      const wheelRadius =
+        mount && mount.radius > 0.05 ? mount.radius : blueprint.wheelRadius;
+      wheelScale.set(blueprint.wheelWidth * 0.5, wheelRadius, wheelRadius);
       for (let corner = 0; corner < 4; corner += 1) {
         if (wheels.count >= wheels.capacity) break;
         const front = corner < 2;
         const side = corner % 2 === 0 ? -1 : 1;
         // Local space: nose at -Z, so the front axle is at negative z.
-        wheelOffset.set(side * halfTrack, blueprint.wheelRadius, front ? -frontAxleZ : rearAxleZ);
+        wheelOffset.set(side * halfTrack, wheelRadius, front ? -frontAxleZ : rearAxleZ);
         // Steer about the wheel's own vertical, then spin about its axle.
         //
         // The near-side wheels are turned through half a turn as well, exactly

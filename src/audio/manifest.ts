@@ -21,7 +21,16 @@
 import type { DistrictId } from '../world/CityPlan';
 import type { SurfaceId } from '../world/CityGround';
 
-export type AudioAssetKind = 'ambience' | 'step' | 'sfx' | 'music' | 'voice' | 'vehicle';
+export type AudioAssetKind =
+  | 'ambience'
+  | 'step'
+  | 'sfx'
+  | 'music'
+  | 'voice'
+  | 'vehicle'
+  | 'weapon'
+  | 'impact'
+  | 'body';
 
 export type AmbienceBedId =
   | 'ambience/harbour'
@@ -77,6 +86,49 @@ export type VehicleAssetId =
   | 'veh/impact';
 
 /**
+ * Firing a weapon, and being on the receiving end of one.
+ *
+ * Three families, kept apart because they are mixed and triggered differently.
+ * `wpn/*` is the gun in the player's own hands or an officer's, played dry and
+ * close; `imp/*` is what the round arrives at, played positionally at the point
+ * of impact; `plr/*` is the player's own body, played flat with no panning at
+ * all because it is not somewhere in the world, it is you.
+ *
+ * `wpn/smg` is the ONE clip in the manifest that is not a generation of its
+ * own. Four separate renders of a submachine-gun shot all came back between
+ * -39 and -49 dBFS peak with a noise floor only 24 dB below that, so bringing
+ * one up to a usable level would have brought an audible hiss up with it under
+ * a weapon that fires thirteen times a second. The shipped file is the pistol
+ * render - the same 9 mm cartridge, and an excellent one at 0.1 dBFS peak with
+ * a -74.8 dB floor - resampled up and cut short, which is both what a shorter
+ * barrel and a lighter bolt actually sound like and what every game does for a
+ * calibre it shares. See its `postProcess` for the exact command.
+ */
+export type WeaponAssetId =
+  | 'wpn/pistol'
+  | 'wpn/smg'
+  | 'wpn/shotgun'
+  | 'wpn/rifle'
+  | 'wpn/launcher'
+  | 'wpn/explosion'
+  | 'wpn/rocket-flight'
+  | 'wpn/reload'
+  | 'wpn/draw'
+  | 'wpn/holster'
+  | 'wpn/dry'
+  | 'wpn/shell';
+
+export type ImpactAssetId =
+  | 'imp/concrete'
+  | 'imp/metal'
+  | 'imp/flesh'
+  | 'imp/glass'
+  | 'imp/ricochet'
+  | 'imp/debris';
+
+export type BodyAssetId = 'plr/hurt' | 'plr/death' | 'plr/heartbeat' | 'plr/tinnitus';
+
+/**
  * The distant traffic layer. Deliberately not an `AmbienceBedId`: like the sea,
  * it sums on top of whichever land bed is playing at a level taken from the
  * world (here, how much traffic is actually moving nearby) rather than
@@ -91,6 +143,9 @@ export type AudioAssetId =
   | MusicAssetId
   | VoiceAssetId
   | VehicleAssetId
+  | WeaponAssetId
+  | ImpactAssetId
+  | BodyAssetId
   | StreetLayerId;
 
 /** Provenance for a generated asset. Never contains a key or a signed URL. */
@@ -618,6 +673,244 @@ const STREET_LAYER: AudioAsset = {
   ),
 };
 
+// ---------------------------------------------------------------------------
+// Combat
+// ---------------------------------------------------------------------------
+
+const COMBAT_GENERATED_ON = '2026-08-27';
+
+interface CombatSpec {
+  readonly id: WeaponAssetId | ImpactAssetId | BodyAssetId;
+  readonly file: string;
+  readonly kind: 'weapon' | 'impact' | 'body';
+  readonly duration: number;
+  readonly bytes: number;
+  readonly trimDb: number;
+  readonly seconds: number;
+  readonly influence: number;
+  readonly loop?: boolean;
+  readonly prompt: string;
+  readonly postProcess?: string;
+}
+
+/**
+ * Rendered by `tools/generate-combat-sfx.mjs`, which is also where the prompts
+ * live in runnable form. `duration`, `bytes` and the level behind `trimDb` are
+ * ffprobe/volumedetect measurements of the shipped files, not the request.
+ */
+const COMBAT_SPECS: readonly CombatSpec[] = [
+  {
+    id: 'wpn/pistol', file: 'wpn/pistol.mp3', kind: 'weapon',
+    duration: 0.88, bytes: 15090, trimDb: -6.0, seconds: 0.9, influence: 0.75,
+    prompt:
+      'a single 9mm semi-automatic pistol gunshot fired outdoors in the open, one sharp percussive crack with a hard transient, the slide cycling with a light metallic clack straight after it, short dry decay, close dry recording, no reverb, no music, no speech, no other sound',
+  },
+  {
+    id: 'wpn/smg', file: 'wpn/smg.mp3', kind: 'weapon',
+    duration: 0.55, bytes: 10075, trimDb: -5.3, seconds: 0.9, influence: 0.75,
+    prompt:
+      'derived from the pistol render; see postProcess. The four submachine-gun generations are recorded in tools/generate-combat-sfx.mjs and were all rejected on level.',
+    postProcess:
+      'Resampled up 18 per cent and cut to 0.55 s from the pistol render, which ' +
+      'shortens and brightens it the way a shorter barrel and lighter bolt do: ' +
+      'ffmpeg -i wpn/pistol.mp3 -af "asetrate=44100*1.18,aresample=44100,volume=-1dB" ' +
+      '-t 0.55 -c:a libmp3lame -b:a 128k -ar 44100 wpn/smg.mp3',
+  },
+  {
+    id: 'wpn/shotgun', file: 'wpn/shotgun.mp3', kind: 'weapon',
+    duration: 1.28, bytes: 21359, trimDb: -6.0, seconds: 1.3, influence: 0.75,
+    prompt:
+      'a single 12 gauge pump-action shotgun blast fired outdoors, deep heavy boom with a wide low-end thump, followed by the pump sliding back and forward with two solid mechanical clacks, close dry recording, no reverb, no music, no speech, no other sound',
+  },
+  {
+    id: 'wpn/rifle', file: 'wpn/rifle.mp3', kind: 'weapon',
+    duration: 1.0, bytes: 17180, trimDb: -2.3, seconds: 1.0, influence: 0.75,
+    prompt:
+      'a single rifle gunshot from a semi-automatic carbine fired outdoors, a hard high-pressure crack with a supersonic snap and a short bright tail, the bolt cycling with a metallic ring, close dry recording, no reverb, no music, no speech, no other sound',
+    postProcess:
+      'Rendered at -18.7 dBFS peak, which needs more than the +10 dB the trim is ' +
+      'allowed to apply. Peak-normalised offline instead: ' +
+      'ffmpeg -i raw.mp3 -af "volume=15.7dB" -c:a libmp3lame -b:a 128k -ar 44100 wpn/rifle.mp3',
+  },
+  {
+    id: 'wpn/launcher', file: 'wpn/launcher.mp3', kind: 'weapon',
+    duration: 1.76, bytes: 29301, trimDb: -6.0, seconds: 1.8, influence: 0.75,
+    prompt:
+      'a shoulder-fired rocket launcher firing, a deep hollow whoosh of the rocket motor igniting inside the tube with a heavy pressure thump and a rushing back blast of hot gas behind it, the rocket accelerating away, close dry recording, no reverb, no music, no speech, no other sound',
+  },
+  {
+    id: 'wpn/explosion', file: 'wpn/explosion.mp3', kind: 'weapon',
+    duration: 3.0, bytes: 48945, trimDb: -6.0, seconds: 3.0, influence: 0.7,
+    prompt:
+      'a large high-explosive detonation outdoors in a street, a violent cracking blast with an enormous low-frequency thump, a sharp shockwave front, then a long rolling rumble decaying away and small pieces of debris raining down at the end, no music, no speech, no siren',
+  },
+  {
+    id: 'wpn/rocket-flight', file: 'wpn/rocket-flight.mp3', kind: 'weapon',
+    duration: 2.61, bytes: 42675, trimDb: -28.8, seconds: 2.5, influence: 0.7, loop: true,
+    prompt:
+      'seamless looping solid-fuel rocket motor burning in flight, a continuous rushing roar of hot gas with a steady hiss over it, absolutely even with no launch and no impact, no music, no speech',
+  },
+  {
+    id: 'wpn/reload', file: 'wpn/reload.mp3', kind: 'weapon',
+    duration: 1.6, bytes: 26793, trimDb: -6.0, seconds: 1.6, influence: 0.8,
+    prompt:
+      'reloading a handgun, the magazine release clicking and the empty magazine dropping out, a fresh magazine pushed in and seated with a solid clack, then the slide released forward with a metallic snap, close dry recording, no reverb, no music, no speech, no other sound',
+  },
+  {
+    id: 'wpn/draw', file: 'wpn/draw.mp3', kind: 'weapon',
+    duration: 0.8, bytes: 13836, trimDb: -3.5, seconds: 0.8, influence: 0.8,
+    prompt:
+      'drawing a handgun out of a leather holster, a short scrape of steel against leather then a hand settling firmly on the grip, close dry recording, no reverb, no music, no speech, no other sound',
+  },
+  {
+    id: 'wpn/holster', file: 'wpn/holster.mp3', kind: 'weapon',
+    duration: 0.8, bytes: 13836, trimDb: 3.9, seconds: 0.8, influence: 0.8,
+    prompt:
+      'putting a handgun away into a leather holster, a muffled scrape of steel sliding into leather ending with a soft strap snap, close dry recording, no reverb, no music, no speech, no other sound',
+  },
+  {
+    id: 'wpn/dry', file: 'wpn/dry.mp3', kind: 'weapon',
+    duration: 0.48, bytes: 8821, trimDb: -0.8, seconds: 0.5, influence: 0.85,
+    prompt:
+      'a loud sharp metallic click recorded close up, the hammer of an empty handgun falling hard on an empty chamber, one crisp dry snap at full volume and nothing else, close dry recording, no reverb, no music, no speech, no other sound',
+  },
+  {
+    id: 'wpn/shell', file: 'wpn/shell.mp3', kind: 'weapon',
+    duration: 1.0, bytes: 17180, trimDb: -1.9, seconds: 1.0, influence: 0.8,
+    prompt:
+      'two or three small brass cartridge cases bouncing and tinkling on a concrete floor and coming to rest, light bright metallic ringing, close dry recording, no reverb, no music, no speech, no other sound',
+  },
+  {
+    id: 'imp/concrete', file: 'imp/concrete.mp3', kind: 'impact',
+    duration: 0.680249, bytes: 12164, trimDb: -6.0, seconds: 0.7, influence: 0.8,
+    prompt:
+      'a bullet slamming into a concrete wall, a hard dry crack of stone chipping with a puff of dust and a few small fragments falling, close dry recording, no reverb, no music, no speech, no other sound',
+  },
+  {
+    id: 'imp/metal', file: 'imp/metal.mp3', kind: 'impact',
+    duration: 0.8, bytes: 13836, trimDb: 1.6, seconds: 0.8, influence: 0.8,
+    prompt:
+      'a bullet punching through a car body panel, a sharp bright metallic bang with sheet metal ringing and denting afterwards, close dry recording, no reverb, no music, no speech, no other sound',
+  },
+  {
+    id: 'imp/flesh', file: 'imp/flesh.mp3', kind: 'impact',
+    duration: 0.6, bytes: 10493, trimDb: -2.4, seconds: 0.6, influence: 0.8,
+    prompt:
+      'a heavy blunt wet impact into a slab of meat, one dull thick thud with a short wet slap, no voice, close dry recording, no reverb, no music, no speech, no other sound',
+    postProcess:
+      'Rendered at -16.3 dBFS peak, past the trim cap. Peak-normalised offline: ' +
+      'ffmpeg -i raw.mp3 -af "volume=13.3dB" -c:a libmp3lame -b:a 128k -ar 44100 imp/flesh.mp3',
+  },
+  {
+    id: 'imp/glass', file: 'imp/glass.mp3', kind: 'impact',
+    duration: 1.08, bytes: 18434, trimDb: -6.0, seconds: 1.1, influence: 0.8,
+    prompt:
+      'a car side window shattering, a bright sharp burst of breaking tempered glass followed by small cubes of glass falling and scattering on the road, close dry recording, no reverb, no music, no speech, no other sound',
+  },
+  {
+    id: 'imp/ricochet', file: 'imp/ricochet.mp3', kind: 'impact',
+    duration: 0.88, bytes: 15090, trimDb: -4.6, seconds: 0.9, influence: 0.8,
+    prompt:
+      'a bullet ricocheting off stone and whining away into the distance, a short hard tick followed by a descending metallic whistling zing, close dry recording, no reverb, no music, no speech, no other sound',
+  },
+  {
+    id: 'imp/debris', file: 'imp/debris.mp3', kind: 'impact',
+    duration: 2.2, bytes: 36406, trimDb: -0.1, seconds: 2.2, influence: 0.7,
+    prompt:
+      'broken rubble raining down onto a road after a blast, chunks of concrete and grit clattering and skittering across tarmac and settling, no explosion, close dry recording, no reverb, no music, no speech, no other sound',
+  },
+  {
+    id: 'plr/hurt', file: 'plr/hurt.mp3', kind: 'body',
+    duration: 0.8, bytes: 13836, trimDb: -5.9, seconds: 0.8, influence: 0.65,
+    prompt:
+      'a man taking a sudden hard hit to the body and letting out one short involuntary pained grunt through clenched teeth, wordless, no words, no music, close dry recording',
+  },
+  {
+    id: 'plr/death', file: 'plr/death.mp3', kind: 'body',
+    duration: 1.76, bytes: 29301, trimDb: -5.8, seconds: 1.8, influence: 0.6,
+    prompt:
+      'a man collapsing, one long wordless failing exhale trailing off into silence as the body drops heavily to the ground, wordless, no words, no music, close dry recording',
+  },
+  {
+    id: 'plr/heartbeat', file: 'plr/heartbeat.mp3', kind: 'body',
+    duration: 2.55, bytes: 41839, trimDb: -14.3, seconds: 2.4, influence: 0.7, loop: true,
+    prompt:
+      'seamless looping slow heavy human heartbeat heard from inside the chest, deep muffled double thump repeating at a steady urgent pace, low frequency, no music, no speech, no other sound',
+  },
+  {
+    id: 'plr/tinnitus', file: 'plr/tinnitus.mp3', kind: 'body',
+    duration: 2.61, bytes: 42675, trimDb: -20.6, seconds: 2.5, influence: 0.7, loop: true,
+    prompt:
+      'seamless looping steady high-pitched ringing tone of ear damage after a nearby explosion, a single continuous thin sine-like whine with a faint hollow pressure underneath, absolutely even, no music, no speech, no other sound',
+  },
+];
+
+const COMBAT: readonly AudioAsset[] = COMBAT_SPECS.map((spec) => ({
+  id: spec.id,
+  path: `/audio/${spec.file}`,
+  kind: spec.kind,
+  duration: spec.duration,
+  loop: spec.loop === true,
+  sampleRate: 44100,
+  channels: 2,
+  bytes: spec.bytes,
+  trimDb: spec.trimDb,
+  generation: {
+    provider: 'elevenlabs' as const,
+    modelId: SFX_MODEL,
+    prompt: spec.prompt,
+    date: COMBAT_GENERATED_ON,
+    credits: Number((spec.seconds * CREDITS_PER_SECOND).toFixed(4)),
+    parameters: {
+      duration_seconds: spec.seconds,
+      prompt_influence: spec.influence,
+      loop: spec.loop === true,
+      output_format: 'mp3_44100_128',
+    },
+  },
+  ...(spec.postProcess ? { postProcess: spec.postProcess } : {}),
+}));
+
+/** What each weapon sounds like when it goes off. */
+export const WEAPON_SOUNDS = {
+  pistol: 'wpn/pistol',
+  smg: 'wpn/smg',
+  shotgun: 'wpn/shotgun',
+  rifle: 'wpn/rifle',
+  launcher: 'wpn/launcher',
+} as const satisfies Readonly<Record<string, WeaponAssetId>>;
+
+/** Handling the weapon, rather than firing it. */
+export const HANDLING_SOUNDS = {
+  reload: 'wpn/reload',
+  draw: 'wpn/draw',
+  holster: 'wpn/holster',
+  dry: 'wpn/dry',
+  shell: 'wpn/shell',
+} as const satisfies Readonly<Record<string, WeaponAssetId>>;
+
+/** What the round arrives at. Keyed by `CombatFx`'s own impact kinds. */
+export const IMPACT_SOUNDS = {
+  world: 'imp/concrete',
+  ground: 'imp/concrete',
+  metal: 'imp/metal',
+  glass: 'imp/glass',
+  body: 'imp/flesh',
+  ricochet: 'imp/ricochet',
+  debris: 'imp/debris',
+} as const satisfies Readonly<Record<string, ImpactAssetId>>;
+
+/** The player's own body. Never panned: it is not out there, it is you. */
+export const BODY_SOUNDS = {
+  hurt: 'plr/hurt',
+  death: 'plr/death',
+  heartbeat: 'plr/heartbeat',
+  tinnitus: 'plr/tinnitus',
+} as const satisfies Readonly<Record<string, BodyAssetId>>;
+
+export const EXPLOSION_SOUND: WeaponAssetId = 'wpn/explosion';
+export const ROCKET_FLIGHT_SOUND: WeaponAssetId = 'wpn/rocket-flight';
+
 export const MUSIC_ASSET_ID: MusicAssetId = 'music/meridian-theme';
 
 const MUSIC: AudioAsset = {
@@ -681,6 +974,7 @@ export const AUDIO_ASSETS: readonly AudioAsset[] = [
   ...STEPS,
   ...SFX,
   ...VEHICLE,
+  ...COMBAT,
   STREET_LAYER,
   MUSIC,
   VOICE,

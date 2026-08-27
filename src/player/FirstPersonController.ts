@@ -35,6 +35,11 @@ export const FIXED_STEP = 1 / 120;
 const MAX_SUBSTEPS = 8;
 const PITCH_LIMIT = Math.PI / 2 - 0.02;
 
+/** Seconds a full-strength camera shake takes to die away. */
+const SHAKE_DECAY = 0.85;
+/** Peak angular deviation of a full-strength shake, radians. About 2.6°. */
+const SHAKE_RADIANS = 0.046;
+
 /**
  * How far around the player traffic is fetched each frame, in metres.
  *
@@ -146,6 +151,8 @@ export class FirstPersonController {
   private readonly velocity = new Vector3();
   private yaw: number;
   private pitch = 0;
+  private shakeAmount = 0;
+  private shakePhase = 0;
   private verticalVelocity = 0;
   private grounded = true;
   private accumulator = 0;
@@ -398,6 +405,20 @@ export class FirstPersonController {
     if (this.bobPhase > Math.PI * 1e5) this.bobPhase %= Math.PI * 2;
   }
 
+  /**
+   * Shakes the camera.
+   *
+   * `strength` is 0..1 and is taken as a MAXIMUM rather than added, so three
+   * rockets landing in the same second do not sum into a seizure. It decays
+   * over `SHAKE_DECAY` seconds and is applied on top of the look angles rather
+   * than into them, so it never moves where the player is actually aiming: the
+   * crosshair stays on target and the world moves around it, which is what
+   * makes a shake feel like an impact rather than like losing control.
+   */
+  shake(strength: number): void {
+    this.shakeAmount = Math.max(this.shakeAmount, clamp(strength, 0, 1));
+  }
+
   private applyCamera(dt: number): void {
     const speed = Math.hypot(this.velocity.x, this.velocity.z);
     // A very small bob: enough to feel like walking, far short of nausea.
@@ -412,7 +433,22 @@ export class FirstPersonController {
       this.position.y + EYE_HEIGHT + this.eyeOffset,
       this.position.z + this.right.z * sway,
     );
-    this.euler.set(this.pitch, this.yaw, 0, 'YXZ');
+    if (this.shakeAmount > 0) {
+      this.shakeAmount = Math.max(0, this.shakeAmount - dt / SHAKE_DECAY);
+      this.shakePhase += dt;
+      // Two incommensurable frequencies per axis, so the trace never repeats
+      // over the life of one shake and never reads as a wobble.
+      const amount = this.shakeAmount * this.shakeAmount * SHAKE_RADIANS;
+      const pitchShake =
+        (Math.sin(this.shakePhase * 47.3) + Math.sin(this.shakePhase * 29.1)) * 0.5 * amount;
+      const yawShake =
+        (Math.sin(this.shakePhase * 38.7) + Math.sin(this.shakePhase * 61.9)) * 0.5 * amount;
+      const rollShake = Math.sin(this.shakePhase * 23.5) * amount * 0.7;
+      this.euler.set(this.pitch + pitchShake, this.yaw + yawShake, rollShake, 'YXZ');
+    } else {
+      this.shakePhase = 0;
+      this.euler.set(this.pitch, this.yaw, 0, 'YXZ');
+    }
     this.camera.quaternion.setFromEuler(this.euler);
   }
 

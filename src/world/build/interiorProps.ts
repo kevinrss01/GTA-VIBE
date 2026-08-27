@@ -2049,7 +2049,7 @@ function addGunStoreFittings(ctx: Fitout): void {
     x: service.x,
     y: room.floorY + 1.2,
     z: service.z,
-    radius: 2.1,
+    radius: 2.9,
     prompt: 'Press E to buy weapons',
     kind: 'sign',
     parcelId: room.parcel.id,

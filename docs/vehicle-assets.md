@@ -236,3 +236,51 @@ the fleet had, so `VehicleMaterial` recovers what it can from the texture:
   behind the loading screen, in parallel with the street lamp and the fountain,
   and a failure at any point falls the whole fleet back to the authored shells
   rather than mixing two looks on one street.
+
+## The wheel arch, corrected 2026-08-27
+
+Reported as "some 3D element around the wheels, hidden, but really visible. It
+looks very ugly." Nothing had been added. What was visible was the INSIDE of
+the car, through bodywork that should never have been removed.
+
+`detectAndCutWheels` opened each arch by dropping a whole triangle whenever its
+CENTROID fell inside the tyre. On a generated body of about fifteen hundred
+triangles a triangle is 10–20 cm across, so the hole that leaves is up to a
+triangle's width wider than the tyre in every direction — a 33 cm wheel in a
+49 cm hole. Something has to be behind an opening that size or you can see
+straight through the car, and what was behind it was the wheel-well liner:
+`#33373b` moulded plastic, correct for a wheel arch and 16 cm too much of it.
+
+Three changes, and the first is the one that matters:
+
+1. **The cut clips the triangles instead of dropping them.** Each triangle that
+   straddles an arch is split against the sixteen edges of a polygon inscribed
+   in the tyre; the pieces outside are kept, the piece inside is discarded, and
+   the vertices the split needs are appended to the model. The opening is now
+   the polygon and nothing else. Inscribed rather than circumscribed on
+   purpose: an inscribed polygon is never wider than the wheel that fills it,
+   at the cost of up to 1.9 per cent of a radius of the model's own tyre
+   surviving at each corner — about 6 mm of black rubber, sitting inside the
+   black rubber of the wheel drawn over it.
+2. **The arch is open below the wheel.** A real wing sweeps down past the tyre
+   and stops; you can see the road under the sill. The six edges whose normals
+   point downwards are left out of the cut, so it runs straight down to the
+   road and past it. Closing them left a skirt of sheet metal reaching the
+   ground on both sides of every wheel.
+3. **The wheel is drawn at the radius its own arch was cut at**, not at the
+   simulation's blueprint figure. A cluster is accepted anywhere between 0.72
+   and 1.6 of the blueprint radius, so those two numbers need not agree, and a
+   wheel smaller than its arch leaves a ring of liner showing all the way
+   round. `tests/vehicleModels.test.ts` pins the detected radius to within a
+   fifth of the blueprint on every shipped body.
+
+The liner behind it is now sized just INSIDE the wheel (0.985) rather than six
+per cent proud of it, so it is hidden from every angle outside the car while
+still closing the oblique sight lines that pass along the flank and miss the
+wheel. The inner wing that closes the arch from inboard reaches the road rather
+than the floorpan, because the open bottom left a band between the sill and the
+tarmac that a low horizontal sight line went straight through: measured on the
+saloon, twenty of 758 rays, all of them between 5 and 17 cm off the ground.
+
+`tests/wheelArch.test.ts` asserts the geometric properties on synthetic
+bodywork; `tests/vehicleModels.test.ts` asserts them on the shipped assets.

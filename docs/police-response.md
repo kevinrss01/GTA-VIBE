@@ -286,3 +286,66 @@ instanced mesh.
   buildings and traffic, so in play the arrival times are the same or later,
   never earlier. The browser run agreed: one shot, one star, `dispatchIn` 8.8 s
   and nothing on the road.
+
+## Officers who visibly shoot, 2026-08-27
+
+The complaint was exact: "their arms are at their sides and I see them
+shooting, but I don't see their weapons, I don't see their arms moving."
+
+Both halves were true. The officer character was baked from two clips, walk and
+idle, and neither has anything to do with firing a weapon; and a vertex
+animation texture is a fixed mesh, so there was nowhere for a weapon to be.
+
+### A third clip
+
+`preset:biped:shoot`, retargeted from the same rig task that produced the walk
+and the idle (`fe2b199a-7fcb-42e7-ad1a-aa77ce2b5e76`), FBX out, 10 credits.
+Task `7b802028-d5b5-4766-8fb2-227e3d6f2da2`.
+
+It is the ONLY shooting preset in Tripo's biped library — `preset:biped:aim`,
+`:shoot_gun`, `:gunplay`, `:pistol` and `:attack` are all rejected by the API —
+and it is a 7.2 s action rather than a loop: the character walks in, drops into
+a crouch at about 1.4 s, and holds it for the remaining five and a half seconds.
+
+That shape broke two assumptions in `tools/bake-pedestrian-vat.mjs`, and both
+needed a real fix rather than a fudge:
+
+- **Travel.** The bake fits a linear ramp to the body centroid over the cycle
+  and subtracts it, which is exactly right for a walk and catastrophic for a
+  clip that crouches once and holds: the fit read the crouch as 1.35 body
+  heights of forward travel and would have slid the officer several metres
+  backwards through their own animation. `--static name=start:end` samples a
+  window of the source, keeps travel at zero and skips the travel-curve
+  analysis entirely. The window shipped is 3.3–4.5 s, twelve frames.
+- **Ground contact.** The normalisation is anchored to the idle clip's soles,
+  which is right for locomotion because every locomotion clip shares that
+  stance. The crouch does not: its lowest point is a shin, and it sat 159 mm
+  THROUGH the pavement. Each static clip is now lifted by its own worst
+  penetration.
+- **Position.** A window cut out of the middle of an action clip is wherever
+  the character had walked to by then — 2.75 body heights down −Z, in this
+  case. Static clips are recentred on the reference clip's mean centroid.
+
+The clip is a third layer in the same shader, blended over whatever the gait
+produced, driven by a per-instance blend in `iAnim.w`. That blend is zero for
+every civilian in the city, so the branch costs the crowd one comparison and
+only ever fetches for an officer who is firing.
+
+### A weapon in the hand
+
+A VAT has no skeleton at runtime — that is what makes it one draw call — so the
+right hand's path is measured at BAKE time and shipped in the clip table, in
+rig units, alongside the texture. `OfficerRig` puts a sidearm there through
+exactly the transform the instance matrix applies to the body, so the weapon
+stays in the grip whatever height and build an officer is.
+
+The sidearm is `models/shop/pistol.glb`, drawn as one `InstancedMesh` for every
+officer in the city and hidden entirely while nobody is aiming.
+
+**An honest limitation.** The baked hand sits at the STERNUM — that preset is a
+crouched stance with the weapon hand drawn in to the chest, which is where a
+long weapon's grip hand goes. A pistol drawn at the hand is therefore inside
+the officer. It is pushed 0.22 body heights forward along the officer's own
+heading to clear the torso, so it reads as a weapon held in front of the chest
+in a compressed ready rather than as one in a fist. Fixing that properly needs
+a shooting clip with an extended arm, and Tripo's library does not have one.

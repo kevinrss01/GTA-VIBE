@@ -322,6 +322,10 @@ export interface WheelCutParams {
   readonly track: number;
   /** Lowest point of the painted body above the road, for a model with no wheels. */
   readonly rideHeight: number;
+  /** Per-vertex normals, so a cut triangle's pieces keep their shading. */
+  readonly normals?: ArrayLike<number> | undefined;
+  /** Per-vertex UVs, so a cut triangle's pieces keep their texture. */
+  readonly uvs?: ArrayLike<number> | undefined;
 }
 
 /** Where the renderer should mount this model's wheels, in the vehicle's frame. */
@@ -329,6 +333,19 @@ export interface WheelMount {
   readonly frontZ: number;
   readonly rearZ: number;
   readonly halfTrack: number;
+  /**
+   * Rolling radius of the wheel this model was drawn with, or 0 when nothing
+   * was detected.
+   *
+   * The renderer used to scale every wheel to the BLUEPRINT radius, which is
+   * the simulation's number and need not match the arch the generator drew: a
+   * cluster is accepted anywhere between 0.72 and 1.6 of it. A wheel smaller
+   * than its own arch leaves a ring of liner showing all the way round, and a
+   * wheel larger than it pushes through the wing. Drawing it at the radius the
+   * arch was cut at makes it fill the arch exactly, and it still stands on the
+   * road because the arch was measured from a model whose own wheel did.
+   */
+  readonly radius: number;
 }
 
 /**
@@ -357,15 +374,33 @@ export interface WheelArch {
   readonly radius: number;
 }
 
+/**
+ * Vertices the arch clip had to invent, appended after the model's own.
+ *
+ * A triangle that straddles the edge of an arch is not kept or dropped, it is
+ * CUT, and the pieces need vertices the model never had. They are appended
+ * rather than replacing anything so every original index stays valid and the
+ * caller only has to concatenate.
+ */
+export interface ClippedVertices {
+  readonly position: Float32Array;
+  readonly normal: Float32Array | null;
+  readonly uv: Float32Array | null;
+  /** How many vertices were appended. */
+  readonly count: number;
+}
+
 export interface WheelDetection {
   readonly mount: WheelMount;
   /** The openings the cut left, front first. Empty when nothing was cut. */
   readonly arches: readonly WheelArch[];
   /** True when the model arrived with wheels and they were removed. */
   readonly cut: boolean;
-  /** The index buffer with the wheel triangles dropped. */
+  /** The index buffer with the wheel triangles dropped or cut. */
   readonly index: Uint32Array;
   readonly removed: number;
+  /** Vertices the clip appended, or null when nothing needed cutting. */
+  readonly extra: ClippedVertices | null;
   /** Metres the body must be lifted so it sits on its wheels rather than its sills. */
   readonly lift: number;
   /** Tyres found in the model. */
@@ -393,15 +428,382 @@ const GROUND_FRACTION = 0.4;
 /** How far a detected tyre may sit from the blueprint's axle and still be it. */
 const AXLE_TOLERANCE = 0.9;
 /**
- * How far past the measured tyre radius the cut reaches.
+ * Sides of the polygon the arch is cut against.
  *
- * The radius is inferred from the run of bins the tyre grounds in, which
- * under-reads it; cutting at the bare figure leaves a ring of black triangles
- * round the top of the arch that reads as a row of teeth. Reaching well past
- * it clears the tyre completely, and the arch opening is wider than the tyre
- * anyway, so nothing of the bodywork goes with it.
+ * WHY A POLYGON AND NOT A CIRCLE. Clipping a triangle against a straight edge
+ * is exact and produces another convex polygon; clipping it against a curve is
+ * neither. Sixteen tangent edges put the worst corner 2.0 per cent outside the
+ * tyre, which on a 0.33 m wheel is 6 mm - a millimetre or two of dark liner
+ * visible at the corners of the arch, which is what a real wheel arch has
+ * there anyway.
  */
-const WHEEL_CUT_REACH = 1.18;
+const ARCH_SIDES = 16;
+
+/**
+ * How far in each of the polygon's edges sits, as a multiple of the radius.
+ *
+ * The polygon is INSCRIBED - its corners are ON the tyre's circle and its
+ * edges cut a little inside it - which is the choice that matters:
+ *
+ *  - Circumscribed, every edge tangent, would guarantee no scrap of the
+ *    generated wheel survives, at the cost of an opening two per cent WIDER
+ *    than the wheel that fills it. Two per cent of a wheel is a 6 mm ring of
+ *    dark liner all the way round every arch, sixteen times over. That ring,
+ *    much larger, is exactly what this whole change exists to remove.
+ *  - Inscribed leaves the opening never wider than the wheel, so the drawn
+ *    wheel covers it completely: no ring, and no sight line into the car.
+ *    What it costs is up to 1.9 per cent of a radius of the model's own tyre
+ *    surviving at each corner - about 6 mm of black rubber, sitting INSIDE the
+ *    black rubber of the wheel that is drawn over it.
+ *
+ * Six millimetres of hidden tyre is a better trade than six millimetres of
+ * visible hole, sixteen times per wheel.
+ */
+const ARCH_EDGE_INSET = Math.cos(Math.PI / ARCH_SIDES);
+
+/**
+ * How steeply downward an edge's normal has to point before it is dropped from
+ * the clip.
+ *
+ * The arch is NOT a closed circle. Under the wheel there is no bodywork at all
+ * on a real car - the wing sweeps down past the tyre and stops, and you can see
+ * the road under the sill - so the bottom of the polygon is left open and the
+ * cut runs straight down to the road and past it. Closing it would leave a
+ * skirt of sheet metal reaching the ground on both sides of every wheel, which
+ * is both wrong to look at and would put the body's lowest point on the road.
+ *
+ * How far down that open bottom reaches is bounded by which triangles are
+ * eligible to be clipped at all - `TRIANGLE_MARGIN` around the arch - so the
+ * floorpan and the sills away from the wheels are never touched.
+ */
+const ARCH_OPEN_BELOW = 0.2;
+
+/** True when this edge of the arch polygon takes part in the cut. */
+function archEdgeUsed(ny: number): boolean {
+  return ny >= -ARCH_OPEN_BELOW;
+}
+
+/**
+ * Slack added when deciding whether a triangle is worth clipping at all.
+ *
+ * Only an optimisation: a triangle whose centroid is this far outside the arch
+ * cannot reach it, so it is kept whole without running the clipper. Generous
+ * enough for the largest triangle in any of the generated bodies.
+ */
+const TRIANGLE_MARGIN = 0.45;
+
+/**
+ * How the arch clip disposed of one triangle.
+ *
+ * `cut` and `dropped` are both counted as removals; the distinction exists so
+ * the tests can tell "this triangle was split" from "this triangle was inside
+ * the tyre".
+ */
+type ClipResult = 'kept' | 'dropped' | 'cut';
+
+/** Floats per clipped vertex: position, normal, uv. */
+const CLIP_STRIDE = 8;
+
+/**
+ * Cuts the bodywork open around a wheel, exactly.
+ *
+ * WHAT THIS REPLACED, AND WHY IT MATTERED. The first version dropped a whole
+ * triangle whenever its CENTROID fell inside the tyre. On a body of about
+ * fifteen hundred triangles a triangle is 10-20 cm across, so the hole that
+ * left was up to a triangle's width wider than the tyre in every direction -
+ * measured on the fleet, a 33 cm wheel in a 49 cm hole. Something had to be
+ * behind that 16 cm ring or you could see through the car, and what was behind
+ * it was the dark grey wheel-well liner. That is the "ugly 3D element around
+ * the wheels": not a thing that was added, but the inside of the car showing
+ * through bodywork that should never have been removed.
+ *
+ * This cuts the triangles instead. Each one that straddles the arch is split
+ * against the sixteen tangent edges of the polygon around the tyre, the pieces
+ * outside are kept and the piece inside is discarded, so the opening is the
+ * polygon and nothing else. The liner behind it is then 2 per cent of a wheel
+ * radius wide - a hairline, which is what a wheel arch looks like.
+ *
+ * The clip is in the (y, z) plane and x rides along on the interpolation,
+ * which is right because the arch is a hole through a flank: the cut is a
+ * cylinder along the axle, not a sphere.
+ */
+class ArchClipper {
+  /** Appended vertices, eight floats each. */
+  private readonly extra: number[] = [];
+  private readonly baseCount: number;
+  private readonly hasNormals: boolean;
+  private readonly hasUvs: boolean;
+  /** Scratch polygons, reused so a body's worth of clipping allocates nothing. */
+  private a: number[] = [];
+  private b: number[] = [];
+  private c: number[] = [];
+
+  constructor(
+    private readonly positions: ArrayLike<number>,
+    private readonly normals: ArrayLike<number> | undefined,
+    private readonly uvs: ArrayLike<number> | undefined,
+  ) {
+    this.baseCount = Math.floor(positions.length / 3);
+    this.hasNormals = normals !== undefined && normals.length >= this.baseCount * 3;
+    this.hasUvs = uvs !== undefined && uvs.length >= this.baseCount * 2;
+  }
+
+  /**
+   * Keeps whatever of one triangle lies outside the arch, writing any pieces
+   * into `out` as triangles.
+   *
+   * Returns `kept` when the triangle never touched the arch (nothing is
+   * written and the caller should emit it unchanged), `dropped` when it was
+   * entirely inside, and `cut` when pieces were written.
+   */
+  subtractArch(
+    ia: number,
+    ib: number,
+    ic: number,
+    archZ: number,
+    radius: number,
+    out: number[],
+  ): ClipResult {
+    if (!(radius > 1e-6)) return 'kept';
+    const centreY = radius;
+
+    let inside = 0;
+    if (this.insidePolygon(ia, archZ, centreY, radius)) inside += 1;
+    if (this.insidePolygon(ib, archZ, centreY, radius)) inside += 1;
+    if (this.insidePolygon(ic, archZ, centreY, radius)) inside += 1;
+    if (inside === 3) return 'dropped';
+    // A triangle can miss the arch with all three corners and still cover it -
+    // one large panel spanning a whole wheel does exactly that - so "no corner
+    // inside" is not the same question as "does not overlap". The disc used
+    // here is the circle the polygon is inscribed in; the region's open bottom
+    // only ever makes it larger, so this stays conservative.
+    if (inside === 0 && !this.overlapsArch(ia, ib, ic, archZ, centreY, radius)) {
+      return 'kept';
+    }
+
+    // `remaining` starts as the whole triangle and is whittled down: each edge
+    // of the polygon peels off the part outside that edge - which is outside
+    // the tyre and therefore kept - leaving the part inside it to face the
+    // next edge. What survives all sixteen is the part inside the polygon,
+    // which is the hole.
+    let remaining = this.a;
+    let outside = this.b;
+    let next = this.c;
+    remaining.length = 0;
+    this.push(remaining, ia);
+    this.push(remaining, ib);
+    this.push(remaining, ic);
+
+    let wrote = false;
+    for (let side = 0; side < ARCH_SIDES && remaining.length > 0; side += 1) {
+      const angle = ((side + 0.5) / ARCH_SIDES) * Math.PI * 2;
+      // Outward normal of this edge, in (y, z). The edge itself is tangent to
+      // the tyre, so a point is outside the polygon through this edge when its
+      // signed distance along the normal exceeds the radius.
+      const ny = Math.sin(angle);
+      const nz = Math.cos(angle);
+      if (!archEdgeUsed(ny)) continue;
+      const offset = radius * ARCH_EDGE_INSET + ny * centreY + nz * archZ;
+
+      outside.length = 0;
+      next.length = 0;
+      clipHalfPlane(remaining, ny, nz, offset, outside, next);
+      if (outside.length >= 3 * CLIP_STRIDE) {
+        this.emit(outside, out);
+        wrote = true;
+      }
+      const swap = remaining;
+      remaining = next;
+      next = swap;
+      // `outside` is finished with; reuse it as the next spare.
+      const spare = outside;
+      outside = next;
+      next = spare;
+    }
+    this.a = remaining;
+    this.b = outside;
+    this.c = next;
+    return wrote ? 'cut' : 'dropped';
+  }
+
+  /** The appended vertices, or null when nothing was cut. */
+  harvest(): ClippedVertices | null {
+    const count = this.extra.length / CLIP_STRIDE;
+    if (count === 0) return null;
+    const position = new Float32Array(count * 3);
+    const normal = this.hasNormals ? new Float32Array(count * 3) : null;
+    const uv = this.hasUvs ? new Float32Array(count * 2) : null;
+    for (let i = 0; i < count; i += 1) {
+      const at = i * CLIP_STRIDE;
+      position[i * 3] = this.extra[at] as number;
+      position[i * 3 + 1] = this.extra[at + 1] as number;
+      position[i * 3 + 2] = this.extra[at + 2] as number;
+      if (normal) {
+        normal[i * 3] = this.extra[at + 3] as number;
+        normal[i * 3 + 1] = this.extra[at + 4] as number;
+        normal[i * 3 + 2] = this.extra[at + 5] as number;
+      }
+      if (uv) {
+        uv[i * 2] = this.extra[at + 6] as number;
+        uv[i * 2 + 1] = this.extra[at + 7] as number;
+      }
+    }
+    return { position, normal, uv, count };
+  }
+
+  /**
+   * True when the triangle and the arch's circle overlap at all, in (y, z).
+   *
+   * Two convex shapes overlap when either contains a point of the other, and
+   * for a triangle and a disc that reduces to: the centre is inside the
+   * triangle, or some edge passes within the radius.
+   */
+  private overlapsArch(
+    ia: number,
+    ib: number,
+    ic: number,
+    archZ: number,
+    centreY: number,
+    radius: number,
+  ): boolean {
+    const ay = this.positions[ia * 3 + 1] ?? 0;
+    const az = this.positions[ia * 3 + 2] ?? 0;
+    const by = this.positions[ib * 3 + 1] ?? 0;
+    const bz = this.positions[ib * 3 + 2] ?? 0;
+    const cy = this.positions[ic * 3 + 1] ?? 0;
+    const cz = this.positions[ic * 3 + 2] ?? 0;
+
+    // Same sign on all three cross products means the centre is inside.
+    const s1 = (by - ay) * (archZ - az) - (bz - az) * (centreY - ay);
+    const s2 = (cy - by) * (archZ - bz) - (cz - bz) * (centreY - by);
+    const s3 = (ay - cy) * (archZ - cz) - (az - cz) * (centreY - cy);
+    if ((s1 >= 0 && s2 >= 0 && s3 >= 0) || (s1 <= 0 && s2 <= 0 && s3 <= 0)) return true;
+
+    const near = radius * radius;
+    return (
+      segmentDistanceSquared(ay, az, by, bz, centreY, archZ) <= near ||
+      segmentDistanceSquared(by, bz, cy, cz, centreY, archZ) <= near ||
+      segmentDistanceSquared(cy, cz, ay, az, centreY, archZ) <= near
+    );
+  }
+
+  private insidePolygon(vertex: number, archZ: number, centreY: number, radius: number): boolean {
+    const y = this.positions[vertex * 3 + 1] ?? 0;
+    const z = this.positions[vertex * 3 + 2] ?? 0;
+    for (let side = 0; side < ARCH_SIDES; side += 1) {
+      const angle = ((side + 0.5) / ARCH_SIDES) * Math.PI * 2;
+      const ny = Math.sin(angle);
+      const nz = Math.cos(angle);
+      if (!archEdgeUsed(ny)) continue;
+      if (ny * (y - centreY) + nz * (z - archZ) > radius * ARCH_EDGE_INSET) return false;
+    }
+    return true;
+  }
+
+  /** Appends one of the model's own vertices to a working polygon. */
+  private push(polygon: number[], vertex: number): void {
+    polygon.push(
+      this.positions[vertex * 3] ?? 0,
+      this.positions[vertex * 3 + 1] ?? 0,
+      this.positions[vertex * 3 + 2] ?? 0,
+      this.hasNormals ? (this.normals?.[vertex * 3] ?? 0) : 0,
+      this.hasNormals ? (this.normals?.[vertex * 3 + 1] ?? 1) : 1,
+      this.hasNormals ? (this.normals?.[vertex * 3 + 2] ?? 0) : 0,
+      this.hasUvs ? (this.uvs?.[vertex * 2] ?? 0) : 0,
+      this.hasUvs ? (this.uvs?.[vertex * 2 + 1] ?? 0) : 0,
+    );
+  }
+
+  /** Fans a convex polygon into triangles of newly appended vertices. */
+  private emit(polygon: number[], out: number[]): void {
+    const corners = polygon.length / CLIP_STRIDE;
+    if (corners < 3) return;
+    const first = this.baseCount + this.extra.length / CLIP_STRIDE;
+    for (let i = 0; i < corners; i += 1) {
+      for (let f = 0; f < CLIP_STRIDE; f += 1) {
+        this.extra.push(polygon[i * CLIP_STRIDE + f] as number);
+      }
+    }
+    for (let i = 1; i + 1 < corners; i += 1) {
+      out.push(first, first + i, first + i + 1);
+    }
+  }
+}
+
+/**
+ * Sutherland-Hodgman against one half-plane in (y, z), splitting a polygon
+ * into the part beyond `n . p > offset` and the part at or under it.
+ *
+ * Every attribute rides along on the same parameter, so a cut edge's position,
+ * normal and texture coordinate all land at the same point of the original
+ * triangle.
+ */
+function clipHalfPlane(
+  polygon: readonly number[],
+  ny: number,
+  nz: number,
+  offset: number,
+  beyond: number[],
+  under: number[],
+): void {
+  const corners = polygon.length / CLIP_STRIDE;
+  if (corners === 0) return;
+  const distance = (i: number): number =>
+    ny * (polygon[i * CLIP_STRIDE + 1] as number) + nz * (polygon[i * CLIP_STRIDE + 2] as number) - offset;
+
+  for (let i = 0; i < corners; i += 1) {
+    const j = (i + 1) % corners;
+    const di = distance(i);
+    const dj = distance(j);
+    if (di >= 0) beyond.push(...slice(polygon, i));
+    if (di <= 0) under.push(...slice(polygon, i));
+    if ((di > 0 && dj < 0) || (di < 0 && dj > 0)) {
+      const t = di / (di - dj);
+      const crossing = lerpVertex(polygon, i, j, t);
+      beyond.push(...crossing);
+      under.push(...crossing);
+    }
+  }
+}
+
+/** Squared distance from a point to a segment, in the plane. */
+function segmentDistanceSquared(
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number,
+  px: number,
+  py: number,
+): number {
+  const dx = bx - ax;
+  const dy = by - ay;
+  const lengthSquared = dx * dx + dy * dy;
+  let t = 0;
+  if (lengthSquared > 1e-12) {
+    t = ((px - ax) * dx + (py - ay) * dy) / lengthSquared;
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+  }
+  const cx = ax + dx * t - px;
+  const cy = ay + dy * t - py;
+  return cx * cx + cy * cy;
+}
+
+function slice(polygon: readonly number[], i: number): number[] {
+  const at = i * CLIP_STRIDE;
+  return polygon.slice(at, at + CLIP_STRIDE) as number[];
+}
+
+function lerpVertex(polygon: readonly number[], i: number, j: number, t: number): number[] {
+  const a = i * CLIP_STRIDE;
+  const b = j * CLIP_STRIDE;
+  const out = new Array<number>(CLIP_STRIDE);
+  for (let f = 0; f < CLIP_STRIDE; f += 1) {
+    const va = polygon[a + f] as number;
+    const vb = polygon[b + f] as number;
+    out[f] = va + (vb - va) * t;
+  }
+  return out;
+}
 
 /**
  * Finds and removes the wheels a generated body arrived with.
@@ -500,11 +902,13 @@ export function detectAndCutWheels(
         frontZ: params.frontAxleZ,
         rearZ: params.rearAxleZ,
         halfTrack: params.track * 0.5,
+        radius: 0,
       },
       arches: [],
       cut: false,
       index: Uint32Array.from(index as ArrayLike<number>),
       removed: 0,
+      extra: null,
       // Nothing touched the road, so the model's floor is its underbody and it
       // has to be lifted onto the wheels the renderer will draw for it.
       lift: params.rideHeight,
@@ -529,45 +933,37 @@ export function detectAndCutWheels(
   }
 
   const xCut = (trackCount > 20 ? trackSum / trackCount : params.track * 0.5) - params.wheelWidth * 1.15;
+  const clip = new ArchClipper(positions, params.normals, params.uvs);
   const kept: number[] = [];
   let removed = 0;
-  // How far out from each axle the cut actually reached. A well sized to this
-  // covers the opening; one sized to the swept circle does not.
-  const opened = chosen.map(() => 0);
+
   for (let t = 0; t < triangles; t += 1) {
-    let drop = false;
+    const a = index[t * 3] ?? 0;
+    const b = index[t * 3 + 1] ?? 0;
+    const c = index[t * 3 + 2] ?? 0;
     let hitCluster = -1;
     if (Math.abs(centroidX[t] as number) >= xCut) {
-      for (let c = 0; c < chosen.length; c += 1) {
-        const cluster = chosen[c] as WheelCluster;
+      for (let i = 0; i < chosen.length; i += 1) {
+        const cluster = chosen[i] as WheelCluster;
+        // Eligible when the triangle comes anywhere near this arch. The clip
+        // decides what actually goes; this is only which arch to test against.
+        const reach = cluster.radius + TRIANGLE_MARGIN;
         const dy = (centroidY[t] as number) - cluster.radius;
         const dz = (centroidZ[t] as number) - cluster.z;
-        const reach = cluster.radius * WHEEL_CUT_REACH;
-        // The disc itself, plus a sweep along the bottom that catches the last
-        // sliver of tyre the circle test leaves behind.
-        if (
-          dy * dy + dz * dz < reach * reach ||
-          (Math.abs(dz) < cluster.radius * 1.15 && (centroidY[t] as number) < cluster.radius * 0.55)
-        ) {
-          drop = true;
-          hitCluster = c;
+        if (dy * dy + dz * dz < reach * reach) {
+          hitCluster = i;
           break;
         }
       }
     }
-    if (drop) {
-      removed += 1;
-      const cluster = chosen[hitCluster] as WheelCluster;
-      for (let k = 0; k < 3; k += 1) {
-        const v = index[t * 3 + k] ?? 0;
-        const dy = (positions[v * 3 + 1] ?? 0) - cluster.radius;
-        const dz = (positions[v * 3 + 2] ?? 0) - cluster.z;
-        const r = Math.hypot(dy, dz);
-        if (r > (opened[hitCluster] as number)) opened[hitCluster] = r;
-      }
+    if (hitCluster < 0) {
+      kept.push(a, b, c);
       continue;
     }
-    kept.push(index[t * 3] ?? 0, index[t * 3 + 1] ?? 0, index[t * 3 + 2] ?? 0);
+    const cluster = chosen[hitCluster] as WheelCluster;
+    const result = clip.subtractArch(a, b, c, cluster.z, cluster.radius, kept);
+    if (result === 'dropped' || result === 'cut') removed += 1;
+    if (result === 'kept') kept.push(a, b, c);
   }
 
   return {
@@ -575,17 +971,27 @@ export function detectAndCutWheels(
       frontZ: front ? front.z : params.frontAxleZ,
       rearZ: rear ? rear.z : params.rearAxleZ,
       halfTrack: trackCount > 20 ? trackSum / trackCount : params.track * 0.5,
+      // The mean of the tyres actually found, so a model whose front and rear
+      // wheels measured a few millimetres apart gets one radius rather than a
+      // wheel that changes size front to back.
+      radius: chosen.reduce((sum, cluster) => sum + cluster.radius, 0) / chosen.length,
     },
-    // The opening each cut left, in the order the renderer mounts its wheels.
-    arches: chosen.map((cluster, i) => ({
+    // The opening the clip left is EXACTLY the polygon it cut against, so the
+    // well behind it only has to be the corner radius of that polygon. This is
+    // the number that used to be a guess plus whatever the worst dropped
+    // triangle reached, and the difference is the whole reason a dark ring
+    // used to ring every wheel: see the comment on `subtractArch`.
+    arches: chosen.map((cluster) => ({
       z: cluster.z,
       centreY: cluster.radius,
-      // What the cut reached, never less than what it swept.
-      radius: Math.max(opened[i] ?? 0, cluster.radius * WHEEL_CUT_REACH),
+      // The polygon's own corner radius, which is the tyre's: an inscribed
+      // polygon touches the circle at its vertices and is inside it elsewhere.
+      radius: cluster.radius,
     })),
     cut: true,
     index: Uint32Array.from(kept),
     removed,
+    extra: clip.harvest(),
     lift: 0,
     detected: clusters.length,
     leftInPlace: clusters.length - chosen.length,

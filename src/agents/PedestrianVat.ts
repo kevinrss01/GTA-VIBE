@@ -48,6 +48,11 @@ export const PEDESTRIAN_VAT_BASE = 'models/pedestrians';
  */
 export const PEDESTRIAN_VAT_IDS = ['ped-a', 'ped-b', 'ped-c', 'ped-d'] as const;
 
+interface RawHandTrack {
+  readonly hand: readonly (readonly number[])[];
+  readonly forearm: readonly (readonly number[])[];
+}
+
 interface RawClip {
   readonly name: string;
   readonly column: number;
@@ -56,6 +61,7 @@ interface RawClip {
   readonly travelPerCycle: number;
   readonly travel: readonly number[];
   readonly slip: number;
+  readonly hand?: RawHandTrack | null;
 }
 
 interface RawSection {
@@ -87,6 +93,15 @@ export class VatClip {
   readonly travelPerCycle: number;
   /** Worst measured slide of a planted foot, in rig units. */
   readonly slip: number;
+  /**
+   * Where the right hand is, per frame, in rig units.
+   *
+   * A VAT has no skeleton at runtime - that is what makes it one draw call -
+   * so anything that has to be held in a hand needs the hand's path measured
+   * at bake time and shipped alongside the texture. `xyz` triples, `frames`
+   * of them. Null for a bake made before the tool recorded it.
+   */
+  readonly hand: Float32Array | null;
   private readonly inverse: Float32Array;
 
   constructor(raw: RawClip) {
@@ -96,6 +111,28 @@ export class VatClip {
     this.travelPerCycle = raw.travelPerCycle;
     this.slip = raw.slip;
     this.inverse = buildInverse(raw.travel);
+    this.hand = packTrack(raw.hand?.hand, raw.frames);
+  }
+
+  /**
+   * The right hand's position at a cycle position, written into `out`.
+   *
+   * Interpolated between frames and wrapped, exactly as the texture fetch is,
+   * so a weapon in the hand never lags the hand that is holding it.
+   */
+  handAt(phase: number, out: { x: number; y: number; z: number }): boolean {
+    const track = this.hand;
+    if (!track || this.frames <= 0) return false;
+    let t = phase % 1;
+    if (t < 0) t += 1;
+    const x = t * this.frames;
+    const a = Math.min(this.frames - 1, Math.floor(x));
+    const b = (a + 1) % this.frames;
+    const f = x - a;
+    out.x = lerp(track[a * 3] ?? 0, track[b * 3] ?? 0, f);
+    out.y = lerp(track[a * 3 + 1] ?? 0, track[b * 3 + 1] ?? 0, f);
+    out.z = lerp(track[a * 3 + 2] ?? 0, track[b * 3 + 2] ?? 0, f);
+    return true;
   }
 
   /**
@@ -126,6 +163,14 @@ export interface PedestrianVatCharacter {
   readonly albedo: Texture | null;
   readonly walk: VatClip;
   readonly idle: VatClip | null;
+  /**
+   * An action pose that plays over the top of the gait, if the bake has one.
+   *
+   * Baked static - no travel, no loop - because it is not locomotion: see the
+   * `--static` flag in `tools/bake-pedestrian-vat.mjs`. Only the police
+   * character carries one.
+   */
+  readonly action: VatClip | null;
   readonly triangles: number;
   readonly vertices: number;
   readonly bytes: number;
@@ -153,6 +198,23 @@ function buildInverse(travel: readonly number[]): Float32Array {
     const b = travel[frame + 1] ?? a;
     const t = b > a ? (target - a) / (b - a) : 0;
     out[k] = (frame + t) / frames;
+  }
+  return out;
+}
+
+/** Flattens a per-frame `[x, y, z]` list into one array, or null if absent. */
+function packTrack(
+  track: readonly (readonly number[])[] | undefined,
+  frames: number,
+): Float32Array | null {
+  if (!track || track.length < frames) return null;
+  const out = new Float32Array(frames * 3);
+  for (let f = 0; f < frames; f += 1) {
+    const point = track[f];
+    if (!point) return null;
+    out[f * 3] = point[0] ?? 0;
+    out[f * 3 + 1] = point[1] ?? 0;
+    out[f * 3 + 2] = point[2] ?? 0;
   }
   return out;
 }
@@ -277,6 +339,7 @@ export async function loadPedestrianVat(
     const walkRaw = meta.clips.find((clip) => clip.name === 'walk') ?? meta.clips[0];
     if (!walkRaw) throw new Error(`${id}: bake carries no clips`);
     const idleRaw = meta.clips.find((clip) => clip.name === 'idle');
+    const actionRaw = meta.clips.find((clip) => clip.name === 'shoot');
 
     return {
       id,
@@ -286,6 +349,7 @@ export async function loadPedestrianVat(
       albedo,
       walk: new VatClip(walkRaw),
       idle: idleRaw ? new VatClip(idleRaw) : null,
+      action: actionRaw ? new VatClip(actionRaw) : null,
       triangles: meta.indexCount / 3,
       vertices: vertexCount,
       bytes: bin.byteLength,

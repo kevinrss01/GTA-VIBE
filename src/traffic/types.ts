@@ -71,6 +71,15 @@ export interface VehicleView {
   readonly roll: number;
   /** True while the brake lights are lit. */
   readonly braking: boolean;
+  /**
+   * Longitudinal acceleration, m/s². Negative under braking.
+   *
+   * Published because `braking` is a LAMP, not a force: the lights come on at
+   * 0.55 m/s² of lift-off, which is most of what a car in traffic does all day
+   * and nothing like hard enough to make a tyre squeal. Anything deciding how
+   * violently a car is stopping has to read this instead.
+   */
+  readonly accelLong: number;
   readonly control: VehicleControl;
 }
 

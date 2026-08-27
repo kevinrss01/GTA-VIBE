@@ -44,7 +44,7 @@ import { Vector3 } from 'three';
 
 import { clamp, damp } from '../core/mathx';
 import { createRng, type Rng } from '../core/rng';
-import { HEAT, WEAPONS, type PlayerState, type WeaponId } from '../player/PlayerState';
+import { ALL_WEAPONS, HEAT, WEAPONS, type PlayerState, type WeaponId } from '../player/PlayerState';
 import type { ColliderBox } from '../world/build/types';
 import {
   Armoury,
@@ -56,6 +56,7 @@ import {
   type Direction,
 } from './ballistics';
 import { CombatFx, type ImpactKind } from './CombatFx';
+import { Projectiles, type RocketHandle } from './Projectiles';
 import { rayCylinder, rayGround, rayOrientedBox, WorldRayIndex } from './rays';
 import { EMPTY_ACTORS, type ActorSource, type ActorTarget, type LawTargets } from './targets';
 import { WeaponViewmodel, type ViewmodelSet } from './WeaponViewmodel';
@@ -74,8 +75,41 @@ const CLEARANCE_PROBE = 1.1;
 /** Weapons that keep firing while the trigger is held. */
 const AUTOMATIC: ReadonlySet<WeaponId> = new Set<WeaponId>(['smg', 'rifle']);
 
-/** Number keys, in the order the shop lists weapons. */
-const SLOT_ORDER: readonly WeaponId[] = ['pistol', 'smg', 'shotgun', 'rifle'];
+/** Seconds between dry-fire clicks, so a held trigger is not a woodpecker. */
+const DRY_CLICK_INTERVAL = 0.34;
+
+/**
+ * Where a vehicle stops being sheet metal and starts being glass.
+ *
+ * A fraction of the vehicle's own half height, measured up from its centre.
+ * Above it a round goes through a window, below it through a door skin, and
+ * the two do not sound or look remotely alike.
+ */
+const GLAZING_FROM = 0.34;
+
+/**
+ * Blast damage as a fraction of the peak, against distance from the seat of
+ * the explosion as a fraction of its radius.
+ *
+ * Full damage inside the first third - anyone that close is inside the
+ * fireball - then a square falloff to nothing at the edge. A linear falloff
+ * made the outer half of the radius feel like a much bigger weapon than it is.
+ */
+function blastFalloff(share: number): number {
+  if (share <= 0.34) return 1;
+  if (share >= 1) return 0;
+  const t = (1 - share) / 0.66;
+  return t * t;
+}
+
+/**
+ * Number keys, in the order the shop lists weapons.
+ *
+ * Kept in step with `ALL_WEAPONS` on purpose: the row the player sees in the
+ * shop and the key they press for it have to be the same ordinal or the
+ * mapping is a memory test.
+ */
+const SLOT_ORDER: readonly WeaponId[] = ALL_WEAPONS;
 
 /** A vehicle, as little of one as combat needs. */
 export interface CombatVehicleView {
@@ -122,8 +156,42 @@ export interface CombatSystemOptions {
   readonly law?: LawTargets | undefined;
   readonly hud?: CombatHud | undefined;
   readonly seed?: string | undefined;
-  /** Fires for every shot that lands, so audio can play something. */
+  /** Fires for every shot that leaves the barrel, so audio can play something. */
   readonly onShot?: ((weapon: WeaponId) => void) | undefined;
+  /** Fires for every projectile that arrives somewhere. */
+  readonly onImpact?:
+    | ((kind: ImpactKind, x: number, y: number, z: number) => void)
+    | undefined;
+  /** Handling the weapon rather than firing it: drawing, stowing, an empty gun. */
+  readonly onHandling?: ((kind: 'draw' | 'holster' | 'dry' | 'reload') => void) | undefined;
+  /** A rocket left the tube, so audio can follow its motor down the street. */
+  readonly onRocket?: ((rocket: RocketHandle) => void) | undefined;
+  /**
+   * The player reached for a weapon they do not have.
+   *
+   * Without this a slot key for an unbought weapon is indistinguishable from a
+   * key that is not bound at all, which is exactly how "the weapon switching
+   * does not work" gets reported: the control was working the whole time and
+   * had nothing to say.
+   */
+  readonly onSlotDenied?: ((weapon: WeaponId, reason: 'unowned' | 'empty') => void) | undefined;
+  /**
+   * A warhead went off. `distance` is from the player, so the caller can
+   * decide how hard to shake the camera and how long to ring the ears.
+   */
+  readonly onExplosion?:
+    | ((x: number, y: number, z: number, radius: number, distance: number) => void)
+    | undefined;
+  /**
+   * The rocket model, for the launcher.
+   *
+   * The projectile layer is built HERE rather than passed in, because it needs
+   * this system's own world probe and its own detonation, and handing those
+   * out through the constructor would make the two mutually dependent at the
+   * call site. Omit it and rockets still fly and still explode; they are just
+   * invisible while they do it.
+   */
+  readonly rocketUrl?: string | undefined;
   /**
    * Generated weapon models to hold in view. Omit for no view model at all -
    * the game is playable and every shot registers identically without one.
@@ -150,6 +218,9 @@ interface Hit {
   /** Foot height and total height of an actor, for the damage zone. */
   footY: number;
   height: number;
+  /** Centre and half height of a vehicle, for telling glazing from panel. */
+  vehicleY: number;
+  vehicleHalf: number;
   nx: number;
   ny: number;
   nz: number;
@@ -191,6 +262,7 @@ export class CombatSystem {
   private readonly civilians: ActorSource;
   private readonly witnesses: WitnessSource | null;
   private readonly viewmodel: WeaponViewmodel | null;
+  private readonly projectiles: Projectiles;
 
   private trigger = false;
   /** Cleared on mouse-up so a semi-automatic needs a fresh pull. */
@@ -205,13 +277,14 @@ export class CombatSystem {
   private stowed = false;
   private recoilPitch = 0;
   private recoilYaw = 0;
+  private dryClick = 0;
   private paused = false;
   private disposed = false;
 
   private readonly direction: Direction = { x: 0, y: 0, z: 0 };
   private readonly hit: Hit = {
     t: 0, kind: 'none', actor: -1, vehicleId: -1, footY: 0, height: 0,
-    nx: 0, ny: 1, nz: 0, box: null,
+    vehicleY: 0, vehicleHalf: 0, nx: 0, ny: 1, nz: 0, box: null,
   };
   private readonly candidates: Candidate[] = [];
   private candidateCount = 0;
@@ -244,8 +317,15 @@ export class CombatSystem {
     this.group = this.fx.group;
     this.group.userData.combat = this;
     this.viewmodel = options.viewmodels ? new WeaponViewmodel(options.viewmodels) : null;
-
-    if (this.viewmodel) this.group.add(this.viewmodel.group);
+    this.projectiles = new Projectiles({
+      url: options.rocketUrl,
+      length: 0.62,
+      probe: (ox, oy, oz, dx, dy, dz, maxT) => this.probeRocket(ox, oy, oz, dx, dy, dz, maxT),
+      onDetonate: (x, y, z) => this.detonate(x, y, z),
+      onTrail: (x, y, z) => this.fx.exhaust(x, y, z, () => this.rng.next()),
+      ...(options.onRocket ? { onLaunch: options.onRocket } : {}),
+    });
+    this.group.add(this.projectiles.group);
 
     // Guarded so the whole hit-registration path can be constructed and driven
     // in a unit test with no DOM at all. `fireOnce` and `setTrigger` are the
@@ -254,6 +334,7 @@ export class CombatSystem {
     const view = typeof window === 'undefined' ? null : window;
     view?.addEventListener('mouseup', this.onMouseUp);
     view?.addEventListener('keydown', this.onKeyDown);
+    view?.addEventListener('wheel', this.onWheel, { passive: true });
     view?.addEventListener('blur', this.onBlur);
   }
 
@@ -277,7 +358,9 @@ export class CombatSystem {
   }
 
   reload(): boolean {
-    return this.armoury.startReload(this.options.player.equipped);
+    const started = this.armoury.startReload(this.options.player.equipped);
+    if (started) this.options.onHandling?.('reload');
+    return started;
   }
 
   /** True while the weapon is holstered. Nothing fires in this state. */
@@ -295,6 +378,10 @@ export class CombatSystem {
       this.trigger = false;
       this.triggerLatched = false;
     }
+    // Only when the player actually has something to put away or take out.
+    if (this.options.player.equipped) {
+      this.options.onHandling?.(holstered ? 'holster' : 'draw');
+    }
   }
 
   toggleHolster(): boolean {
@@ -305,11 +392,51 @@ export class CombatSystem {
   equipSlot(slot: number): boolean {
     const id = SLOT_ORDER[slot];
     if (!id) return false;
-    if (!this.options.player.owns(id)) return false;
+    const player = this.options.player;
+    if (!player.owns(id)) {
+      this.options.onSlotDenied?.(id, 'unowned');
+      return false;
+    }
+    if (player.ammo(id) <= 0) this.options.onSlotDenied?.(id, 'empty');
     // Reaching for a weapon is taking it out. Making the player press two keys
     // to draw the one they just asked for would be a puzzle, not a control.
+    const wasStowed = this.stowed;
     this.setHolstered(false);
-    return this.options.player.equip(id);
+    const changed = player.equipped !== id;
+    const equipped = player.equip(id);
+    // Swapping weapons is a draw too, but only when something actually
+    // changed - re-pressing the key for the weapon already in hand is not.
+    if (equipped && changed && !wasStowed) this.options.onHandling?.('draw');
+    return equipped;
+  }
+
+  /**
+   * Steps to the next or previous weapon the player actually owns.
+   *
+   * The scroll wheel's job, and the reason it exists at all: the number row
+   * needs a modifier on several common layouts and is nowhere near the hand on
+   * a trackpad, so a player who cannot reach `2` still has to be able to reach
+   * the SMG. Weapons the player does not own are skipped rather than reported,
+   * because a wheel is a browse and not a request for a specific thing.
+   */
+  cycleWeapon(direction: 1 | -1): boolean {
+    const player = this.options.player;
+    const owned = SLOT_ORDER.filter((id) => player.owns(id));
+    if (owned.length === 0) return false;
+    const current = player.equipped;
+    const at = current ? owned.indexOf(current) : -1;
+    // From nothing equipped, a scroll down starts at the first weapon and a
+    // scroll up at the last, rather than both landing on the same one.
+    const next = at < 0
+      ? (direction > 0 ? 0 : owned.length - 1)
+      : (at + direction + owned.length) % owned.length;
+    const id = owned[next];
+    if (!id) return false;
+    const changed = id !== current;
+    this.setHolstered(false);
+    const equipped = player.equip(id);
+    if (equipped && changed) this.options.onHandling?.('draw');
+    return equipped;
   }
 
   /**
@@ -318,6 +445,19 @@ export class CombatSystem {
    */
   get effects(): CombatFx {
     return this.fx;
+  }
+
+  /**
+   * The held weapon and hands, for the renderer's first-person overlay pass.
+   *
+   * Deliberately NOT part of `group`. `group` goes into the scene, where the
+   * depth buffer is shared with the city and a shop counter the player is
+   * standing at is geometrically inside the weapon they are holding. This one
+   * belongs in `Engine.overlayScene`, which is drawn afterwards against a
+   * cleared depth buffer - see `Engine.renderFrame`.
+   */
+  get overlay(): Object3D | null {
+    return this.viewmodel?.group ?? null;
   }
 
   /** True once the equipped weapon's generated model is on screen. */
@@ -351,9 +491,15 @@ export class CombatSystem {
     };
   }
 
+  /** Rockets in the air. Diagnostics and automated QA. */
+  get rocketsLive(): number {
+    return this.projectiles.liveCount;
+  }
+
   /** Clears cooldowns, reloads and live effects. Called on respawn. */
   reset(): void {
     this.armoury.reset();
+    this.projectiles.clear();
     this.fx.clear();
     this.trigger = false;
     this.triggerLatched = false;
@@ -371,6 +517,8 @@ export class CombatSystem {
 
     this.witnesses?.refresh(dt);
     this.armoury.update(dt);
+    if (this.dryClick > 0) this.dryClick = Math.max(0, this.dryClick - dt);
+    this.projectiles.update(dt);
 
     if (!this.paused && this.trigger && !ctx.driving) {
       const id = this.options.player.equipped;
@@ -417,8 +565,10 @@ export class CombatSystem {
     const view = typeof window === 'undefined' ? null : window;
     view?.removeEventListener('mouseup', this.onMouseUp);
     view?.removeEventListener('keydown', this.onKeyDown);
+    view?.removeEventListener('wheel', this.onWheel);
     view?.removeEventListener('blur', this.onBlur);
     this.viewmodel?.dispose();
+    this.projectiles.dispose();
     this.fx.dispose();
   }
 
@@ -430,7 +580,17 @@ export class CombatSystem {
     if (!id || !player.alive || this.stowed) return false;
     const outcome = this.armoury.fire(id);
     if (!outcome.fired) {
-      if (outcome.reason === 'magazine') this.armoury.startReload(id);
+      if (outcome.reason === 'magazine') {
+        if (this.armoury.startReload(id)) this.options.onHandling?.('reload');
+      }
+      // A trigger pull on an empty weapon has to make a sound or the player
+      // reads it as the game having stopped responding to the mouse.
+      if (outcome.reason === 'noAmmo' || outcome.reason === 'magazine') {
+        if (this.dryClick <= 0) {
+          this.dryClick = DRY_CLICK_INTERVAL;
+          this.options.onHandling?.('dry');
+        }
+      }
       return false;
     }
 
@@ -454,6 +614,22 @@ export class CombatSystem {
       mx = this.muzzle.x;
       my = this.muzzle.y;
       mz = this.muzzle.z;
+    }
+
+    // A weapon with a muzzle speed fires an object, not a ray. Everything
+    // below this point - candidate gathering, per-pellet casting, per-victim
+    // heat - is the hitscan path and does not apply to it: a rocket's
+    // consequences happen wherever and whenever it lands, which is `detonate`.
+    if (spec.muzzleSpeed !== undefined) {
+      this.fireProjectile(spec.muzzleSpeed, mx, my, mz);
+      this.counters.shotsFired += 1;
+      if (this.witnessed()) player.addHeat(HEAT.gunshot);
+      this.fx.muzzle(mx, my, mz, 1.9);
+      const blastKick = recoilKick(spec);
+      this.recoilPitch = clamp(this.recoilPitch + blastKick, 0, 0.2);
+      this.viewmodel?.punch(2.4);
+      this.options.onShot?.(id);
+      return true;
     }
 
     const maxT = spec.rangeM * FALLOFF_END;
@@ -506,11 +682,11 @@ export class CombatSystem {
         }
         if (hit.kind === 'police') hitPolice = true;
       } else if (hit.kind === 'policeVehicle') {
-        impact = 'metal';
+        impact = this.vehicleSurface(hit, endY);
         hitPoliceVehicle = true;
         this.options.law?.damageVehicle(hit.vehicleId, base);
       } else if (hit.kind === 'vehicle') {
-        impact = 'metal';
+        impact = this.vehicleSurface(hit, endY);
       }
 
       this.fx.impact(
@@ -523,6 +699,7 @@ export class CombatSystem {
         impact,
         () => this.rng.next(),
       );
+      this.options.onImpact?.(impact, endX, endY, endZ);
     }
 
     // -- consequences -------------------------------------------------------
@@ -670,6 +847,8 @@ export class CombatSystem {
       hit.t = t;
       hit.kind = view.police ? 'policeVehicle' : 'vehicle';
       hit.vehicleId = view.id;
+      hit.vehicleY = view.y;
+      hit.vehicleHalf = view.halfHeight;
       hit.actor = -1;
       hit.nx = -dir.x;
       hit.ny = -dir.y;
@@ -702,6 +881,148 @@ export class CombatSystem {
     }
 
     return hit;
+  }
+
+  /**
+   * Glazing or bodywork.
+   *
+   * A vehicle is one oriented box to the ray test, so the only thing that can
+   * distinguish a window from a door is where up the box the round landed.
+   * Above `GLAZING_FROM` of the half height is the greenhouse on every shape
+   * in the fleet, from the compact to the box truck.
+   */
+  private vehicleSurface(hit: Hit, hitY: number): ImpactKind {
+    if (hit.vehicleHalf <= 0) return 'metal';
+    return (hitY - hit.vehicleY) / hit.vehicleHalf >= GLAZING_FROM ? 'glass' : 'metal';
+  }
+
+  /**
+   * Sends a rocket downrange.
+   *
+   * The aim is taken from the camera rather than from the muzzle so the rocket
+   * goes where the crosshair is, not where a barrel held at the shoulder
+   * happens to point - those differ by about two degrees, which is a metre and
+   * a half at thirty metres and reads as the weapon being inaccurate.
+   */
+  private fireProjectile(speed: number, mx: number, my: number, mz: number): void {
+    spreadDirection(
+      this.aim.x, this.aim.y, this.aim.z,
+      WEAPONS.launcher.spreadRad, this.rng, this.direction,
+    );
+    this.projectiles.launch(mx, my, mz, this.direction.x, this.direction.y, this.direction.z, speed);
+  }
+
+  /**
+   * Nearest obstruction along a rocket's next step.
+   *
+   * Reuses the same candidate gathering and the same cast the hitscan weapons
+   * do, so a rocket collides with exactly the things a bullet collides with
+   * and there is no second, subtly different world model to keep in step.
+   */
+  private probeRocket(
+    ox: number,
+    oy: number,
+    oz: number,
+    dx: number,
+    dy: number,
+    dz: number,
+    maxT: number,
+  ): number {
+    this.aim.set(dx, dy, dz);
+    this.gatherCandidates(ox, oy, oz, maxT, 0);
+    this.direction.x = dx;
+    this.direction.y = dy;
+    this.direction.z = dz;
+    const hit = this.castOne(ox, oy, oz, this.direction, maxT);
+    return hit.kind === 'none' ? -1 : hit.t;
+  }
+
+  /**
+   * A warhead going off.
+   *
+   * Damage is radial and applied ONCE per victim, which is why it walks the
+   * actor sources directly rather than going anywhere near `castOne`: a blast
+   * is not a very fat bullet, it does not care about line of sight along a
+   * ray, and everyone inside the radius is hit at the same instant.
+   *
+   * Line of sight is deliberately not tested at all. A grenade behind a kerb
+   * killing somebody standing on it is correct - blast goes over cover - and
+   * casting a ray to every person in a 9.5 m radius to decide otherwise would
+   * cost more than the whole rest of the weapon.
+   */
+  detonate(x: number, y: number, z: number): void {
+    const spec = WEAPONS.launcher;
+    const radius = spec.blastRadius ?? 8;
+    const peak = spec.blastDamage ?? 150;
+    const player = this.options.player;
+
+    this.fx.explosion(x, y, z, radius, () => this.rng.next());
+
+    let civiliansHurt = 0;
+    let civiliansKilled = 0;
+    let officersHurt = 0;
+    let officersKilled = 0;
+    let hitPolice = false;
+
+    const strike = (
+      source: ActorSource,
+      police: boolean,
+    ): void => {
+      source.forEachActor(x, z, radius, (target) => {
+        // Measured to the middle of the body, not to the feet: somebody
+        // standing at the lip of the radius is otherwise untouched by a blast
+        // that visibly engulfs them.
+        const dx = target.x - x;
+        const dy = target.y + target.height * 0.5 - y;
+        const dz = target.z - z;
+        const distance = Math.hypot(dx, dy, dz);
+        if (distance > radius) return;
+        const damage = peak * blastFalloff(distance / radius);
+        if (damage <= 0) return;
+        const result = source.damage(target.id, damage);
+        if (result === 'killed') {
+          if (police) officersKilled += 1;
+          else civiliansKilled += 1;
+        } else if (result === 'hurt') {
+          if (police) officersHurt += 1;
+          else civiliansHurt += 1;
+        }
+        if (police && result !== 'none') hitPolice = true;
+      });
+    };
+
+    strike(this.civilians, false);
+    if (this.options.law) strike(this.options.law, true);
+
+    let hitPoliceVehicle = false;
+    this.options.vehicles?.forEachNear(x, z, radius, (view) => {
+      if (!view.police) return;
+      const distance = Math.hypot(view.x - x, view.y - y, view.z - z);
+      if (distance > radius) return;
+      hitPoliceVehicle = true;
+      this.options.law?.damageVehicle(view.id, peak * blastFalloff(distance / radius));
+    });
+
+    for (let i = 0; i < civiliansHurt; i += 1) player.addHeat(HEAT.civilianHurt);
+    for (let i = 0; i < civiliansKilled; i += 1) player.addHeat(HEAT.civilianKilled);
+    for (let i = 0; i < officersHurt; i += 1) player.addHeat(HEAT.policeHurt);
+    for (let i = 0; i < officersKilled; i += 1) player.addHeat(HEAT.policeKilled);
+    if (hitPoliceVehicle && !hitPolice) player.addHeat(HEAT.policeHurt);
+    if (hitPolice || hitPoliceVehicle) this.options.law?.reportAttack(x, z);
+
+    this.counters.civiliansHurt += civiliansHurt;
+    this.counters.civiliansKilled += civiliansKilled;
+    this.counters.officersHurt += officersHurt;
+    this.counters.officersKilled += officersKilled;
+    this.counters.hits += civiliansHurt + civiliansKilled + officersHurt + officersKilled;
+
+    // The player is not immune to their own rocket. Standing next to what you
+    // just fired at is a decision with a consequence, not a free shot.
+    const camera = this.options.camera;
+    const self = Math.hypot(camera.position.x - x, camera.position.y - 1 - y, camera.position.z - z);
+    if (self < radius && player.alive) player.hurt(peak * 0.55 * blastFalloff(self / radius));
+
+    this.options.onExplosion?.(x, y, z, radius, self);
   }
 
   /**
@@ -790,13 +1111,57 @@ export class CombatSystem {
       this.toggleHolster();
       return;
     }
-    if (event.code === 'Digit0') {
+    if (matchesDigit(event, 0)) {
       this.options.player.equip(null);
       return;
     }
-    const slot = SLOT_ORDER.findIndex((_, index) => event.code === `Digit${index + 1}`);
-    if (slot >= 0) this.equipSlot(slot);
+    for (let slot = 0; slot < SLOT_ORDER.length; slot += 1) {
+      if (!matchesDigit(event, slot + 1)) continue;
+      this.equipSlot(slot);
+      return;
+    }
   };
+
+  /**
+   * The scroll wheel cycles weapons, but only while the game owns the pointer.
+   *
+   * Without the pointer-lock check a scroll over the pause menu or the shop
+   * would silently change the weapon behind them.
+   */
+  private readonly onWheel = (event: WheelEvent): void => {
+    if (this.paused || event.deltaY === 0) return;
+    if (typeof document === 'undefined') return;
+    if (document.pointerLockElement !== this.options.domElement) return;
+    this.cycleWeapon(event.deltaY > 0 ? 1 : -1);
+  };
+}
+
+/**
+ * True when a key event is the player asking for a given number.
+ *
+ * Three ways, because one is not enough across the keyboards this game is
+ * actually played on:
+ *
+ *  - `code === 'DigitN'` is the physical key in the number row, which is right
+ *    on every layout where that key is unshifted.
+ *  - `code === 'NumpadN'` is the same number on the keypad, which a desktop
+ *    player may well be using and which reports a completely different code.
+ *  - `key === 'N'` is the character actually produced, which is the only one
+ *    that works on a layout where the number needs a modifier - and the only
+ *    one that works when the browser remaps the row at all.
+ *
+ * Modified presses are excluded outright: Command-1 and Control-1 are browser
+ * tab switches, and firing a weapon swap underneath one of those is worse than
+ * ignoring it.
+ */
+function matchesDigit(event: KeyboardEvent, digit: number): boolean {
+  if (event.ctrlKey || event.metaKey || event.altKey) return false;
+  const text = String(digit);
+  return (
+    event.code === `Digit${text}` ||
+    event.code === `Numpad${text}` ||
+    event.key === text
+  );
 }
 
 /**

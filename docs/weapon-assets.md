@@ -192,3 +192,47 @@ harness driving frames by hand sees exactly what a player sees.
 with one material and three textures, no animations and no skins, and reports
 `transforms ok`. Triangle counts are in the table above: the whole armoury is
 5 798 triangles, of which at most 2 020 are ever drawn at once.
+
+## The launcher, 2026-08-27
+
+| Asset | Path | Task | Triangles | Length | Credits |
+| --- | --- | --- | --- | --- | --- |
+| `launcher` (Harbour Breaker) | `public/models/weapons/launcher.glb` | `9e594bb0-01d8-4f9c-9e9f-6c4677fa8e96` | 1 599 | 0.998 (normalised) | 40 |
+| rocket | `public/models/weapons/rocket.glb` | `c0933ac6-23e4-401d-beff-6868bceb6177` | 848 | 0.998 (normalised) | 40 |
+
+Prompts, in the same house style as the rest:
+
+- `launcher` — "game-ready shoulder-fired rocket launcher prop, side profile,
+  long matte olive-green fibreglass tube with black rubber shoulder pad and
+  pistol grip, simple flip-up iron sight and a short carry handle, clean
+  readable silhouette, single fused mesh, PBR materials, neutral studio
+  lighting, no stand, no base, no text"
+- `rocket` — "game-ready anti-tank rocket projectile prop, side profile,
+  olive-green cylindrical body with a pointed dark grey warhead nose and four
+  small swept tail fins at the rear, clean readable silhouette, single fused
+  mesh, PBR materials, neutral studio lighting, no stand, no base, no text"
+
+Both at `model_version=P1-20260311`, `texture_alignment=geometry`, PBR and
+texture on, `face_limit` 1 600 and 900.
+
+### Which way round they are
+
+Measured, not guessed, by slicing each mesh into twelve slabs along its longest
+axis and reading the cross-section of each:
+
+- **Launcher.** The slab at max-Z is 188 vertices across a clean 0.100 × 0.102
+  ring — an open tube. The slab at min-Z is 0.055 × 0.189, tall and narrow: the
+  shoulder pad. The pistol grip is the −0.183 dip a quarter of the way back.
+  Muzzle at max-Z, so it takes the pistol's `yaw: Math.PI`.
+- **Rocket.** The slab at max-Z is 12 vertices across 8 mm — the point of the
+  warhead. The slab at min-Z spans 0.232, twice the body's width: the fins.
+  Nose already at +Z, so `Projectiles` aims the model's own +Z down the
+  velocity with no correction in between.
+
+### Framing
+
+The launcher is the only weapon that is not held in front of the chest — it
+rides on the shoulder, and its butt is a third of a metre behind its middle.
+Centred where the carbine is, the butt plate ended up behind the near plane and
+the player was looking down the inside of their own launch tube. It is centred
+0.56 m out and pushed down and right so the tube clears the crosshair.

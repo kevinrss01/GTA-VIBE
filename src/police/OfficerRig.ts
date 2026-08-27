@@ -39,7 +39,6 @@
  * stride of 1.61 rig units lands on the ground as.
  */
 
-import type { Object3D } from 'three';
 
 import { SHAPE_HAT, packColor } from '../agents/appearance';
 import { gaitCadence, hipAmplitude } from '../agents/gait';
@@ -49,6 +48,18 @@ import {
 } from '../agents/PedestrianProcRig';
 import { createPedestrianVatMesh, type PedestrianVatBundle } from '../agents/PedestrianRig';
 import { loadPedestrianVat, type PedestrianVatCharacter } from '../agents/PedestrianVat';
+import {
+  Group,
+  InstancedMesh,
+  Matrix4,
+  Quaternion,
+  Vector3,
+  type Material,
+  type Mesh,
+  type Object3D,
+} from 'three';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+
 import { clamp, damp } from '../core/mathx';
 import { hash2 } from '../core/rng';
 
@@ -75,6 +86,40 @@ const BOOTS = packColor(0x111317);
 const CAP = packColor(0x161c28);
 const HAIR = packColor(0x1b1712);
 const SKIN: readonly number[] = [0x8d5524, 0xa9683b, 0xc68642, 0xd9a066, 0xefc9a3, 0x6b4226];
+
+/**
+ * The sidearm an officer holds while they are firing.
+ *
+ * Drawn as its own small `InstancedMesh` - one draw call for every officer in
+ * the city, and hidden entirely while nobody is aiming - rather than being
+ * baked into the character, because a VAT is a fixed mesh: a weapon inside it
+ * would be in the officer's hand while they were walking, standing, and lying
+ * down, and could never be dropped, holstered or shot out of their grip.
+ *
+ * Where it goes comes from the bake's own measurement of the right hand
+ * (`VatClip.handAt`), so it follows the hand that is holding it instead of
+ * being pinned to an offset somebody guessed.
+ */
+const WEAPON_URL = 'models/shop/pistol.glb';
+/** Real length of that model along its barrel, in metres. */
+const WEAPON_LENGTH = 0.21;
+/**
+ * How far in front of the hand the weapon's centre sits, along the officer's
+ * own forward axis, in metres.
+ *
+ * MEASURED, and larger than it looks like it should be. Tripo's biped library
+ * has exactly one shooting preset and it is a CROUCHED stance with the weapon
+ * hand drawn in to the chest - the baked right hand sits at the sternum, 0.027
+ * body-heights in front of the body's own centre line, with the elbow outboard
+ * of it. That is a real firing position (it is where a long weapon's grip hand
+ * goes, and where a pistol goes in a close-quarters compressed ready) but it
+ * means a weapon drawn AT the hand is inside the officer's chest. The torso
+ * front at that height is about 0.12 body-heights out, so the weapon is pushed
+ * clear of it and reads as being held in front of the chest.
+ */
+const WEAPON_REACH = 0.22;
+/** Above this blend the weapon is in the hand and drawn. */
+const WEAPON_SHOWN = 0.35;
 
 /** Comfortable walking speed used to pick a cadence. */
 const PREFERRED_SPEED = 1.5;
@@ -108,6 +153,14 @@ export interface OfficerPose {
   /** Previous position, so the REALISED displacement is what advances the clip. */
   lastX: number;
   lastZ: number;
+  /**
+   * How far into the firing stance this officer is, 0..1. Owned by the caller.
+   *
+   * Blended over the gait rather than replacing it, so an officer bringing
+   * their weapon up while still moving reads as one person doing two things
+   * and not as a pose snapping on.
+   */
+  aiming: number;
 }
 
 /** Fresh appearance for one officer, deterministic in `seed`. */
@@ -129,7 +182,17 @@ export class OfficerRig {
   private readonly proc: ProcPedestrianMeshBundle;
   private readonly vat: PedestrianVatBundle;
   private character: PedestrianVatCharacter | null = null;
+  private weapon: InstancedMesh | null = null;
+  private readonly weaponHolder = new Group();
+  private weaponRequested = false;
   private disposed = false;
+
+  private readonly hand = { x: 0, y: 0, z: 0 };
+  private readonly weaponMatrix = new Matrix4();
+  private readonly weaponPosition = new Vector3();
+  private readonly weaponRotation = new Quaternion();
+  private readonly weaponScale = new Vector3(1, 1, 1);
+  private readonly weaponAxis = new Vector3(0, 1, 0);
 
   /**
    * `load` defaults to "only where a browser can resolve a relative URL".
@@ -154,12 +217,76 @@ export class OfficerRig {
     this.vat.mesh.count = 0;
     this.vat.mesh.visible = false;
 
-    if (load) void this.load();
+    this.weaponHolder.name = 'police-sidearms';
+    if (load) {
+      void this.load();
+      this.loadWeapon();
+    }
   }
 
-  /** Both meshes. Add every one of them to the scene; only one ever draws. */
+  /**
+   * Downloads the sidearm and builds its instanced mesh.
+   *
+   * Failure is silent and survivable: officers then fire with empty hands,
+   * which is what they did before this existed, and nothing else changes.
+   */
+  private loadWeapon(baseUrl = ''): void {
+    if (this.weaponRequested || this.disposed) return;
+    this.weaponRequested = true;
+    new GLTFLoader().load(
+      `${baseUrl}${WEAPON_URL}`,
+      (gltf) => {
+        if (this.disposed) return;
+        let source: Mesh | null = null;
+        gltf.scene.updateMatrixWorld(true);
+        gltf.scene.traverse((child: Object3D) => {
+          const mesh = child as Mesh;
+          if (!source && mesh.isMesh && mesh.geometry) source = mesh;
+        });
+        const found = source as Mesh | null;
+        if (!found) return;
+        const geometry = found.geometry.clone();
+        geometry.applyMatrix4(found.matrixWorld);
+        // The model arrives normalised into a unit box with a centre pivot,
+        // like every Tripo asset. Scaling by the real length here means the
+        // per-instance matrix only has to carry position and rotation.
+        geometry.computeBoundingBox();
+        const box = geometry.boundingBox;
+        const longest = box
+          ? Math.max(box.max.x - box.min.x, box.max.y - box.min.y, box.max.z - box.min.z)
+          : 1;
+        geometry.scale(
+          WEAPON_LENGTH / longest,
+          WEAPON_LENGTH / longest,
+          WEAPON_LENGTH / longest,
+        );
+        const material = Array.isArray(found.material)
+          ? (found.material[0] as Material)
+          : (found.material as Material);
+        const mesh = new InstancedMesh(geometry, material, this.vat.mesh.instanceMatrix.count);
+        mesh.name = 'police-sidearm';
+        mesh.frustumCulled = false;
+        mesh.castShadow = false;
+        mesh.count = 0;
+        mesh.visible = false;
+        this.weapon = mesh;
+        this.weaponHolder.add(mesh);
+      },
+      undefined,
+      () => {
+        /* An officer with empty hands is a small loss; a crash is not. */
+      },
+    );
+  }
+
+  /** Every mesh. Add all of them to the scene; only the right ones draw. */
   get meshes(): readonly Object3D[] {
-    return [this.vat.mesh, this.proc.mesh];
+    return [this.vat.mesh, this.proc.mesh, this.weaponHolder];
+  }
+
+  /** True once the officers' sidearm model is on screen. Diagnostics and QA. */
+  get weaponReady(): boolean {
+    return this.weapon !== null;
   }
 
   /** True once the baked officer is installed and being drawn. */
@@ -235,7 +362,7 @@ export class OfficerRig {
         anim[a + 1] = 0;
       }
       anim[a + 2] = pose.gait;
-      anim[a + 3] = 0;
+      anim[a + 3] = clamp(pose.aiming, 0, 1);
 
       // No tint. The uniform IS the albedo; multiplying it would be exactly
       // the mistake that kept officers procedural in the first place.
@@ -254,6 +381,76 @@ export class OfficerRig {
       this.vat.anim.needsUpdate = true;
       this.vat.tint.needsUpdate = true;
     }
+
+    // Every officer firing at once is at the same point of the same one-second
+    // pose, so the phase is a uniform rather than a per-instance float. It is
+    // driven by the clock and not by anything an officer does, which is right
+    // for a settled stance: what changes per officer is how far into it they
+    // are, and that is the blend.
+    const action = character.action;
+    if (action && action.duration > 1e-3) {
+      this.vat.setActionPhase((time / action.duration) % 1);
+    }
+    this.writeWeapons(poses, character, time);
+  }
+
+  /**
+   * Puts a sidearm in the hand of every officer who has one raised.
+   *
+   * The hand's position comes from the bake, in rig units, and goes through
+   * exactly the transform the instance matrix applies to the body: scale by
+   * girth across and height up, yaw by heading, translate to the officer. Do
+   * this any other way and the weapon drifts out of the hand the moment an
+   * officer is taller or wider than average.
+   */
+  private writeWeapons(
+    poses: readonly OfficerPose[],
+    character: PedestrianVatCharacter,
+    time: number,
+  ): void {
+    const weapon = this.weapon;
+    if (!weapon) return;
+    const action = character.action;
+    const phase = action && action.duration > 1e-3 ? (time / action.duration) % 1 : 0;
+    const matrices = weapon.instanceMatrix.array as Float32Array;
+    let drawn = 0;
+
+    for (const pose of poses) {
+      if (drawn >= weapon.instanceMatrix.count) break;
+      if (pose.aiming < WEAPON_SHOWN) continue;
+      const track = action ?? character.idle ?? character.walk;
+      if (!track.handAt(phase, this.hand)) continue;
+
+      const c = Math.cos(pose.heading);
+      const s = Math.sin(pose.heading);
+      const width = pose.girth;
+      // The body's own instance transform, applied to one point.
+      const handX = pose.x + width * (c * this.hand.x + s * this.hand.z);
+      const handY = pose.y + pose.height * this.hand.y;
+      const handZ = pose.z + width * (-s * this.hand.x + c * this.hand.z);
+
+      // Along the officer's heading, which is where they are shooting: the
+      // forearm-to-hand vector would point the barrel wherever the retargeted
+      // clip happens to leave the wrist, and this pose is a two-handed hold
+      // with the weapon across the body rather than an extended arm.
+      const forwardX = -s;
+      const forwardZ = -c;
+      this.weaponPosition.set(
+        handX + forwardX * WEAPON_REACH,
+        handY,
+        handZ + forwardZ * WEAPON_REACH,
+      );
+      // The model's barrel lies along its own +Z, so a half turn plus the
+      // officer's heading puts it down the officer's forward axis.
+      this.weaponRotation.setFromAxisAngle(this.weaponAxis, pose.heading + Math.PI);
+      this.weaponMatrix.compose(this.weaponPosition, this.weaponRotation, this.weaponScale);
+      this.weaponMatrix.toArray(matrices, drawn * 16);
+      drawn += 1;
+    }
+
+    weapon.count = drawn;
+    weapon.visible = drawn > 0;
+    if (drawn > 0) weapon.instanceMatrix.needsUpdate = true;
   }
 
   private writeProc(poses: readonly OfficerPose[]): void {
@@ -336,6 +533,12 @@ export class OfficerRig {
     this.vat.dispose();
     this.character?.dispose();
     this.character = null;
+    if (this.weapon) {
+      this.weapon.geometry.dispose();
+      this.weapon.dispose();
+      this.weapon = null;
+    }
+    this.weaponHolder.clear();
   }
 }
 

@@ -11,10 +11,11 @@
  *
  * Every fraction is the weapon's own value over the BEST value in the whole
  * catalogue for that stat, so a full bar means "nothing here beats this" and
- * nothing is rescaled to flatter anything. Each of the four weapons wins
- * exactly one row, which is the shape of the armoury rather than a decision
- * taken here: the Sweeper hits hardest, the SMG shoots fastest and holds most,
- * the Sidearm is tightest, the Carbine reaches furthest.
+ * nothing is rescaled to flatter anything. Every weapon wins at least one row,
+ * which is the shape of the armoury rather than a decision taken here: the
+ * Sweeper hits hardest, the SMG shoots fastest and holds most, the Sidearm is
+ * tightest, the Carbine reaches furthest, and the Breaker is the only thing in
+ * the shop with a blast radius at all.
  *
  * The printed value beside each bar is the real quantity in its real unit -
  * the bar is the comparison, the number is the fact - so nothing about the
@@ -26,7 +27,7 @@
 
 import { ALL_WEAPONS, WEAPONS, type WeaponId, type WeaponSpec } from '../player/PlayerState';
 
-export type WeaponBarKey = 'damage' | 'fireRate' | 'accuracy' | 'range' | 'magazine';
+export type WeaponBarKey = 'damage' | 'fireRate' | 'accuracy' | 'range' | 'magazine' | 'blast';
 
 export interface WeaponBar {
   readonly key: WeaponBarKey;
@@ -101,6 +102,21 @@ const ROWS: readonly Row[] = [
     measure: (spec) => spec.magazine,
     format: (spec) => `${spec.magazine}`,
   },
+  /*
+   * The row that exists so the launcher can be compared honestly.
+   *
+   * Without it a rocket has to be judged on damage-per-shot and range, where
+   * it looks like a slightly odd rifle; the thing it actually does - kill
+   * everything inside nine and a half metres of where it lands - has nowhere
+   * to appear at all. A firearm reads a dash rather than a zero, because zero
+   * blast radius is not a small amount of blast, it is a different weapon.
+   */
+  {
+    key: 'blast',
+    label: 'Blast',
+    measure: (spec) => spec.blastRadius ?? 0,
+    format: (spec) => (spec.blastRadius ? `${spec.blastRadius} m` : '—'),
+  },
 ];
 
 /** The best value in the catalogue for each row, computed once. */
@@ -114,7 +130,7 @@ const BEST: Readonly<Record<WeaponBarKey, number>> = (() => {
   return out;
 })();
 
-/** The five bars for one weapon, in the order they are drawn. */
+/** The bars for one weapon, in the order they are drawn. */
 export function weaponBars(id: WeaponId): readonly WeaponBar[] {
   const spec = WEAPONS[id];
   return ROWS.map((row) => {

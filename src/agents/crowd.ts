@@ -1144,6 +1144,54 @@ export class Crowd {
     return true;
   }
 
+  /**
+   * Knocks everybody inside a radius flat, away from the seat of a blast.
+   *
+   * Unlike `downNearest` this is not about who was hit - the damage has
+   * already been decided by whoever called it - it is about what the street
+   * LOOKS like a second later. Everyone goes down, thrown outwards, and the
+   * throw is hardest at the centre; a blast that killed four people and left
+   * everyone else strolling past it reads as nothing having happened.
+   *
+   * Only the innermost `lethalShare` of the radius is fatal, so somebody at
+   * the edge gets up again. Returns how many people it moved.
+   */
+  blastAt(x: number, z: number, radius: number, lethalShare = 0.55): number {
+    if (radius <= 0) return 0;
+    let count = 0;
+    const span = Math.ceil(radius / CELL);
+    const cx = Math.floor(x / CELL);
+    const cz = Math.floor(z / CELL);
+    const radiusSquared = radius * radius;
+    for (let i = -span; i <= span; i += 1) {
+      for (let j = -span; j <= span; j += 1) {
+        let other = this.cellHead[hashCell(cx + i, cz + j)] ?? -1;
+        while (other >= 0) {
+          const next = this.cellNext[other] ?? -1;
+          const ped = this.peds[other];
+          if (ped && ped.active && ped.state !== 'down') {
+            const dx = ped.x - x;
+            const dz = ped.z - z;
+            const d2 = dx * dx + dz * dz;
+            if (d2 <= radiusSquared) {
+              const distance = Math.sqrt(d2);
+              const share = distance / radius;
+              // Somebody standing exactly on it has no outward direction of
+              // their own; throw them the way they were already facing.
+              const length = distance > 0.05 ? distance : 1;
+              const dirX = distance > 0.05 ? dx / length : -Math.sin(ped.heading);
+              const dirZ = distance > 0.05 ? dz / length : -Math.cos(ped.heading);
+              this.knockDown(ped, dirX, dirZ, 5 + (1 - share) * 9, share <= lethalShare);
+              count += 1;
+            }
+          }
+          other = next;
+        }
+      }
+    }
+    return count;
+  }
+
   private advancePhase(ped: Pedestrian, dt: number): void {
     const look = ped.look;
     // `gaitCadence` is shared with the renderer so the stride the shader draws

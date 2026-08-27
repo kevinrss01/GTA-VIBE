@@ -1630,7 +1630,12 @@ function emitApproach(b: Building): void {
       x: approach.x,
       y: b.outsideY,
       z: approach.z,
-      radius: 1.9,
+      // Wide enough to cover the whole approach: the point sits 1.5 m out from
+      // the door, so this reaches from the threshold itself to about 4 m back
+      // down the pavement. It used to be 1.9, which - with the facing test
+      // taken against this point rather than the door - left a usable band
+      // barely two metres deep that switched off as the player arrived.
+      radius: 2.8,
       prompt: 'Press E to enter',
       kind: 'door',
       // Heading matches the camera convention: forward is (-sin y, 0, -cos y),

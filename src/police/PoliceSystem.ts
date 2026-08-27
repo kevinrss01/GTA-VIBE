@@ -223,8 +223,8 @@ export interface PoliceSystemOptions {
   readonly seed?: string | undefined;
   /** The player has been taken into custody. Drive the respawn from here. */
   readonly onArrest?: (() => void) | undefined;
-  /** An officer fired. For audio. */
-  readonly onOfficerShot?: (() => void) | undefined;
+  /** An officer fired, and where their muzzle was. For audio. */
+  readonly onOfficerShot?: ((x: number, y: number, z: number) => void) | undefined;
 }
 
 export interface PoliceContext {
@@ -436,6 +436,32 @@ export class PoliceSystem implements LawTargets {
   }
 
   /**
+   * Where the officers on foot are, and how far into the firing stance.
+   *
+   * Diagnostics only: it exists so a change to the officer rig can be LOOKED
+   * at - put the camera three metres from a man who is shooting at you - and
+   * so automated QA can assert that somebody really did raise their weapon
+   * rather than that a counter went up.
+   */
+  get officerPoses(): readonly {
+    x: number;
+    y: number;
+    z: number;
+    heading: number;
+    aiming: number;
+  }[] {
+    return this.officers
+      .filter((officer) => officer.state === 'chasing')
+      .map((officer) => ({
+        x: officer.x,
+        y: officer.y,
+        z: officer.z,
+        heading: officer.heading,
+        aiming: Number(officer.aiming.toFixed(3)),
+      }));
+  }
+
+  /**
    * Seconds left of the dispatch delay, for the diagnostics overlay and for
    * automated QA that wants to assert the pacing without a stopwatch.
    */
@@ -602,6 +628,7 @@ export class PoliceSystem implements LawTargets {
         health: ACTOR_HEALTH,
         state: 'riding',
         aim: 0,
+        aiming: 0,
         shotTimer: 0,
         sightTimer: 0,
         blocked: 0,
@@ -896,6 +923,10 @@ export class PoliceSystem implements LawTargets {
         officer.heading = unit.yaw;
         officer.speed = 0;
         officer.seesPlayer = false;
+        // Nobody aims from inside a moving car; the weapon comes up after they
+        // get out. Snapped rather than damped because a riding officer is not
+        // drawn as a person at all.
+        officer.aiming = 0;
         continue;
       }
 
@@ -1002,9 +1033,16 @@ export class PoliceSystem implements LawTargets {
         !(wantsArrest && distance <= ARREST_RANGE * 1.7);
       if (!canShoot) {
         officer.aim = 0;
+        // The stance comes down over about a third of a second, so an officer
+        // who loses sight of the player lowers their weapon rather than
+        // snapping upright.
+        officer.aiming = damp(officer.aiming, 0, 9, dt);
         continue;
       }
       officer.aim += dt;
+      // ...and goes up over the same time it takes them to line the shot up,
+      // so the pose is fully raised exactly when the first round leaves.
+      officer.aiming = damp(officer.aiming, 1, 7, dt);
       if (officer.aim < officerAimTime(stars) || officer.shotTimer > 0) continue;
       officer.shotTimer = OFFICER_SHOT_INTERVAL * (0.85 + this.rng.next() * 0.35);
       this.fireAtPlayer(officer, stars, ctx);
@@ -1031,8 +1069,10 @@ export class PoliceSystem implements LawTargets {
         ctx.playerZ + spreadX * 0.4,
       );
     }
-    this.options.onOfficerShot?.();
-    if (hits) this.options.player.hurt(OFFICER_SHOT_DAMAGE);
+    this.options.onOfficerShot?.(officer.x, muzzleY, officer.z);
+    // The officer's own position is passed with the damage so the HUD can
+    // point the player at whoever is shooting at them.
+    if (hits) this.options.player.hurt(OFFICER_SHOT_DAMAGE, officer.x, officer.z);
   }
 
   // -- housekeeping ---------------------------------------------------------

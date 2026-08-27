@@ -32,6 +32,7 @@
  */
 
 import {
+  BufferAttribute,
   BufferGeometry,
   Matrix4,
   Mesh,
@@ -54,6 +55,7 @@ import {
   measureWheel,
   type BodyFit,
   type BodyMeasurement,
+  type ClippedVertices,
   type WheelArch,
   type WheelMount,
 } from './VehicleModelFit';
@@ -162,17 +164,28 @@ const VEHICLE_INTERIOR: SurfaceStyle = { albedo: 0x33373b, roughness: 0.9, metal
  * every angle without opening a visible rim.
  */
 const WELL_INSET = 0.99;
-/** Clearance between the well and the wheel the renderer drops into it. */
-const WELL_WHEEL_CLEARANCE = 1.06;
 /**
- * How far past the cut radius the inner wing reaches.
+ * Where the well sits relative to the wheel that is drawn in it.
  *
- * The cut drops a whole triangle whenever its centroid lands inside the wheel,
- * so the opening it leaves is wider than the circle it swept. The plate behind
- * the well has to cover that margin as well as the circle, and inboard there
- * is nothing for it to collide with.
+ * BELOW one, deliberately, and that is the whole fix for the dark ring. The
+ * opening in the bodywork is now never wider than the wheel (see
+ * `ARCH_EDGE_INSET`), so a liner drawn just INSIDE the wheel is completely
+ * hidden by it from every angle outside the car while still closing the
+ * oblique sight lines that pass along the flank and miss the wheel entirely.
+ * It used to be 1.06 - six per cent PROUD of the wheel - because the opening
+ * was much wider than the wheel and the liner was what covered the difference.
  */
-const WELL_CAP_MARGIN = 1.02;
+const WELL_WHEEL_CLEARANCE = 0.985;
+/**
+ * How far past the opening the inner wing reaches.
+ *
+ * The opening is now cut exactly (see `ARCH_EDGE_INSET` in `VehicleModelFit`),
+ * so this is no longer covering a ragged margin - it is simple slack, so that
+ * a ray entering at the very lip of the arch still meets the plate rather than
+ * its edge. Inboard there is nothing for the plate to collide with, so slack
+ * costs nothing.
+ */
+const WELL_CAP_MARGIN = 1.06;
 /** Highest the inner wing may reach, as a fraction of the body height. */
 const WELL_CAP_CEILING = 0.55;
 const GENERATED_WHEEL: SurfaceStyle = { albedo: 0xffffff, roughness: 0.6, metalness: 0.0 };
@@ -278,6 +291,29 @@ function flatten(root: Object3D): { geometry: BufferGeometry; material: MeshStan
     merged.setIndex(Array.from(index));
   }
   return { geometry: merged, material };
+}
+
+/**
+ * Appends the arch clip's new vertices to every attribute of a geometry.
+ *
+ * The clip indexes its output past the end of the model's own vertices, so the
+ * arrays have to grow by exactly the count it reports and in exactly the same
+ * order for position, normal and uv. Anything the model does not carry - a
+ * body with no UVs - is skipped rather than invented.
+ */
+function appendVertices(geometry: BufferGeometry, extra: ClippedVertices): void {
+  const grow = (name: 'position' | 'normal' | 'uv', source: Float32Array | null): void => {
+    const attribute = geometry.getAttribute(name);
+    if (!attribute || !source) return;
+    const size = attribute.itemSize;
+    const merged = new Float32Array(attribute.count * size + extra.count * size);
+    merged.set(attribute.array as ArrayLike<number>, 0);
+    merged.set(source, attribute.count * size);
+    geometry.setAttribute(name, new BufferAttribute(merged, size));
+  };
+  grow('position', extra.position);
+  grow('normal', extra.normal);
+  grow('uv', extra.uv);
 }
 
 /**
@@ -419,7 +455,10 @@ function fitInterior(
   for (const arch of arches) {
     // Inside the opening so the panel always covers the join, but never so
     // tight that the wheel the renderer drops in pokes through it.
-    const radius = Math.max(arch.radius * WELL_INSET, wheelRadius * WELL_WHEEL_CLEARANCE);
+    // Sized against the wheel that is actually drawn - the arch's own radius
+    // when the model had one - rather than the simulation's blueprint figure.
+    const drawn = mount.radius > 0.05 ? mount.radius : wheelRadius;
+    const radius = Math.min(arch.radius * WELL_INSET, drawn * WELL_WHEEL_CLEARANCE);
     const flank = flankAtArch(positions, index, arch);
     const xOuter = Math.max(flank, mount.halfTrack + wheelWidth * 0.5);
     if (xOuter <= xInner) continue;
@@ -427,10 +466,20 @@ function fitInterior(
       archZ: arch.z,
       centreY: arch.centreY,
       radius,
-      capRadius: Math.max(radius, arch.radius) * WELL_CAP_MARGIN,
-      // Never below the floorpan and never up into the glazing: outside that
-      // band there is no bodywork to hide behind.
-      capBottom: floorY,
+      // The inner wing has to cover the whole opening, so it is sized to the
+      // opening and not to the liner in front of it.
+      capRadius: Math.max(radius, arch.radius, drawn) * WELL_CAP_MARGIN,
+      // Down to the ROAD, not to the floorpan.
+      //
+      // The arch is open below the wheel - a real wing stops above the sill
+      // and you can see the road under it - so a plate that stopped at the
+      // floorpan left a band between the sill and the tarmac that a low
+      // horizontal sight line went straight through into the cabin. Measured
+      // on the saloon, twenty of 758 rays did exactly that, all of them
+      // between 5 and 17 cm off the ground. Stopping AT the road closes them
+      // without reintroducing the skirt that hanging below it used to be: this
+      // plate is inboard of the tyre and no lower than the tarmac.
+      capBottom: 0.004,
       capTop: bodyHeight * WELL_CAP_CEILING,
       xInner,
       xOuter,
@@ -553,6 +602,8 @@ export class VehicleModelSet {
       // go: a wheel that cannot spin or steer is worse than no wheel at all.
       const positions = geometry.getAttribute('position');
       const sourceIndex = geometry.getIndex();
+      const sourceNormal = geometry.getAttribute('normal');
+      const sourceUv = geometry.getAttribute('uv');
       const detection = detectAndCutWheels(positions.array, sourceIndex ? sourceIndex.array : [], {
         halfWidth: fit.metres.width * 0.5,
         length: bp.length,
@@ -562,7 +613,15 @@ export class VehicleModelSet {
         rearAxleZ: bp.chassis.wheelbase - bp.chassis.frontAxle,
         track: bp.chassis.track,
         rideHeight: bp.rideHeight,
+        ...(sourceNormal ? { normals: sourceNormal.array } : {}),
+        ...(sourceUv ? { uvs: sourceUv.array } : {}),
       });
+      // The arch clip splits triangles rather than dropping them whole, so it
+      // can hand back vertices the model never had. They are appended to every
+      // attribute in the same order, which is why one count covers all three.
+      if (detection.extra) {
+        appendVertices(geometry, detection.extra);
+      }
       if (detection.removed > 0) geometry.setIndex(Array.from(detection.index));
       if (detection.lift !== 0) {
         geometry.applyMatrix4(new Matrix4().makeTranslation(0, detection.lift, 0));

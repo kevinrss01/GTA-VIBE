@@ -14,6 +14,7 @@
 
 import './ui.css';
 import { VOLUME_CHANNELS, type VolumeChannel } from '../audio/AudioDirector';
+import { controlHints, type ControlHint } from './platform';
 
 export type QualityLevel = 'low' | 'medium' | 'high';
 
@@ -29,26 +30,16 @@ export function musicLabel(enabled: boolean): string {
   return enabled ? MUSIC_LABEL_ON : MUSIC_LABEL_OFF;
 }
 
-export interface ControlHint {
-  readonly keys: string;
-  readonly action: string;
-}
+export type { ControlHint };
 
-/** The control list, shared by the HUD hint and this menu. */
-export const CONTROL_HINTS: readonly ControlHint[] = [
-  { keys: 'Arrow keys / WASD', action: 'Move' },
-  { keys: 'Shift', action: 'Run' },
-  { keys: 'Mouse', action: 'Look' },
-  { keys: 'E', action: 'Enter a car, a door or a shop' },
-  { keys: 'Left mouse', action: 'Fire' },
-  { keys: '1 - 4', action: 'Select a weapon' },
-  { keys: 'H', action: 'Holster or draw' },
-  { keys: 'R', action: 'Reload' },
-  { keys: 'Space', action: 'Handbrake (driving)' },
-  { keys: 'M', action: 'Map' },
-  { keys: '`', action: 'Performance stats' },
-  { keys: 'Esc', action: 'Pause' },
-];
+/**
+ * The control list, shared by the HUD hint and this menu.
+ *
+ * Resolved once at module load against the machine the game is running on -
+ * see `platform.ts` for which entries differ and why. It stays a constant
+ * because a player does not change operating system mid-session.
+ */
+export const CONTROL_HINTS: readonly ControlHint[] = controlHints();
 
 /** Short, original description of the city shown under the title. */
 const CITY_BLURB =

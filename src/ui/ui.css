@@ -110,6 +110,28 @@
   user-select: none;
 }
 
+/*
+ * The damage overlay.
+ *
+ * Sits UNDER the crosshair and every readout but over the canvas, so a player
+ * bleeding out can still see where they are aiming and how much health is
+ * left. It is a backing store at half resolution stretched over the viewport;
+ * `image-rendering: auto` is deliberate, because the smoothing is what turns
+ * a coarse gradient back into a soft one.
+ */
+.mb-hud__damage {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 0;
+  pointer-events: none;
+}
+
+.mb-hud__damage[hidden] {
+  display: none;
+}
+
 .mb-hud__crosshair {
   position: absolute;
   top: 50%;
@@ -126,6 +148,33 @@
 }
 
 .mb-hud.is-playing .mb-hud__crosshair {
+  opacity: 1;
+}
+
+/*
+ * The transient line under the crosshair: "you do not own that weapon", "no
+ * ammunition". It is deliberately close to the middle of the screen, because
+ * it always answers something the player just tried to do.
+ */
+.mb-hud__flash {
+  position: absolute;
+  top: calc(50% + 46px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2;
+  padding: 5px 12px;
+  border-radius: 4px;
+  background: rgba(12, 15, 19, 0.66);
+  color: #f2e6d8;
+  font-size: 12px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  opacity: 0;
+  transition: opacity 180ms ease;
+}
+
+.mb-hud__flash.is-visible {
   opacity: 1;
 }
 

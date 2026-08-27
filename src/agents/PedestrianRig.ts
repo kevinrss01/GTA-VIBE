@@ -79,6 +79,15 @@ export interface VatUniforms {
   /** (first column, frame count, 0, 0) for each clip. */
   readonly mbClipWalk: IUniform<Vector4>;
   readonly mbClipIdle: IUniform<Vector4>;
+  /**
+   * The action pose, if this character has one.
+   *
+   * Only the police character is baked with one, so for every civilian this is
+   * the idle clip and `iAnim.w` - the blend into it - is left at zero. The
+   * branch is per-instance and therefore coherent across a whole character, so
+   * a crowd that never uses it pays one comparison.
+   */
+  readonly mbClipAction: IUniform<Vector4>;
 }
 
 const SAMPLE_GLSL = /* glsl */ `
@@ -91,6 +100,7 @@ uniform sampler2D mbVatNrm;
 uniform vec4 mbVatSize;
 uniform vec4 mbClipWalk;
 uniform vec4 mbClipIdle;
+uniform vec4 mbClipAction;
 
 // Texel centres sit on integer + 0.5, so a coordinate of
 // column + phase * frames + 0.5 lands between the two frames either side of
@@ -128,6 +138,15 @@ const READ_GLSL = /* glsl */ `
     } else {
       mbPose = mix(texture2D(mbVatPos, uvIdle).xyz, texture2D(mbVatPos, uvWalk).xyz, gait);
       mbNormal = mix(texture2D(mbVatNrm, uvIdle).xyz, texture2D(mbVatNrm, uvWalk).xyz, gait);
+    }
+    // The action pose, blended over whatever the gait produced. The blend is
+    // zero for every civilian in the city, so this branch costs one compare
+    // for the crowd and only ever fetches for an officer who is firing.
+    float act = iAnim.w;
+    if (act > 0.004) {
+      vec2 uvAct = mbVatUv(mbClipAction, mbClipAction.z);
+      mbPose = mix(mbPose, texture2D(mbVatPos, uvAct).xyz, act);
+      mbNormal = mix(mbNormal, texture2D(mbVatNrm, uvAct).xyz, act);
     }
     mbNormal = normalize(mbNormal * 2.0 - 1.0);
   }
@@ -179,6 +198,8 @@ export interface PedestrianVatBundle {
   character: PedestrianVatCharacter | null;
   /** Swaps the downloaded character in. Does not recompile the program. */
   install(character: PedestrianVatCharacter): void;
+  /** Cycle position of the shared action pose, 0..1. */
+  setActionPhase(phase: number): void;
   dispose(): void;
 }
 
@@ -203,6 +224,12 @@ export function createPedestrianVatMesh(capacity: number, slot: number): Pedestr
     mbVatSize: { value: new Vector4(1, 1, 0, 0) },
     mbClipWalk: { value: new Vector4(0, 1, 0, 0) },
     mbClipIdle: { value: new Vector4(0, 1, 0, 0) },
+    // (column, frames, phase, 0). The phase is a UNIFORM rather than a
+    // per-instance attribute because every officer firing at the same moment
+    // is at the same point of the same one-second pose; giving each their own
+    // would cost a fourth float per person in the whole crowd's buffer to
+    // express something no player could distinguish.
+    mbClipAction: { value: new Vector4(0, 1, 0, 0) },
   };
 
   const material = new MeshStandardMaterial({ color: 0xffffff, roughness: 0.82, metalness: 0 });
@@ -283,8 +310,13 @@ export function createPedestrianVatMesh(capacity: number, slot: number): Pedestr
       uniforms.mbClipWalk.value.set(character.walk.column, character.walk.frames, 0, 0);
       const idle = character.idle ?? character.walk;
       uniforms.mbClipIdle.value.set(idle.column, idle.frames, 0, 0);
+      const action = character.action ?? idle;
+      uniforms.mbClipAction.value.set(action.column, action.frames, 0, 0);
       if (character.albedo) material.map = character.albedo;
       this.character = character;
+    },
+    setActionPhase(phase: number): void {
+      uniforms.mbClipAction.value.z = phase;
     },
     dispose(): void {
       placeholder?.dispose();

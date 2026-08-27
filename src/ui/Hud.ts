@@ -78,6 +78,9 @@ export class Hud {
   private readonly bannerEl: HTMLElement;
   private readonly bannerTitleEl: HTMLElement;
   private readonly bannerDetailEl: HTMLElement;
+  private readonly flashEl: HTMLElement;
+  private flashTimer = 0;
+  private flashText = '';
   private wanted = -1;
   private health = Number.NaN;
   private weaponLine = '';
@@ -230,7 +233,11 @@ export class Hud {
     this.bannerDetailEl.className = 'mb-hud__banner-detail';
     this.bannerEl.append(this.bannerTitleEl, this.bannerDetailEl);
 
-    this.element.append(this.vitalsEl, this.bannerEl);
+    this.flashEl = document.createElement('p');
+    this.flashEl.className = 'mb-hud__flash';
+    this.flashEl.setAttribute('role', 'status');
+
+    this.element.append(this.vitalsEl, this.bannerEl, this.flashEl);
     // -------------------------------------------------------------------------
 
     this.setLocation('', null);
@@ -343,6 +350,40 @@ export class Hud {
     this.ammoEl.textContent = ammo;
     this.ammoEl.classList.toggle('is-empty', state === 'empty');
     this.vitalsEl.hidden = false;
+  }
+
+  /**
+   * A short line under the crosshair, for something the player just tried to
+   * do and could not.
+   *
+   * Deliberately not the banner: the banner is for being dead or arrested and
+   * takes over the screen. This is for "you do not own that weapon" - the
+   * answer to a key press, gone in a couple of seconds. Repeating the same
+   * message restarts its timer rather than stacking.
+   */
+  flash(message: string, seconds = 2.2): void {
+    this.flashText = message;
+    this.flashTimer = seconds;
+    this.flashEl.textContent = message;
+    this.flashEl.classList.add('is-visible');
+  }
+
+  /**
+   * Ages the transient line. Called once a frame by the application, which
+   * already owns the clock; the HUD deliberately has no timers of its own.
+   */
+  tick(dt: number): void {
+    if (this.flashTimer <= 0) return;
+    this.flashTimer -= dt;
+    if (this.flashTimer > 0) return;
+    this.flashTimer = 0;
+    this.flashText = '';
+    this.flashEl.classList.remove('is-visible');
+  }
+
+  /** The message currently up, or an empty string. For automated QA. */
+  get flashMessage(): string {
+    return this.flashText;
   }
 
   /**

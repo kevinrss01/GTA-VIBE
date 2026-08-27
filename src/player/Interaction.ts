@@ -13,6 +13,31 @@ import type { InteractionPoint } from '../world/build/types';
 const CELL = 8;
 
 /**
+ * Inside this distance of a point, the player is offered it whatever way they
+ * are facing.
+ *
+ * This is the fix for the doorway that only worked from a couple of metres
+ * out. A door's interaction point sits 1.5 m OUTSIDE the door, on the approach,
+ * and the facing test used to be taken against that point - so walking up to
+ * the door put the point behind the player's shoulder, the dot product went
+ * negative, and the prompt they were walking towards switched off exactly when
+ * they arrived. The old grace was 0.35 m, which is narrower than one stride.
+ */
+const NEAR_GRACE = 2;
+
+/**
+ * How much closer a point has to be to take the prompt away from the one that
+ * already has it.
+ *
+ * Two doorways on a terrace are metres apart, and without hysteresis the
+ * prompt swaps between them as the player's heading wanders by a degree.
+ */
+const STICKINESS = 0.25;
+
+/** Cosine of the widest angle off the player's heading a point may sit at. */
+const FACING_MINIMUM = 0.15;
+
+/**
  * How far above or below a point the player may stand and still be offered it.
  *
  * Generous enough to cover a doorway seen from the top of its own steps, tight
@@ -90,10 +115,30 @@ export class InteractionSystem {
           // Ignore anything on a different floor.
           if (Math.abs(point.y - y) > SAME_FLOOR_TOLERANCE) continue;
 
-          const facing = distance < 0.35 ? 1 : (dx * forwardX + dz * forwardZ) / distance;
-          if (facing < 0.15) continue;
+          /*
+           * Face the THING, not the standing spot in front of it.
+           *
+           * A door registers its point on the approach and its target inside
+           * the building; the door itself is between the two, and that is what
+           * a player turns to look at. Halfway between them is the threshold to
+           * within a few centimetres, so this is the doorway - and unlike the
+           * approach point, it never ends up behind the player who has walked
+           * up to it.
+           */
+          const target = point.target;
+          const facingX = target ? (point.x + target.x) * 0.5 : point.x;
+          const facingZ = target ? (point.z + target.z) * 0.5 : point.z;
+          const fx = facingX - x;
+          const fz = facingZ - z;
+          const facingDistance = Math.hypot(fx, fz);
+          const facing =
+            facingDistance < NEAR_GRACE
+              ? 1
+              : (fx * forwardX + fz * forwardZ) / facingDistance;
+          if (facing < FACING_MINIMUM) continue;
 
-          const score = facing * 2 - distance / Math.max(0.001, point.radius);
+          let score = facing * 2 - distance / Math.max(0.001, point.radius);
+          if (point === this.current) score += STICKINESS;
           if (score > bestScore) {
             bestScore = score;
             best = point;

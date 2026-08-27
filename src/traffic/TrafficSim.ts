@@ -221,6 +221,7 @@ interface MutableView {
   pitch: number;
   roll: number;
   braking: boolean;
+  accelLong: number;
   control: VehicleControl;
 }
 
@@ -722,6 +723,7 @@ export class TrafficSim {
       pitch: 0,
       roll: 0,
       braking: false,
+      accelLong: 0,
       control: 'ambient',
     };
     return {
@@ -1786,6 +1788,7 @@ export class TrafficSim {
     view.pitch = vehicle.groundPitch + vehicle.bodyPitch;
     view.roll = vehicle.groundRoll + vehicle.bodyRoll;
     view.braking = vehicle.braking;
+    view.accelLong = vehicle.accelLong;
     view.control = vehicle.control;
   }
 

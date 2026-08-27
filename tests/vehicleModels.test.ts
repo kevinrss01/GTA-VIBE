@@ -260,14 +260,33 @@ describe('shipped vehicle assets', () => {
       expect(halfTrack, `${kind} track`).toBeGreaterThan(bp.width * 0.3);
       expect(halfTrack, `${kind} track`).toBeLessThan(bp.width * 0.55);
 
+      /*
+       * The renderer draws each wheel at the radius its own arch was cut at,
+       * so that radius has to be a plausible wheel for this vehicle and not
+       * merely a number the detector produced. The estimator reads the chord
+       * of the tyre where it grounds and under-reads a little; anything worse
+       * than a fifth off would be a visibly wrong-sized wheel.
+       */
+      expect(detection.mount.radius, `${kind} arch radius`).toBeGreaterThan(bp.wheelRadius * 0.8);
+      expect(detection.mount.radius, `${kind} arch radius`).toBeLessThan(bp.wheelRadius * 1.25);
+
       // Grounding: after the cut and the lift, the body hangs above the road
       // and its roof lands where the blueprint says it should.
       const kept = new Set<number>();
       for (const value of detection.index) kept.add(value);
+      // The arch clip splits triangles rather than dropping them whole, so
+      // the index can reach past the model's own vertices into the ones it
+      // appended. Reading only `moved` would return NaN for every one.
+      const base = Math.floor(moved.length / 3);
+      const extra = detection.extra;
+      const yOf = (vertex: number): number =>
+        vertex < base
+          ? (moved[vertex * 3 + 1] as number)
+          : (extra?.position[(vertex - base) * 3 + 1] as number);
       let minY = Infinity;
       let maxY = -Infinity;
       for (const vertex of kept) {
-        const y = (moved[vertex * 3 + 1] as number) + detection.lift;
+        const y = yOf(vertex) + detection.lift;
         minY = Math.min(minY, y);
         maxY = Math.max(maxY, y);
       }
@@ -479,7 +498,10 @@ describe('you cannot see inside a car', () => {
       let through = 0;
       for (const [o, d] of rays) {
         if (!blocked(solid, mesh.index, o, d)) continue;
-        if (wheelBlocks(o, d, cut.mount, bp.wheelRadius, bp.wheelWidth * 0.5)) continue;
+        // The renderer draws each wheel at the radius its own arch was cut
+        // at, not at the blueprint's, so the ray test has to use the same one.
+        const drawnRadius = cut.mount.radius > 0.05 ? cut.mount.radius : bp.wheelRadius;
+        if (wheelBlocks(o, d, cut.mount, drawnRadius, bp.wheelWidth * 0.5)) continue;
         tested += 1;
         if (!blocked(shellPos, shellIndex.array, o, d)) through += 1;
       }

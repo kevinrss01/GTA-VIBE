@@ -248,6 +248,31 @@ export function defaultViewmodels(baseUrl: string): ViewmodelSet {
         support: [0.042, -0.178, 0.55],
         handRoll: 0.25,
       },
+      launcher: {
+        // Barrel at max-Z like the pistol, so it takes the same half turn.
+        // Measured by slicing the mesh along Z: the slab at max-Z is a clean
+        // 0.10 x 0.10 ring - an open tube - while the slab at min-Z is
+        // 0.055 x 0.189, tall and narrow, which is the shoulder pad. The
+        // pistol grip is the -0.183 dip in the slabs a quarter of the way
+        // back, and that is what `grip` is written against.
+        url: `${baseUrl}models/weapons/launcher.glb`,
+        // A real 1.1 m tube, foreshortened like the carbine.
+        length: 0.62,
+        yaw: Math.PI,
+        pitch: 0,
+        roll: 0,
+        // FURTHER OUT than every other weapon, because this one is not held in
+        // front of the chest - it rides ON the shoulder, and its shoulder end
+        // is a third of a metre behind its middle. Centred at 0.56 m the tube
+        // spans 0.25 to 0.87 m in front of the eye; centred where the carbine
+        // is, the butt plate ended up behind the near plane and the player was
+        // looking down the inside of their own launch tube.
+        offset: [0.168, -0.178, 0.56],
+        muzzle: [0.168, -0.16, 0.87],
+        grip: [0.168, -0.288, 0.38],
+        support: [0.13, -0.226, 0.74],
+        handRoll: 0.2,
+      },
     },
   };
 }
@@ -315,11 +340,13 @@ const IDLE_AMPLITUDE = 0.0055;
 /**
  * Room the weapon needs in front of the eye before it starts being pulled in.
  *
- * Measured from the eye along the barrel. A carbine reaches about 0.8 m; the
- * player's collision cylinder is 0.34 m of radius, so without this the muzzle
- * is half a metre inside a wall whenever somebody stands close to one.
+ * Measured from the eye along the barrel. This is now a READABILITY threshold
+ * rather than a geometric one - the overlay pass means the weapon can never
+ * intersect anything - so it is set at about the reach of the longest weapon
+ * rather than generously past it: the tuck should say "you are at a wall", not
+ * fire off every time somebody walks near a parked car.
  */
-const CLEARANCE_NEEDED = 0.95;
+const CLEARANCE_NEEDED = 0.8;
 /**
  * How the weapon is tucked when there is no room in front of it.
  *
@@ -330,15 +357,25 @@ const CLEARANCE_NEEDED = 0.95;
  * shorten up in a doorway, and it keeps both the weapon and the hands in frame
  * the entire time.
  *
- * Together these take a carbine's 0.79 m of forward reach down to about
- * 0.46 m and stand the barrel up 26 degrees, so what is left inside a wall is
- * a tenth of a metre at a steep angle instead of most of the barrel. It is not
- * a depth-buffer trick and it does not pretend to be one: a separate
- * near-plane pass for the viewmodel is the real fix, and that belongs in the
- * render loop rather than here.
+ * The real fix - a separate near-plane pass for the viewmodel - now exists in
+ * `Engine.renderFrame`, so this is no longer avoiding anything: it is purely
+ * the body language of somebody who has run out of room.
  */
 const CLOSE_PULL = 0.05;
-const CLOSE_TILT = 1;
+/*
+ * MUCH SMALLER THAN IT WAS, because it no longer has a job to do.
+ *
+ * A full radian of muzzle-up was load-bearing while the weapon shared a depth
+ * buffer with the city: it was the only thing keeping a barrel out of a wall
+ * the player was standing at, and it was a poor one - what was left inside the
+ * wall was still a tenth of a metre, and swinging the gun through 57 degrees to
+ * get there read as a bug of its own. The viewmodel is drawn in its own pass
+ * against a cleared depth buffer now (see `Engine.renderFrame`), so nothing it
+ * does can intersect anything. What is left is only the READ: a person who
+ * walks up to a wall shortens up a little, and 17 degrees says that without
+ * pointing the weapon at the ceiling.
+ */
+const CLOSE_TILT = 0.3;
 const CLOSE_DROP = 0.04;
 
 interface Entry {

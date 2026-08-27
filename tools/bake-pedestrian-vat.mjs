@@ -99,6 +99,26 @@ function parseArgs(argv) {
       if (eq < 0) throw new Error(`--min-period wants name=seconds, got ${raw}`);
       args.minPeriod = { ...(args.minPeriod ?? {}), [raw.slice(0, eq)]: Number(raw.slice(eq + 1)) };
     }
+    else if (token === '--static') {
+      // name=start:end, in seconds of the SOURCE clip.
+      //
+      // For an action that is not locomotion. The whole travel-curve machinery
+      // below assumes a looping gait: it fits a linear ramp to the centroid
+      // over the cycle and subtracts it, which is exactly right for a walk and
+      // catastrophic for a clip that crouches once and holds - the fit reads
+      // the crouch as forward travel and slides the character several metres
+      // backwards through its own animation. A static clip samples a window of
+      // the source, keeps its travel at zero, and skips the analysis entirely.
+      const raw = next();
+      const eq = raw.indexOf('=');
+      if (eq < 0) throw new Error(`--static wants name=start:end, got ${raw}`);
+      const name = raw.slice(0, eq);
+      const [start, end] = raw.slice(eq + 1).split(':').map(Number);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+        throw new Error(`--static wants name=start:end in seconds, got ${raw}`);
+      }
+      args.static = { ...(args.static ?? {}), [name]: { start, end } };
+    }
     else if (token === '--flip-v') args.flipV = true;
     else if (token === '--clip') {
       // name=path[:frames]
@@ -378,7 +398,12 @@ function sampleClip(root, mesh, clip, times, welded, step = 1) {
     normals.push(frameNormals);
     centroids.push(new THREE.Vector3(sumX / vertexCount, 0, sumZ / vertexCount));
 
-    for (const name of ['L_Foot', 'R_Foot', 'L_ToeBase', 'R_ToeBase']) {
+    // The feet are for the travel measurement; the right forearm and hand are
+    // for the weapon the runtime puts in that hand. Both go through the same
+    // list so they get the same in-place conversion, yaw, scale and lift the
+    // vertices do - a hand track in a different space to the mesh would put
+    // the pistol somewhere near the officer rather than in their grip.
+    for (const name of ['L_Foot', 'R_Foot', 'L_ToeBase', 'R_ToeBase', 'R_Forearm', 'R_Hand']) {
       const bone = root.getObjectByName(name);
       if (!bone) continue;
       (bones[name] ??= []).push(new THREE.Vector3().setFromMatrixPosition(bone.matrixWorld));
@@ -602,6 +627,29 @@ function findPeriod(root, mesh, clip, welded, { tolerance = 0.012, minPeriod = 0
   return { period: duration, error: score(duration, 1) };
 }
 
+/**
+ * Per-frame right-hand and forearm positions, rounded, or null when the rig
+ * did not carry those bones.
+ *
+ * Rounded to a tenth of a millimetre on a 1.75 m person, which keeps the JSON
+ * small and is two orders of magnitude finer than anything a player can see in
+ * the position of a pistol.
+ */
+function handTrack(bones, frames) {
+  const hand = bones['R_Hand'];
+  const forearm = bones['R_Forearm'];
+  if (!hand || !forearm || hand.length < frames || forearm.length < frames) return null;
+  const round = (v) => [
+    Number(v.x.toFixed(5)),
+    Number(v.y.toFixed(5)),
+    Number(v.z.toFixed(5)),
+  ];
+  return {
+    hand: hand.slice(0, frames).map(round),
+    forearm: forearm.slice(0, frames).map(round),
+  };
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
 
@@ -655,6 +703,21 @@ async function main() {
   // ---- clip periods and frame times --------------------------------------
   const baked = [];
   for (const entry of loaded) {
+    const window = args.static?.[entry.name];
+    if (window) {
+      const times = [];
+      const span = window.end - window.start;
+      for (let i = 0; i < entry.frames; i += 1) {
+        times.push(window.start + (i / entry.frames) * span);
+      }
+      const sample = sampleClip(entry.root, entry.mesh, entry.clip, times, welded);
+      console.log(
+        `[${args.id}] ${entry.name}: static window ${window.start.toFixed(2)}-` +
+          `${window.end.toFixed(2)}s of ${entry.clip.duration.toFixed(3)}s, ${entry.frames} frames`,
+      );
+      baked.push({ ...entry, period: span, sample, isStatic: true });
+      continue;
+    }
     const minPeriod = args.minPeriod?.[entry.name];
     const period = findPeriod(
       entry.root,
@@ -706,7 +769,9 @@ async function main() {
       sxy += du * (centroids[f].x - meanX);
       szy += du * (centroids[f].z - meanZ);
     }
-    const travel = { x: sxy / sxx, z: szy / sxx };
+    // A static clip is not going anywhere: subtracting a fitted ramp from a
+    // crouch would slide it backwards through its own hold.
+    const travel = entry.isStatic ? { x: 0, z: 0 } : { x: sxy / sxx, z: szy / sxx };
 
     for (let f = 0; f < frames; f += 1) {
       const u = f / frames;
@@ -769,6 +834,62 @@ async function main() {
     }
     const r = rotate(entry.rootTravel.x, entry.rootTravel.z);
     entry.rootTravel = r;
+  }
+
+  /*
+   * A static clip has to be brought back over the origin.
+   *
+   * A locomotion clip is centred by construction: the ramp subtraction above
+   * removes its net travel, and the reference normalisation below centres the
+   * footprint. Neither does anything for a window cut out of the MIDDLE of an
+   * action clip - the shoot preset walks forward before it crouches, so the
+   * window at 3.3 s sits 2.78 body heights down -Z of the origin, and an
+   * officer would have been drawn firing from most of three metres behind
+   * where they are standing. Matching the reference clip's mean centroid puts
+   * it back without disturbing the pose.
+   */
+  {
+    // Measured from the transformed vertices rather than the sampled
+    // centroids: by this point the poses have been through the in-place
+    // conversion and the yaw correction, and the centroids captured at sample
+    // time have not.
+    const meanXZ = (entry) => {
+      let x = 0;
+      let z = 0;
+      let n = 0;
+      for (const p of entry.sample.positions) {
+        for (let i = 0; i < p.length; i += 3) {
+          x += p[i];
+          z += p[i + 2];
+          n += 1;
+        }
+      }
+      return n > 0 ? { x: x / n, z: z / n } : { x: 0, z: 0 };
+    };
+    const anchor = baked.find((entry) => entry.name === 'idle') ?? baked[0];
+    const anchorMean = meanXZ(anchor);
+    for (const entry of baked) {
+      if (!entry.isStatic || entry === anchor) continue;
+      const mean = meanXZ(entry);
+      const dx = mean.x - anchorMean.x;
+      const dz = mean.z - anchorMean.z;
+      if (Math.abs(dx) < 1e-6 && Math.abs(dz) < 1e-6) continue;
+      for (const p of entry.sample.positions) {
+        for (let i = 0; i < p.length; i += 3) {
+          p[i] -= dx;
+          p[i + 2] -= dz;
+        }
+      }
+      for (const list of Object.values(entry.sample.bones)) {
+        for (const v of list) {
+          v.x -= dx;
+          v.z -= dz;
+        }
+      }
+      console.log(
+        `[${args.id}] ${entry.name}: recentred by (${dx.toFixed(3)}, ${dz.toFixed(3)}) units`,
+      );
+    }
   }
 
   // ---- normalisation: 1 unit tall, feet on y = 0, footprint centred -------
@@ -835,6 +956,36 @@ async function main() {
   }
   console.log(`[${args.id}] ground correction ${(lift * 1750).toFixed(1)} mm on a 1.75 m person`);
 
+  /*
+   * A static action pose stands on the ground on its own terms.
+   *
+   * The normalisation above is anchored to the IDLE clip's soles, which is the
+   * right anchor for locomotion because every locomotion clip shares that
+   * stance. An action clip need not: the shoot preset drops into a low
+   * crouch whose lowest point is a shin rather than a sole, and measured on
+   * `ped-police` that sat 159 mm THROUGH the pavement. Lifting each static
+   * clip by its own worst penetration is the only correction that works
+   * without knowing which body part is touching, and it cannot affect the
+   * locomotion clips because it is only ever applied to static ones.
+   */
+  for (const entry of baked) {
+    if (!entry.isStatic) continue;
+    let low = Infinity;
+    for (const p of entry.sample.positions) {
+      for (let i = 1; i < p.length; i += 3) low = Math.min(low, p[i]);
+    }
+    const clipLift = -SINK - low;
+    if (Math.abs(clipLift) < 1e-5) continue;
+    for (const p of entry.sample.positions) {
+      for (let i = 1; i < p.length; i += 3) p[i] += clipLift;
+    }
+    for (const list of Object.values(entry.sample.bones)) for (const v of list) v.y += clipLift;
+    console.log(
+      `[${args.id}] ${entry.name}: static ground lift ${(clipLift * 1750).toFixed(1)} mm ` +
+        'on a 1.75 m person',
+    );
+  }
+
   // ---- travel curve and slip measurement ---------------------------------
   //
   // THE NO-SLIDE CONDITION. A planted foot's world position is
@@ -851,6 +1002,15 @@ async function main() {
   // runtime looks u up by distance travelled instead of multiplying by a rate.
   for (const entry of baked) {
     const frames = entry.sample.positions.length;
+    if (entry.isStatic) {
+      // No travel, so nothing to spread and nothing to invert: the runtime
+      // drives a static clip's phase from its own timer, never from distance.
+      entry.travelCurve = new Array(frames + 1).fill(0);
+      entry.stride = 0;
+      entry.slip = 0;
+      console.log(`[${args.id}] ${entry.name}: static, no travel curve`);
+      continue;
+    }
     // Over a whole cycle the body returns to the same pose, so the distance the
     // feet carried it is exactly the distance the centroid moved. That makes
     // the centroid the ground truth for the TOTAL; the per-frame contact
@@ -987,6 +1147,18 @@ async function main() {
       travel: entry.travelCurve.map((value) => Number(value.toFixed(6))),
       /** Worst measured residual slip of a planted foot, in rig units. */
       slip: Number(entry.slip.toFixed(6)),
+      /**
+       * The right hand and the forearm behind it, per frame, in rig units.
+       *
+       * This is what lets the runtime draw a weapon in a baked character's
+       * hand. A VAT has no skeleton at runtime - that is the whole point of
+       * baking - so the hand's path has to be measured here and shipped
+       * alongside the texture. Two points rather than a full transform: the
+       * forearm-to-hand vector is the barrel axis, and world up completes the
+       * frame, which is enough to hold a pistol and costs seven numbers a
+       * frame instead of sixteen.
+       */
+      hand: handTrack(entry.sample.bones, entry.sample.positions.length),
     });
     columns += entry.sample.positions.length + 1;
   }

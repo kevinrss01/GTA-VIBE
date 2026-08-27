@@ -357,6 +357,7 @@ function car(over: Partial<VehicleAudioView> & { id: number }): VehicleAudioView
     z: 0,
     speed: 8,
     braking: false,
+    accelLong: 0,
     control: 'ambient',
     ...over,
   };
@@ -571,6 +572,97 @@ describe('car doors, braking and impacts', () => {
 // ---------------------------------------------------------------------------
 // Ambient traffic
 // ---------------------------------------------------------------------------
+
+/*
+ * The tyre squeal that was audible from a pavement all day.
+ *
+ * The ambient scrub used to trigger on `vehicle.braking`, which is the BRAKE
+ * LAMP: it lights at 0.55 m/s of deceleration per second, which is ordinary
+ * lift-off and something every car in the city does several times per junction.
+ * The asset behind it is an emergency stop with brake squeal, so the result was
+ * an emergency stop within 34 m every 0.85 s, forever.
+ */
+describe('the ambient tyre scrub', () => {
+  const braking = (over: Partial<VehicleAudioView> & { id: number }): VehicleAudioView =>
+    car({ braking: true, ...over });
+
+  it('says nothing for a car merely lifting off in traffic', async () => {
+    const { audio, street } = await makeStreet();
+    // Ten seconds of a car doing what a car in traffic does: lifting off and
+    // coasting, over and over, with the brake lamp flickering on each time.
+    // Every one of those is a rising edge of the flag the old gate read.
+    for (let i = 0; i < 600; i += 1) {
+      const lifting = i % 2 === 0;
+      street.update(1 / 60, {
+        ...BASE,
+        vehicles: [
+          braking({ id: 1, x: 6, speed: 14, braking: lifting, accelLong: lifting ? -0.9 : 0 }),
+        ],
+      });
+    }
+    expect(sourcesFor('veh/tyre-scrub')).toHaveLength(0);
+    audio.dispose();
+    street.dispose();
+  });
+
+  it('does say something for a car actually standing on the brakes', async () => {
+    const { audio, street } = await makeStreet();
+    for (let i = 0; i < 120; i += 1) {
+      street.update(1 / 60, {
+        ...BASE,
+        vehicles: [braking({ id: 1, x: 6, speed: 16, accelLong: i < 5 ? 0 : -8.5 })],
+      });
+    }
+    expect(sourcesFor('veh/tyre-scrub').length).toBeGreaterThan(0);
+    audio.dispose();
+    street.dispose();
+  });
+
+  it('ignores a hard stop from walking pace', async () => {
+    const { audio, street } = await makeStreet();
+    for (let i = 0; i < 120; i += 1) {
+      street.update(1 / 60, {
+        ...BASE,
+        vehicles: [braking({ id: 1, x: 6, speed: 3, accelLong: i < 5 ? 0 : -9 })],
+      });
+    }
+    expect(sourcesFor('veh/tyre-scrub')).toHaveLength(0);
+    audio.dispose();
+    street.dispose();
+  });
+
+  it('ignores a hard stop happening a street away', async () => {
+    const { audio, street } = await makeStreet();
+    for (let i = 0; i < 120; i += 1) {
+      street.update(1 / 60, {
+        ...BASE,
+        vehicles: [braking({ id: 1, x: 40, speed: 16, accelLong: i < 5 ? 0 : -9 })],
+      });
+    }
+    expect(sourcesFor('veh/tyre-scrub')).toHaveLength(0);
+    audio.dispose();
+    street.dispose();
+  });
+
+  it('does not repeat itself once a second while a queue stops', async () => {
+    const { audio, street } = await makeStreet();
+    // Ten seconds of cars braking hard in front of the listener, one after
+    // another. The cooldown has to hold this to a handful of squeals.
+    for (let i = 0; i < 600; i += 1) {
+      const phase = Math.floor(i / 30) % 2;
+      street.update(1 / 60, {
+        ...BASE,
+        vehicles: [
+          braking({ id: 1, x: 6, speed: 16, accelLong: phase === 0 ? -9 : 0 }),
+          braking({ id: 2, x: 9, speed: 16, accelLong: phase === 1 ? -9 : 0 }),
+        ],
+      });
+    }
+    expect(sourcesFor('veh/tyre-scrub').length).toBeLessThanOrEqual(5);
+    audio.dispose();
+    street.dispose();
+  });
+});
 
 describe('ambient traffic voices', () => {
   const fleet = (n: number, spacing: number): VehicleAudioView[] =>

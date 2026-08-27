@@ -514,7 +514,10 @@ function addExit(ctx: Fitout): void {
     x: landing.x,
     y: parcel.groundY + 1.2,
     z: landing.z,
-    radius: 1.9,
+    // Matches the front door's reach for the same reason: the landing is 1.8 m
+    // inside, and a player walking at the door has to still be offered the way
+    // out when they are standing on the threshold.
+    radius: 2.8,
     prompt: 'Press E to leave',
     kind: 'door',
     parcelId: parcel.id,

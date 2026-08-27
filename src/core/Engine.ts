@@ -17,11 +17,14 @@ import {
   ACESFilmicToneMapping,
   Clock,
   Color,
+  DirectionalLight,
   FogExp2,
+  HemisphereLight,
   PCFSoftShadowMap,
   PerspectiveCamera,
   Scene,
   WebGLRenderer,
+  type Texture,
 } from 'three';
 
 import { clamp } from './mathx';
@@ -85,6 +88,34 @@ export class Engine {
   readonly scene: Scene;
   readonly camera: PerspectiveCamera;
   readonly canvas: HTMLCanvasElement;
+
+  /**
+   * The first-person overlay: everything drawn ON the camera rather than in
+   * front of it.
+   *
+   * WHY A SECOND PASS. A held weapon reaches most of a metre out of the eye
+   * and the player's collision cylinder is only 0.34 m of radius, so anything
+   * the player can stand next to - a shop counter, a till, a door frame - is
+   * geometrically INSIDE the weapon. No amount of tucking the model back fixes
+   * that; it is two solids occupying one volume, and the depth buffer resolves
+   * it the only way it can, by drawing the counter through the gun.
+   *
+   * The fix is the one every first-person game uses: render the world, throw
+   * the depth buffer away, then render the viewmodel into the empty one. The
+   * weapon is then always in front of everything, because there is no longer
+   * anything for it to be behind.
+   *
+   * `overlayCamera` deliberately shares the main camera's field of view and
+   * aspect and differs only in its near plane, so the weapon appears at
+   * exactly the position and size the single-pass version put it - the muzzle
+   * world position `CombatSystem` computes for tracers stays correct.
+   *
+   * Costs one extra draw call per object in the overlay - three, for a weapon
+   * and two hands - and nothing at all while it is empty.
+   */
+  readonly overlayScene: Scene;
+  readonly overlayCamera: PerspectiveCamera;
+  private readonly overlayFixtures: number;
 
   private readonly clock = new Clock();
   private frameHandle = 0;
@@ -161,10 +192,57 @@ export class Engine {
     this.camera = new PerspectiveCamera(62, 1, 0.1, 1200);
     this.camera.rotation.order = 'YXZ';
 
+    // No fog and no background: the overlay is composited over a finished
+    // frame, so a background would erase it and fog would tint a weapon held
+    // 40 cm from the eye as though it were across the street.
+    this.overlayScene = new Scene();
+    // 4 cm of near plane. The muzzle of the carbine sits about 0.8 m out and
+    // the nearest knuckle about 0.25 m, so this clears both without throwing
+    // away depth precision the pass does not need.
+    this.overlayCamera = new PerspectiveCamera(62, 1, 0.04, 12);
+    this.overlayCamera.rotation.order = 'YXZ';
+
+    /*
+     * The overlay carries its own lights, and it has to.
+     *
+     * A second scene sees none of the first one's - and the world's sun is
+     * positioned relative to the city in any case, so borrowing it would swing
+     * the shading of the held weapon as the player walked across town. These
+     * two are parented to the overlay CAMERA, so they travel with the eye and
+     * the weapon is lit the same way everywhere: a key over the player's left
+     * shoulder, which is where a hand held in front of a face is lit from
+     * outdoors, and a wide fill for the side facing away from it.
+     *
+     * `overlayScene.environment` is set through `setOverlayEnvironment` once
+     * the sky has been baked, so the metal reflects the same sky the city does.
+     */
+    const key = new DirectionalLight(0xfff2df, 2.2);
+    key.position.set(-0.6, 1.1, 0.5);
+    const fill = new HemisphereLight(0xb9d6f2, 0x50493f, 1.5);
+    this.overlayCamera.add(key, key.target, fill);
+    // A camera is only walked by the renderer when it is in the scene being
+    // rendered, and this one is that scene's camera, so it has to be in it for
+    // the lights hanging off it to be found at all.
+    this.overlayScene.add(this.overlayCamera);
+    // Everything the overlay owns for itself. Anything past this count is
+    // content somebody put there, which is what decides whether the second
+    // pass runs at all.
+    this.overlayFixtures = this.overlayScene.children.length;
+
     this.resize();
     window.addEventListener('resize', this.onResize);
     canvas.addEventListener('webglcontextlost', this.onWebglContextLost);
     canvas.addEventListener('webglcontextrestored', this.onWebglContextRestored);
+  }
+
+  /**
+   * Gives the first-person overlay the same sky the world reflects.
+   *
+   * Called once, after `Sky.createEnvironment`. Without it the weapon's metal
+   * has nothing to reflect and reads as flat plastic.
+   */
+  setOverlayEnvironment(texture: Texture | null): void {
+    this.overlayScene.environment = texture;
   }
 
   private readonly onResize = (): void => this.resize();
@@ -200,6 +278,9 @@ export class Engine {
     this.renderer.setSize(width, height, false);
     this.camera.aspect = width / Math.max(1, height);
     this.camera.updateProjectionMatrix();
+    this.overlayCamera.aspect = this.camera.aspect;
+    this.overlayCamera.fov = this.camera.fov;
+    this.overlayCamera.updateProjectionMatrix();
     this.stats.pixelRatio = ratio;
   }
 
@@ -235,7 +316,7 @@ export class Engine {
     this.renderer.info.reset();
     this.onUpdate?.(dt, this.clock.elapsedTime);
     const afterUpdate = performance.now();
-    this.renderer.render(this.scene, this.camera);
+    this.renderFrame();
     const finished = performance.now();
     this.lastUpdateMs = afterUpdate - started;
     this.lastRenderMs = finished - afterUpdate;
@@ -255,7 +336,30 @@ export class Engine {
     if (this.disposed) return;
     this.renderer.info.reset();
     this.onUpdate?.(dt, (this.stepClock += dt));
+    this.renderFrame();
+  }
+
+  /**
+   * The world, then the first-person overlay on top of it.
+   *
+   * `clearDepth` between the two is the whole trick: the overlay pass starts
+   * with an empty depth buffer, so nothing in the world can occlude it. The
+   * colour buffer is deliberately NOT cleared, which is why `autoClear` has to
+   * be off for the second render.
+   */
+  private renderFrame(): void {
     this.renderer.render(this.scene, this.camera);
+    if (this.overlayScene.children.length <= this.overlayFixtures) return;
+    this.overlayCamera.position.copy(this.camera.position);
+    this.overlayCamera.quaternion.copy(this.camera.quaternion);
+    // The lights hang off the camera, so its world matrix has to be current
+    // before the render walks them.
+    this.overlayCamera.updateMatrixWorld(true);
+    const autoClear = this.renderer.autoClear;
+    this.renderer.autoClear = false;
+    this.renderer.clearDepth();
+    this.renderer.render(this.overlayScene, this.overlayCamera);
+    this.renderer.autoClear = autoClear;
   }
 
   private stepClock = 0;

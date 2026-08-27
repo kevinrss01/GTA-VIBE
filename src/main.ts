@@ -30,7 +30,8 @@ import { PedestrianSystem } from './agents/PedestrianSystem';
 import { TrafficSystem } from './traffic/TrafficSystem';
 import { SignalHeads } from './city/SignalHeads';
 import { StreetAudio } from './audio/StreetAudio';
-import { HEAT, MAX_HEALTH, PlayerState } from './player/PlayerState';
+import { CombatAudio, type FlightSound } from './audio/CombatAudio';
+import { HEAT, MAX_HEALTH, PlayerState, WEAPONS, type WeaponId } from './player/PlayerState';
 import { GunShop } from './shop/GunShop';
 import { Furnishings } from './world/furnishings/Furnishings';
 import { loadStreetPropModels } from './world/furnishings/StreetProps';
@@ -39,6 +40,7 @@ import { CrowdTargets } from './combat/CrowdTargets';
 import { WorldRayIndex } from './combat/rays';
 import { RespawnDirector } from './combat/Respawn';
 import { defaultViewmodels } from './combat/WeaponViewmodel';
+import type { RocketHandle } from './combat/Projectiles';
 import { PoliceSystem } from './police/PoliceSystem';
 import { loadVehicleModels } from './traffic/VehicleModels';
 import { CollisionWorld } from './player/Collision';
@@ -46,6 +48,7 @@ import { FirstPersonController } from './player/FirstPersonController';
 import { Driving } from './player/Driving';
 import { InteractionSystem } from './player/Interaction';
 import { AudioDirector } from './audio/AudioDirector';
+import { DamageFeedback } from './ui/DamageFeedback';
 import { Hud } from './ui/Hud';
 import { LoadingScreen } from './ui/LoadingScreen';
 import { Minimap } from './ui/Minimap';
@@ -126,6 +129,9 @@ async function boot(): Promise<void> {
   const sky = new Sky();
   engine.scene.add(sky.mesh);
   engine.scene.environment = sky.createEnvironment(engine.renderer);
+  // The held weapon is drawn in its own pass with its own scene, so it needs
+  // to be handed the same sky to reflect.
+  engine.setOverlayEnvironment(engine.scene.environment);
 
   const lighting = new Lighting();
   lighting.addTo(engine.scene);
@@ -440,8 +446,15 @@ async function boot(): Promise<void> {
     quality: 'high',
     seed: plan.seed,
     onArrest: () => respawn.bust('busted'),
+    onOfficerShot: (x: number, y: number, z: number) => combatAudio.shotAt('pistol', x, y, z),
   });
   engine.scene.add(police.group);
+
+  // Gunfire, impacts, blasts and the sound of being hit. A third layer on the
+  // director's own buses, like `StreetAudio`, so the volume sliders reach it.
+  const combatAudio = new CombatAudio(audio);
+  const damageFeedback = new DamageFeedback();
+  hud.element.append(damageFeedback.element);
 
   const combat = new CombatSystem({
     player,
@@ -455,9 +468,38 @@ async function boot(): Promise<void> {
     hud,
     seed: plan.seed,
     viewmodels: defaultViewmodels(import.meta.env.BASE_URL),
+    rocketUrl: `${import.meta.env.BASE_URL}models/weapons/rocket.glb`,
+    onShot: (weapon) => combatAudio.shot(weapon),
+    onImpact: (kind, x, y, z) => combatAudio.impact(kind, x, y, z),
+    onHandling: (kind) => combatAudio.handling(kind),
+    onExplosion: (x, y, z, radius, distance) => {
+      combatAudio.explosion(x, y, z, distance);
+      // Everything inside the blast gets thrown about, and the camera with it.
+      pedestrians.blastAt(x, z, radius);
+      controller.shake(Math.max(0, 1 - distance / (radius * 3.5)));
+    },
+    onRocket: (rocket) => {
+      const flight = combatAudio.flight(rocket.x, rocket.y, rocket.z);
+      rocketFlights.push({ rocket, flight });
+    },
+    onSlotDenied: (weapon, reason) => {
+      hud.flash(
+        reason === 'unowned'
+          ? `${WEAPONS[weapon].name} — buy it at the gun store`
+          : `${WEAPONS[weapon].name} — out of ammunition`,
+      );
+    },
   });
   engine.scene.add(combat.group);
+  // The held weapon is drawn in its own pass against a cleared depth buffer,
+  // which is the only way a barrel can be at a shop counter without going
+  // through it. See `Engine.renderFrame`.
+  const heldWeapon = combat.overlay;
+  if (heldWeapon) engine.overlayScene.add(heldWeapon);
   police.setEffects(combat.effects);
+
+  /** Live rocket motors, so each one's loop can follow it and then stop. */
+  const rocketFlights: { rocket: RocketHandle; flight: FlightSound }[] = [];
 
   const respawn = new RespawnDirector({
     player,
@@ -470,6 +512,8 @@ async function boot(): Promise<void> {
     onBust: () => {
       police.standDown();
       combat.reset();
+      combatAudio.reset();
+      damageFeedback.reset();
     },
   });
 
@@ -479,6 +523,13 @@ async function boot(): Promise<void> {
     shop.refresh();
   };
   hud.setMoney(player.money);
+
+  // Being shot: a grunt, a red flash, and an arc pointing at whoever did it.
+  player.onDamage = (amount, sourceX, sourceZ) => {
+    combatAudio.hurt();
+    damageFeedback.hit(amount / MAX_HEALTH, sourceX, sourceZ);
+  };
+  player.onDeath = () => combatAudio.death();
 
   interactions.onActivate = ({ point }) => {
     // The counter is an interaction point like any other; the shop claims it.
@@ -620,8 +671,18 @@ async function boot(): Promise<void> {
       playerSpeed: state.speed,
     });
     respawn.update(dt);
+    // Health comes back once the player has been left alone. See PlayerState.
+    player.regenerate(dt);
     hud.setWanted(player.wanted);
     hud.setHealth(player.health, MAX_HEALTH);
+    hud.tick(dt);
+    damageFeedback.update(dt, {
+      health: player.health / MAX_HEALTH,
+      alive: player.alive,
+      yaw: state.yaw,
+      x: state.x,
+      z: state.z,
+    });
 
     shop.update(dt, { x: state.x, z: state.z });
     furnishings.update(state.x, state.z);
@@ -644,6 +705,25 @@ async function boot(): Promise<void> {
       surface: state.surface,
       indoors: state.indoors,
       speed: state.speed,
+    });
+
+    // Rocket motors travel with their rockets, and stop when they arrive. The
+    // list is walked backwards so a finished flight can be spliced out of it.
+    for (let i = rocketFlights.length - 1; i >= 0; i -= 1) {
+      const entry = rocketFlights[i];
+      if (!entry) continue;
+      if (entry.rocket.live) {
+        entry.flight.moveTo(entry.rocket.x, entry.rocket.y, entry.rocket.z);
+      } else {
+        entry.flight.stop();
+        rocketFlights.splice(i, 1);
+      }
+    }
+
+    combatAudio.update(dt, {
+      health: player.health,
+      maxHealth: MAX_HEALTH,
+      alive: player.alive,
     });
 
     // Engine note, tyres, doors, impacts and crowd footsteps. Routed through
@@ -741,6 +821,9 @@ async function boot(): Promise<void> {
   // The start click is the user gesture that lets us create the AudioContext.
   // Music stays off; only ambience and effects come up here.
   await audio.unlock();
+  // Gunfire has to be resident before the first trigger pull, not fetched
+  // after it: a shot whose sound arrives 300 ms late reads as no sound at all.
+  combatAudio.preload();
   hud.setMusicEnabled(audio.musicEnabled);
   pause.setMusicEnabled(audio.musicEnabled);
 
@@ -764,6 +847,8 @@ async function boot(): Promise<void> {
     traffic.dispose();
     signals.dispose();
     streetAudio.dispose();
+    combatAudio.dispose();
+    damageFeedback.dispose();
     shop.dispose();
     furnishings.dispose();
     combat.dispose();
@@ -958,7 +1043,51 @@ async function boot(): Promise<void> {
       },
       /** Combat and law-enforcement state, for automated QA. */
       get law(): unknown {
-        return { combat: combat.stats, police: police.stats, shopOpen: shop.open };
+        return {
+          combat: combat.stats,
+          police: police.stats,
+          shopOpen: shop.open,
+          rockets: combat.rocketsLive,
+          viewmodelReady: combat.viewmodelReady,
+          officerPoses: police.officerPoses,
+        };
+      },
+      /**
+       * Levers that put the game into a state worth looking at, for automated
+       * QA and for verifying a change by hand.
+       *
+       * Deliberately a separate object with a name that says what it is: these
+       * write to the same `PlayerState` the shop and the police read, so
+       * anything reached through here is the real system and not a mock. It is
+       * the only way to check a weapon, a wanted level or an explosion without
+       * playing the twenty minutes it would take to earn one.
+       */
+      qa: {
+        /** Puts a weapon and its ammunition in the player's hands. */
+        give(id: WeaponId, rounds = 90): void {
+          player.earn(WEAPONS[id].price);
+          player.buyWeapon(id);
+          while (player.ammo(id) < rounds) {
+            player.earn(WEAPONS[id].ammoPrice);
+            if (!player.buyAmmo(id)) break;
+          }
+          player.equip(id);
+        },
+        /** One deliberate trigger pull. Returns whether a round left. */
+        fire(): boolean {
+          return combat.fireOnce();
+        },
+        /** Damages the player from a direction, as an officer's round does. */
+        hurt(amount = 20, sourceX?: number, sourceZ?: number): void {
+          player.hurt(amount, sourceX, sourceZ);
+        },
+        /** Adds heat, which is what the star rating is a threshold over. */
+        heat(amount = 200): void {
+          player.addHeat(amount);
+        },
+        teleport(x: number, z: number, heading?: number): void {
+          controller.teleport(x, z, heading);
+        },
       },
       /** Player driving state, for automated QA. */
       get driving(): unknown {

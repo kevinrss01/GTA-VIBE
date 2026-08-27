@@ -366,6 +366,17 @@ export class PedestrianSystem {
   }
 
   /**
+   * Throws everybody inside a blast radius flat.
+   *
+   * Called by the combat layer AFTER it has decided who the explosion killed:
+   * this is the visible consequence, not the damage model. Returns how many
+   * people were moved, for diagnostics.
+   */
+  blastAt(x: number, z: number, radius: number): number {
+    return this.crowd.blastAt(x, z, radius);
+  }
+
+  /**
    * Everybody standing on a carriageway, so traffic can brake for them.
    *
    * WIRING, for whoever owns `main.ts`. Two lines, once, after both systems

@@ -235,3 +235,53 @@ the quay never triggers an immediate announcement.
   getting their own recordings, as directed.
 - **No additional speech was generated**; the existing harbour PA is the single
   environmental voice element.
+
+## Combat, 2026-08-27
+
+Twenty-two more clips: firing a weapon, what the round arrives at, and being on
+the receiving end of one. Rendered by
+[`tools/generate-combat-sfx.mjs`](../tools/generate-combat-sfx.mjs), which is
+the runnable form of every prompt below and can be re-run clip by clip. Same
+provider, same model (`eleven_text_to_sound_v2`), same output format
+(`mp3_44100_128`), measured the same way.
+
+| Family | Clips | Charged |
+| --- | --- | --- |
+| `wpn/*` — the gun in somebody's hands | 12 | 60.0 |
+| `imp/*` — where the round lands | 6 | 21.7 |
+| `plr/*` — the player's own body | 4 | 23.7 |
+| **Total** | **22** | **105.4 credits** |
+
+Four clips were rendered more than once and the cost of the rejected takes is
+included above (26.7 credits over four re-renders).
+
+### What had to be corrected, and why
+
+- **`wpn/smg` is the only clip that is not its own generation.** Four separate
+  submachine-gun renders came back between -39 and -49 dBFS peak with a noise
+  floor only 24 dB below that. Bringing one up to a usable level would have
+  brought an audible hiss up with it under a weapon that fires thirteen times a
+  second. The shipped file is the pistol render — the same 9 mm cartridge, and
+  an excellent take at 0.1 dBFS peak with a -74.8 dB floor — resampled up 18 per
+  cent and cut to 0.55 s, which is what a shorter barrel and a lighter bolt
+  actually sound like. The exact `ffmpeg` command is in the runtime manifest's
+  `postProcess` field.
+- **`wpn/rifle` and `imp/flesh` were peak-normalised offline** (+15.7 dB and
+  +13.3 dB). Both rendered further below the trim's +10 dB cap than it is
+  allowed to correct; the alternative was a rifle you could not hear.
+- **`wpn/dry` and `imp/concrete` were re-rendered** with the level asked for in
+  the prompt itself ("loud", "recorded close up"), which worked where trimming
+  would have raised the noise floor.
+
+### Mixing
+
+One-shots are peak-normalised towards -6 dBFS and the two driven loops
+(`plr/heartbeat`, `plr/tinnitus`) mean-normalised towards -34 dBFS, exactly as
+the rest of the manifest is. The heartbeat and the ringing are not played, they
+are DRIVEN: they run silently from the first time they are needed and their gain
+follows health and blast proximity, because a loop that is started and stopped
+clicks on every transition and restarts mid-beat.
+
+`src/audio/CombatAudio.ts` is the layer that plays them. Like `StreetAudio` it
+builds on the director's existing buses rather than opening a context of its
+own, so the volume sliders still reach all of it.

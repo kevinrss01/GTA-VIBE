@@ -145,10 +145,32 @@ const TRAFFIC_RADIUS = 55;
 const TRAFFIC_RELEASE = 72;
 const TRAFFIC_REASSIGN = 0.25;
 const TRAFFIC_REF_DISTANCE = 7;
-/** Ambient braking loud enough to be worth a scrub, and how near it must be. */
-const TRAFFIC_SCRUB_SPEED = 6;
-const TRAFFIC_SCRUB_RADIUS = 34;
-const TRAFFIC_SCRUB_COOLDOWN = 0.85;
+/**
+ * When another car's braking is worth hearing as a tyre squeal.
+ *
+ * THIS USED TO BE WRONG IN A WAY THAT WAS AUDIBLE EVERYWHERE. The trigger was
+ * `vehicle.braking`, which is the BRAKE LAMP: it lights at 0.55 m/s² of
+ * deceleration, which is ordinary lift-off in traffic and something every car
+ * in the city does several times per junction. The asset behind it is "a car
+ * braking hard on dry asphalt, rubber scrubbing and chirping with brake pad
+ * squeal" - an emergency stop. The result was an emergency stop somewhere
+ * within 34 m every 0.85 s, all day, while walking down an empty pavement.
+ *
+ * The gate now reads the actual deceleration and demands a stop hard enough
+ * that a real tyre would break traction: 5.5 m/s² is about 0.56 g, roughly
+ * where an ordinary car on dry tarmac starts to protest. Speed matters too - a
+ * car braking hard from 8 km/h squeals from nothing - and the level is scaled
+ * by how far past the threshold it went, so a merely firm stop is a whisper
+ * and a genuine emergency stop is loud.
+ */
+const TRAFFIC_SCRUB_DECEL = 5.5;
+/** Deceleration at which the scrub is at full level. */
+const TRAFFIC_SCRUB_FULL_DECEL = 9;
+const TRAFFIC_SCRUB_SPEED = 11;
+const TRAFFIC_SCRUB_RADIUS = 26;
+const TRAFFIC_SCRUB_COOLDOWN = 2.6;
+/** Loudest an ambient scrub may be, as a fraction of the asset's own level. */
+const TRAFFIC_SCRUB_GAIN = 0.55;
 
 /** Distant hum: how far cars contribute, and how quickly the level follows. */
 const HUM_RADIUS = 95;
@@ -247,6 +269,8 @@ export interface VehicleAudioView {
   /** Forward speed in m/s. */
   readonly speed: number;
   readonly braking: boolean;
+  /** Longitudinal acceleration in m/s². Negative under braking. */
+  readonly accelLong: number;
   readonly control: 'ambient' | 'player';
 }
 
@@ -681,16 +705,24 @@ export class StreetAudio {
     }
     this.setVoiceLevel(voice, ambientLevel(vehicle.speed) * AMBIENT_TRIM);
 
-    const startedBraking = vehicle.braking && !voice.wasBraking;
-    voice.wasBraking = vehicle.braking;
+    // Rising edge of a HARD stop, not of the brake lamp. See the constants.
+    const hard = vehicle.accelLong <= -TRAFFIC_SCRUB_DECEL;
+    const started = hard && !voice.wasBraking;
+    voice.wasBraking = hard;
     if (
-      startedBraking &&
+      started &&
       Math.abs(vehicle.speed) > TRAFFIC_SCRUB_SPEED &&
       distance < TRAFFIC_SCRUB_RADIUS &&
       this.trafficScrubCooldown <= 0
     ) {
       this.trafficScrubCooldown = TRAFFIC_SCRUB_COOLDOWN;
-      this.playPositional(VEHICLE_SOUNDS.tyreScrub, vehicle.x, vehicle.y, vehicle.z, 0.8, 8, 40);
+      const severity = Math.min(
+        1,
+        (-vehicle.accelLong - TRAFFIC_SCRUB_DECEL) /
+          (TRAFFIC_SCRUB_FULL_DECEL - TRAFFIC_SCRUB_DECEL),
+      );
+      const level = TRAFFIC_SCRUB_GAIN * (0.35 + severity * 0.65);
+      this.playPositional(VEHICLE_SOUNDS.tyreScrub, vehicle.x, vehicle.y, vehicle.z, level, 8, 34);
     }
   }
 
