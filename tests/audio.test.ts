@@ -74,18 +74,49 @@ interface FakeSource {
   stop(): void;
 }
 
+/**
+ * A stand-in for `AudioParam` that refuses non-finite numbers, because the
+ * real one does.
+ *
+ * The browser throws `TypeError: Failed to set the 'value' property on
+ * 'AudioParam': The provided float value is non-finite`, and since the listener
+ * is written from inside the frame loop that exception takes rendering, input
+ * and the simulation down with it. A mock that quietly accepted NaN made the
+ * test guarding against it vacuous - it stayed green with the guard deleted.
+ * Caught by Greptile.
+ */
 class FakeParam {
-  value = 0;
+  private current = 0;
+
+  get value(): number {
+    return this.current;
+  }
+
+  set value(next: number) {
+    FakeParam.check(next);
+    this.current = next;
+  }
+
   setValueAtTime(v: number): FakeParam {
-    this.value = v;
+    FakeParam.check(v);
+    this.current = v;
     return this;
   }
   linearRampToValueAtTime(v: number): FakeParam {
-    this.value = v;
+    FakeParam.check(v);
+    this.current = v;
     return this;
   }
   cancelScheduledValues(): FakeParam {
     return this;
+  }
+
+  private static check(v: number): void {
+    if (!Number.isFinite(v)) {
+      throw new TypeError(
+        "Failed to set the 'value' property on 'AudioParam': The provided float value is non-finite.",
+      );
+    }
   }
 }
 
