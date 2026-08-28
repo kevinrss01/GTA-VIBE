@@ -348,6 +348,23 @@ export class Driving {
     }
     if (!placed) controller.teleport(this.x, this.z, this.yaw);
 
+    // HAND THE WHOLE ARC OVER, NOT JUST ITS HEIGHT. A car abandoned mid-flight
+    // still has somewhere to be going: publishing the height alone would drop
+    // the upward velocity, so it would stop climbing and fall from wherever it
+    // happened to be when the door opened. Published BEFORE `release`, because
+    // release parks the car and the traffic layer integrates it from there -
+    // and a blast that lands in the same frame as the exit would otherwise have
+    // its lift thrown away before a single pose was ever published.
+    handle.setPose({
+      x: this.x,
+      z: this.z,
+      yaw: this.yaw,
+      speed: this.speed,
+      steer: this.steer,
+      braking: false,
+      lift: this.hop,
+      liftRate: this.hopRate,
+    });
     handle.release();
     this.handle = null;
     this.hop = 0;
@@ -508,6 +525,12 @@ export class Driving {
       const stepX = dx / steps;
       const stepZ = dz / steps;
       const surface = ground.sample(this.x, this.z);
+      // THE BOX RIDES WITH THE BODY. `this.hop` is the height a blast threw the
+      // car to, and it is published to the renderer - so testing the footprint
+      // at the road height instead would stop a visibly airborne car dead
+      // against a kerb or a bonnet it had already cleared, and charge it for
+      // the collision. Zero on every frame of ordinary driving, so this is the
+      // same test it always was until something lifts the car.
       const moved = collision.moveBox(
         this.x,
         this.z,
@@ -516,7 +539,7 @@ export class Driving {
         stepZ,
         handle.view.halfLength,
         handle.view.halfWidth,
-        surface.y,
+        surface.y + this.hop,
         BODY_HEIGHT,
         true,
         this.contact,
@@ -623,6 +646,7 @@ export class Driving {
       steer: this.steer,
       braking: this.braking,
       lift: this.hop,
+      liftRate: this.hopRate,
     });
 
     // -- chase camera --------------------------------------------------------

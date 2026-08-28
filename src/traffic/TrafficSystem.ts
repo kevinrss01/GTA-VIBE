@@ -335,6 +335,7 @@ export class TrafficSystem {
         // through the same `hop` an ambient one uses or it would be welded
         // back to the road before it was drawn.
         vehicle.hop = Math.max(0, pose.lift ?? 0);
+        vehicle.hopRate = pose.liftRate ?? 0;
         const travelled = pose.speed * (1 / 60);
         vehicle.wheelSpin -= travelled / vehicle.blueprint.wheelRadius;
         vehicle.speed = pose.speed;

@@ -552,6 +552,15 @@ export interface VehicleHandle {
      * happens to be sitting in.
      */
     lift?: number;
+    /**
+     * Rate of change of `lift`, m/s, positive upward.
+     *
+     * The other half of the arc. A car handed back mid-flight - the player
+     * bailing out of one a blast has just thrown - has to carry its upward
+     * velocity across the handover, or it stops climbing at the door and falls
+     * from wherever it happened to be.
+     */
+    liftRate?: number;
   }): void;
   /**
    * Gives the vehicle up. It stays EXACTLY where it was left.

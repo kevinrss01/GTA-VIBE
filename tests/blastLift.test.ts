@@ -377,6 +377,44 @@ describe('a blast reaches the car the player is sitting in', () => {
     expect(sim.takeImpulse(car.id)?.lift).toBe(0);
   });
 
+  it('carries the upward velocity across a handover, not just the height', () => {
+    /*
+     * The second Greptile finding, and it was real: publishing only the height
+     * meant a car abandoned mid-flight stopped climbing at the door and fell
+     * from wherever it happened to be. Worse, a blast landing in the same frame
+     * as the exit had its lift thrown away entirely, because the queued impulse
+     * lived in `Driving` and was zeroed on the way out.
+     *
+     * The sim-level contract is that both fields are the arc, and that a body
+     * holding them integrates onward under gravity.
+     */
+    const { sim, laneId } = makeSim();
+    const car = seed(sim, laneId, 60);
+    // `release()` parks the car, and a parked body is the one the traffic layer
+    // integrates from there - so this is the real handover path.
+    sim.park(car);
+    // Exactly what `setPose` writes for a car handed back mid-climb.
+    car.hop = 0.4;
+    car.hopRate = 3;
+    const climbed = fly(sim, car, 1.2);
+    // It kept going up from 0.4 m rather than falling from it...
+    expect(climbed.peak).toBeGreaterThan(0.8);
+    // ...and still came down.
+    expect(car.hop).toBe(0);
+  });
+
+  it('falls rather than floating when only the height survives', () => {
+    // The failure mode the field above prevents, pinned so it stays a fall and
+    // never becomes a car frozen in mid-air.
+    const { sim, laneId } = makeSim();
+    const car = seed(sim, laneId, 60);
+    sim.park(car);
+    car.hop = 1.2;
+    car.hopRate = 0;
+    fly(sim, car, 3);
+    expect(car.hop).toBe(0);
+  });
+
   it('rides a driven car above the road when the pose publishes a lift', () => {
     // The other half: the traffic layer has to ADD the published height to the
     // ground it samples, or the driving layer's arc is overwritten before it is
