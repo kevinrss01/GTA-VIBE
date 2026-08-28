@@ -789,3 +789,46 @@ So of the eight behaviours this run was meant to cover, it independently
 confirmed boot, HUD and vehicle entry. The other seven rest on the deterministic
 suite and on the browser verification recorded above, which covered all of them
 except a lethal civilian takedown and grass footsteps.
+
+## The second Vercel failure, and why it never showed up locally
+
+Fixing the lockfile got the build past `pnpm install` and straight into a second,
+unrelated failure:
+
+```
+tools/glbMesh.ts(14,30): error TS2307: Cannot find module 'node:fs'
+tools/glbMesh.ts(82,27): error TS2591: Cannot find name 'Buffer'
+tests/travellers.test.ts(16,30): error TS2307: Cannot find module 'node:fs'
+... 12 errors
+Error: Command "npm run build" exited with 2
+```
+
+`npm run build` passed on this machine and `vercel build` passed on this machine.
+Reproducing Vercel's own sequence — `git archive HEAD` into an empty directory,
+`npm ci`, `npm run build` — failed identically, which turned a puzzle into a
+bug.
+
+**`@types/node` was never a dependency of this repository.** `tools/` and six
+test files import `node:fs`, `node:path` and `node:url` and use `Buffer`, and
+nothing declared the types for them. TypeScript resolves `@types` by walking
+*up* the directory tree, and it was finding
+
+```
+/Users/kevin/node_modules/@types/node   (25.0.8)
+```
+
+— a package in the home directory, three levels above the checkout and no part
+of the project. Every local build has quietly depended on it. Any clean
+machine — Vercel, CI, a fresh clone, another developer — fails.
+
+The fix is two lines and both are needed: `@types/node` pinned in
+`devDependencies`, and `"node"` added to the `types` array in `tsconfig.json`,
+because an explicit `types` array suppresses the automatic global inclusion that
+would otherwise supply `Buffer`.
+
+Verified the way it should have been all along: `git archive HEAD` into an empty
+directory, `npm ci`, `npm run build` — clean.
+
+This one predates the repair pass entirely. It was only ever going to surface by
+actually deploying, which is the argument for doing so rather than trusting a
+local build.

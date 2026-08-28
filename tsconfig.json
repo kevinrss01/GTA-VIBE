@@ -4,7 +4,14 @@
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "types": ["vite/client"],
+    // `node` is not optional and not a convenience. `tools/` and several tests
+    // import `node:fs`/`node:path` and use `Buffer`, and with an explicit
+    // `types` array those globals are only included if listed here. Without
+    // both this line and the `@types/node` devDependency, `tsc` resolved them
+    // from whatever `node_modules/@types` happened to exist in an ANCESTOR
+    // directory of the checkout - which is why the build passed on one machine
+    // and failed on every clean one, including Vercel.
+    "types": ["vite/client", "node"],
     "strict": true,
     "noImplicitOverride": true,
     "noUncheckedIndexedAccess": true,
