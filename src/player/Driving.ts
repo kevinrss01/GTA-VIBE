@@ -411,6 +411,12 @@ export class Driving {
     // owner spends it - which is what makes an ambient driver running into the
     // parked player shove them forward instead of stopping dead against them.
     this.absorbImpulse();
+    // ADVANCED BEFORE THE MOVE, NOT AFTER IT. `moveBox` below tests the
+    // footprint at `surface.y + this.hop`, and `setPose` publishes the same
+    // number to the renderer; stepping the arc between them would leave the
+    // collision volume one frame under the drawn body, which is exactly the
+    // launch and landing frames where it matters.
+    this.stepHop(dt);
 
     // What the bodywork has done to the car. One rule, shared with the traffic
     // AI: see `VehicleHandling`. A wrecked engine bay takes the power away, a
@@ -645,7 +651,6 @@ export class Driving {
     this.rollLean += (targetRoll - this.rollLean) * Math.min(1, dt * 7);
 
     // -- hand the pose back to the renderer ----------------------------------
-    this.stepHop(dt);
     handle.setPose({
       x: this.x,
       z: this.z,
