@@ -211,7 +211,7 @@ export function flightControlHints(
      * aeroplane answers is worse than no reference.
      */
     return [
-      { keys: '↑ / W', action: 'Climb' },
+      { keys: '↑ / W', action: 'Take off, then climb - it opens the throttle for you' },
       { keys: '↓ / S', action: 'Descend' },
       { keys: '← / A', action: 'Turn left' },
       { keys: '→ / D', action: 'Turn right' },
@@ -263,11 +263,11 @@ export function flightHudHints(
     // Five lines, in the order a player needs them: get it moving, get it off
     // the ground, point it somewhere, put it down.
     return [
-      { keys: mac ? '⇧ Shift' : 'Shift', action: 'Throttle up' },
-      { keys: '↑ / W', action: 'Climb' },
+      { keys: '↑ / W', action: 'Take off, then climb' },
       { keys: '↓ / S', action: 'Descend' },
       { keys: '← / A', action: 'Turn left' },
       { keys: '→ / D', action: 'Turn right' },
+      { keys: mac ? '⇧ Shift' : 'Shift', action: 'More throttle' },
       { keys: 'Space', action: 'Brakes' },
       { keys: 'E', action: 'Get out (stopped)' },
     ];
@@ -631,6 +631,7 @@ export class Flying {
     this.spec = handle.spec;
     this.flight = createFlightState(handle.spec, info.x, info.z, info.yaw, info.y);
     this.throttleLever = 0;
+    this.throttleTouched = false;
     this.gearLever = true;
     // Seeded from the keyboard rather than from `false`, so a `G` that is
     // already down when the player climbs in does not read as a fresh press
@@ -838,7 +839,13 @@ export class Flying {
         (this.pressed('KeyD', 'ArrowRight') ? 1 : 0) - (this.pressed('KeyA', 'ArrowLeft') ? 1 : 0);
       this.demand.climb = climb;
       this.demand.turn = turn;
+      if (up || down) this.throttleTouched = true;
+      // While the assist owns the throttle the lever shadows it, so the first
+      // press of Shift or Control continues from the power that is set rather
+      // than snapping to whatever the lever happened to be left at.
+      if (!this.throttleTouched) this.throttleLever = this.controls.throttle;
       this.demand.throttle = this.throttleLever;
+      this.demand.autoThrottle = !this.throttleTouched;
       this.demand.brakes = brakes;
       const gearKeyAssist = this.keys.has('KeyG');
       if (gearKeyAssist && !this.gearLatch && spec.retractableGear) this.gearLever = !this.gearLever;
@@ -898,9 +905,17 @@ export class Flying {
     climb: number;
     turn: number;
     throttle: number;
+    autoThrottle: boolean;
     brakes: boolean;
     gearDown: boolean;
-  } = { climb: 0, turn: 0, throttle: 0, brakes: false, gearDown: true };
+  } = { climb: 0, turn: 0, throttle: 0, autoThrottle: true, brakes: false, gearDown: true };
+
+  /**
+   * False once the player has touched the throttle keys on this flight.
+   *
+   * Reset on boarding, so every new aeroplane starts flying itself again.
+   */
+  private throttleTouched = false;
 
   get assist(): boolean {
     return this.assistOn;

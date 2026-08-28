@@ -18,7 +18,14 @@ import { createFlightControls, trimLevelFlight, type FlightControls } from '../s
 import { CollisionWorld } from '../src/player/Collision';
 import { BODY_HEIGHT, BODY_RADIUS } from '../src/player/FirstPersonController';
 import { controlHints } from '../src/ui/platform';
-import { AIRFIELD_LEVEL, APRON, RUNWAY, STANDS, inRect } from '../src/world/airport/layout';
+import {
+  AIRFIELD_LEVEL,
+  APRON,
+  RUNWAY,
+  RUNWAY_READY,
+  STANDS,
+  inRect,
+} from '../src/world/airport/layout';
 import { landElevation } from '../src/world/elevation';
 import type { ColliderBox } from '../src/world/build/types';
 
@@ -79,7 +86,8 @@ describe('the parked fleet', () => {
   it('puts one aircraft on every stand, at the stand’s own position', () => {
     const { air } = rig();
     const list = air.list;
-    expect(list).toHaveLength(STANDS.length);
+    // Every stand, plus the one lined up on the runway overrun.
+    expect(list).toHaveLength(STANDS.length + 1);
 
     for (const stand of STANDS) {
       const parked = list.find((craft) => craft.standId === stand.id);
@@ -100,9 +108,60 @@ describe('the parked fleet', () => {
       expect(craft.y).toBe(AIRFIELD_LEVEL);
       expect(craft.pitch).toBe(craft.spec.groundPitch);
       expect(craft.roll).toBe(0);
-      // And inside the apron rectangle the layout drew, wings included.
+      // And inside the apron rectangle the layout drew, wings included. The
+      // runway-ready aeroplane is deliberately not on the apron; it has its
+      // own assertions below.
+      if (craft.standId === RUNWAY_READY.id) continue;
       expect(inRect(APRON, craft.x, craft.z, craft.spec.halfWidth + 1)).toBe(true);
     }
+  });
+
+  /*
+   * THE AEROPLANE A PLAYER CAN ACTUALLY FLY.
+   *
+   * Every stand is at x = 240 facing east while the runway is at x = 340
+   * running north-south, so an aeroplane taken from a stand and given full
+   * power rolls ACROSS the runway and off the far side. Flying required a
+   * hundred metres of taxi and a ninety-degree turn that nothing tells you
+   * about, and it was reported as not being able to fly at all.
+   *
+   * These pin the aeroplane that answers that: on the centreline, pointing
+   * down the runway, with the whole of it in front and nothing parked on the
+   * surface anything lands on.
+   */
+  describe('the runway-ready aeroplane', () => {
+    it('is lined up on the centreline, off the landing surface', () => {
+      const { air } = rig();
+      const ready = air.list.find((craft) => craft.standId === RUNWAY_READY.id);
+      expect(ready, 'no aeroplane on the runway threshold').toBeDefined();
+      if (!ready) return;
+      expect(ready.x).toBe(RUNWAY.centreX);
+      expect(ready.yaw).toBe(RUNWAY_READY.heading);
+      expect(ready.y).toBe(AIRFIELD_LEVEL);
+      // Before the threshold, on the paved overrun, so it is not standing on
+      // the touchdown zone.
+      expect(ready.z).toBeLessThan(RUNWAY.northZ);
+      expect(ready.z).toBeGreaterThan(RUNWAY.northZ - RUNWAY.overrun);
+    });
+
+    it('has the whole runway in front of it', () => {
+      const { air } = rig();
+      const ready = air.list.find((craft) => craft.standId === RUNWAY_READY.id);
+      if (!ready) throw new Error('no runway-ready aeroplane');
+      // Forward is (-sin yaw, 0, -cos yaw): at PI that is +Z, toward the far
+      // threshold. Anything else and full power drives it off the airfield.
+      const forwardZ = -Math.cos(ready.yaw);
+      expect(forwardZ).toBeGreaterThan(0.99);
+      const runAhead = RUNWAY.southZ - ready.z;
+      expect(runAhead).toBeGreaterThan(600);
+    });
+
+    it('is a type the player is allowed to fly', () => {
+      const { air } = rig();
+      const ready = air.list.find((craft) => craft.standId === RUNWAY_READY.id);
+      if (!ready) throw new Error('no runway-ready aeroplane');
+      expect(ready.spec.flyable).toBe(true);
+    });
   });
 
   it('gives the heavy stand the only aircraft that fits it', () => {

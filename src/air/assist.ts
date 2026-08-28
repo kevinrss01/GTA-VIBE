@@ -51,6 +51,16 @@ export interface AssistDemand {
   /** -1 left .. +1 right. */
   readonly turn: number;
   readonly throttle: number;
+  /**
+   * True until the player first touches the throttle keys, and the whole
+   * reason one key is enough to fly.
+   *
+   * While it holds, the assist sets the power the climb demand needs. The
+   * moment Shift or Control is pressed it goes false for the rest of the
+   * flight and `throttle` above is authoritative - so the lever is never taken
+   * away from somebody who wants it, and never needed by somebody who does not.
+   */
+  readonly autoThrottle: boolean;
   readonly brakes: boolean;
   readonly gearDown: boolean;
 }
@@ -112,6 +122,14 @@ const PITCH_DAMPING = 0.9;
 const ALPHA_LIMIT = 0.82;
 /** Below this ground speed the wheels steer instead of the wings banking. */
 const STEER_SPEED = 22;
+/**
+ * Ground steering authority.
+ *
+ * Full rudder is what a taxiing aeroplane needs to turn in anything like the
+ * distance a player is willing to spend on it. At half deflection the turn
+ * radius is wide enough that lining up with a runway reads as not working.
+ */
+const STEER_AUTHORITY = 1;
 
 /**
  * Writes the assisted control surfaces into `controls` and returns it.
@@ -126,11 +144,31 @@ export function applyFlightAssist(
   controls: FlightControls,
   dt: number,
 ): FlightControls {
-  controls.throttle = clamp(demand.throttle, 0, 1);
-  controls.brakes = demand.brakes;
-  controls.gearDown = demand.gearDown;
-
   const climb = clamp(demand.climb, -1, 1);
+
+  /*
+   * THE THROTTLE FLIES ITSELF UNTIL THE PLAYER TAKES IT.
+   *
+   * Take-off used to be two keys held together for fifteen seconds - power on
+   * Shift, stick on Up - and it was reported as not being able to fly at all.
+   * Nothing about an aeroplane tells you that the thing which gets it off the
+   * ground is a key you hold with your other hand.
+   *
+   * So while `autoThrottle` holds, power follows what was asked for: full to
+   * get off the ground and to climb, a cruise setting in level flight, and
+   * well back for a descent. Holding `Up` is then the whole of a take-off, and
+   * letting go is the whole of levelling off. An earlier version only did this
+   * on the wheels, and the engine dropped to idle the instant they left the
+   * ground - airborne at 7 m and climbing no further.
+   *
+   * Touching Shift or Control ends it for the rest of the flight; see
+   * `autoThrottle`.
+   */
+  const autoThrottle = state.onGround || climb > 0 ? 1 : climb < 0 ? 0.3 : 0.72;
+  controls.throttle = clamp(demand.autoThrottle ? autoThrottle : demand.throttle, 0, 1);
+  // Brakes are released by asking to go. Holding Space still stops it.
+  controls.brakes = demand.brakes && !(state.onGround && climb > 0);
+  controls.gearDown = demand.gearDown;
   const turn = clamp(demand.turn, -1, 1);
   const speed = groundSpeed(state);
 
@@ -158,7 +196,7 @@ export function applyFlightAssist(
    * right turn on the ground is a negative rudder. In the air this is zero;
    * see the note above the constants for the measurements behind that.
    */
-  const steering = -turn * onWheels;
+  const steering = -turn * onWheels * STEER_AUTHORITY;
   controls.rudder = clamp(steering, -1, 1);
 
   // -- pitch -----------------------------------------------------------------

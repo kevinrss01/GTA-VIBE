@@ -93,7 +93,7 @@ import {
   type Material,
 } from 'three';
 
-import { STANDS, type Stand } from '../world/airport/layout';
+import { RUNWAY_READY, STANDS, type Stand } from '../world/airport/layout';
 import { ModelLibrary } from '../world/ModelLibrary';
 import { AIRCRAFT, ALL_AIRCRAFT_TYPES, type AircraftSpec, type AircraftType } from './AircraftCatalogue';
 
@@ -112,6 +112,8 @@ const STAND_FLEET: Readonly<Record<string, AircraftType>> = {
   'stand-3': 'twin',
   'stand-4': 'cessna',
   'stand-5': 'cessna',
+  // The one on the runway threshold, lined up and ready to fly.
+  [RUNWAY_READY.id]: 'cessna',
 };
 
 /** Radians per second at full throttle. About 2400 rpm on the piston type. */
@@ -255,6 +257,18 @@ export class AircraftSystem {
     this.group = new Group();
     this.group.name = 'aircraft';
     for (const stand of STANDS) this.park(stand);
+    /*
+     * And one on the runway, lined up. See `RUNWAY_READY`: without it the only
+     * aeroplanes in the game are parked across the runway rather than along it,
+     * and flying requires a taxi and a ninety-degree turn nobody is told about.
+     */
+    this.park({
+      id: RUNWAY_READY.id,
+      x: RUNWAY_READY.x,
+      z: RUNWAY_READY.z,
+      heading: RUNWAY_READY.heading,
+      size: 'light',
+    });
   }
 
   private park(stand: Stand): void {

@@ -64,7 +64,14 @@ const AIRFIELD_GROUND = (x: number, z: number): number => landElevation(x, z);
 
 /** Somewhere long, flat and paved, well clear of the stands and their kit. */
 const FIELD_X = RUNWAY.centreX;
-const FIELD_Z = RUNWAY.northZ + 60;
+/*
+ * Well down the runway, not at its threshold. `RUNWAY_READY` parks an aeroplane
+ * on the northern overrun so a player can fly without taxiing, and a fixture
+ * placed at the threshold would take off straight into it - which is a real
+ * collision, correctly reported, and nothing to do with what these tests are
+ * about.
+ */
+const FIELD_Z = RUNWAY.northZ + 200;
 
 function stubPlayer(): FlyingPlayer & { at: { x: number; z: number } | null; paused: boolean } {
   return {
@@ -904,15 +911,20 @@ describe('the assisted controls', () => {
     expect(Math.abs(flying.state.bank)).toBeLessThan(0.15);
   });
 
-  it('gets a beginner airborne on two keys', () => {
-    // The whole point: throttle up, hold Up, leave the ground. No rudder, no
-    // trim, no coordination, nothing the player has to be taught.
+  it('gets a beginner airborne on ONE key', () => {
+    /*
+     * The whole point. Hold Up and leave the ground: no throttle key, no
+     * rudder, no trim, no coordination, nothing the player has to be taught.
+     * On the wheels `Up` opens the throttle as well - see `assist.ts`.
+     *
+     * Placed at the northern threshold pointing DOWN the runway, which is
+     * where `RUNWAY_READY` parks the aeroplane a player actually finds, and
+     * which is the only heading with a take-off run in front of it.
+     */
     const { flying } = rig();
-    expect(flying.placeInAircraft('cessna', FIELD_X, FIELD_Z, 0)).toBe(true);
-    press('ShiftLeft');
+    expect(flying.placeInAircraft('cessna', FIELD_X, RUNWAY.northZ + 20, Math.PI)).toBe(true);
     press('ArrowUp');
     run(flying, 30);
-    release('ShiftLeft');
     release('ArrowUp');
     expect(flying.state.onGround).toBe(false);
     expect(flying.state.altitudeAgl).toBeGreaterThan(30);

@@ -164,6 +164,36 @@ export interface Stand {
   readonly size: 'light' | 'medium' | 'heavy';
 }
 
+/**
+ * An aeroplane parked ON the runway, lined up and ready to go.
+ *
+ * Every stand is at x = 240 facing east; the runway is at x = 340 running
+ * north-south. So an aircraft taken from a stand and given full power rolls
+ * ACROSS the runway and off the far side - to fly it you first have to taxi
+ * 100 m east and turn ninety degrees, on nose-wheel steering, before you have
+ * even started the take-off roll. That was reported as simply not being able
+ * to fly, and it is a fair description: nothing about the aeroplane tells you
+ * any of it.
+ *
+ * This is the fix that needs no instructions. It sits on the northern
+ * threshold pointing down the full 600 m of runway, so boarding it and opening
+ * the throttle is a take-off. `heading` is `Math.PI` because the game's forward
+ * is `(-sin yaw, 0, -cos yaw)`, which at PI is +Z - the direction of the far
+ * threshold.
+ */
+export const RUNWAY_READY = {
+  id: 'runway-ready',
+  x: RUNWAY.centreX,
+  /*
+   * On the paved overrun BEFORE the threshold, not on the runway itself.
+   * Lined up with the full 600 m ahead of it, and off the surface anything
+   * lands on - an aeroplane parked on the touchdown zone is a hazard, and the
+   * blast pad is where one waits in the real thing too.
+   */
+  z: RUNWAY.northZ - 30,
+  heading: Math.PI,
+} as const;
+
 export const STANDS: readonly Stand[] = [
   { id: 'stand-1', x: 240, z: 336, heading: -Math.PI / 2, size: 'heavy' },
   { id: 'stand-2', x: 240, z: 404, heading: -Math.PI / 2, size: 'medium' },
