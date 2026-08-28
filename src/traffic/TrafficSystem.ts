@@ -329,6 +329,12 @@ export class TrafficSystem {
         vehicle.x = pose.x;
         vehicle.z = pose.z;
         vehicle.yaw = pose.yaw;
+        // The driving layer owns the arc, the traffic layer owns the ground.
+        // `settleBody` assigns `y` from the terrain under the axles every
+        // frame, so a driven car a blast has thrown has to publish its height
+        // through the same `hop` an ambient one uses or it would be welded
+        // back to the road before it was drawn.
+        vehicle.hop = Math.max(0, pose.lift ?? 0);
         const travelled = pose.speed * (1 / 60);
         vehicle.wheelSpin -= travelled / vehicle.blueprint.wheelRadius;
         vehicle.speed = pose.speed;
@@ -394,7 +400,9 @@ export class TrafficSystem {
    * the player's - or a pursuit unit's - it records the exchange here and lets
    * the owner decide what it does to the car. Poll it once a frame.
    */
-  takeImpulse(vehicleId: number): { x: number; z: number; yaw: number; damage: number } | null {
+  takeImpulse(
+    vehicleId: number,
+  ): { x: number; z: number; yaw: number; lift: number; damage: number } | null {
     return this.sim.takeImpulse(vehicleId);
   }
 

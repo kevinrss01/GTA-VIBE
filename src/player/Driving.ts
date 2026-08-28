@@ -133,6 +133,17 @@ const CONTACT_SPEED = 1.4;
  * takes to shed the yaw from a shunt, and it keeps the kick bounded whatever
  * the mass ratio.
  */
+/**
+ * Gravity, landing restitution and the lift trigger for a driven car a blast
+ * threw. The same three numbers `TrafficSim` uses for an ambient body, so the
+ * identical car follows the identical arc whoever is sitting in it. Kept here
+ * rather than imported because they are the driving model's own constants and
+ * the traffic layer does not export them.
+ */
+const BLAST_GRAVITY = 9.81;
+const LANDING_RESTITUTION = 0.12;
+const BLAST_LIFT_TRIGGER = 0.6;
+
 const YAW_KICK_SECONDS = 0.25;
 /** Ceiling on the heading a single hit may change, radians. */
 const YAW_KICK_LIMIT = 0.7;
@@ -242,7 +253,7 @@ export class Driving {
       kind: this.handle?.kind ?? null,
       police: this.handle?.view.police ?? false,
       x: this.x,
-      y: this.options.ground.sample(this.x, this.z).y + CAM_LOOK_HEIGHT,
+      y: this.options.ground.sample(this.x, this.z).y + this.hop + CAM_LOOK_HEIGHT,
       z: this.z,
       yaw: this.yaw,
     };
@@ -275,6 +286,8 @@ export class Driving {
     if (!handle) return false;
 
     this.handle = handle;
+    this.hop = 0;
+    this.hopRate = 0;
     this.x = view.x;
     this.z = view.z;
     this.yaw = view.yaw;
@@ -337,6 +350,8 @@ export class Driving {
 
     handle.release();
     this.handle = null;
+    this.hop = 0;
+    this.hopRate = 0;
     this.speed = 0;
     traffic.setPlayerIsObstacle(true);
     controller.setPaused(false);
@@ -599,6 +614,7 @@ export class Driving {
     this.rollLean += (targetRoll - this.rollLean) * Math.min(1, dt * 7);
 
     // -- hand the pose back to the renderer ----------------------------------
+    this.stepHop(dt);
     handle.setPose({
       x: this.x,
       z: this.z,
@@ -606,12 +622,13 @@ export class Driving {
       speed: this.speed,
       steer: this.steer,
       braking: this.braking,
+      lift: this.hop,
     });
 
     // -- chase camera --------------------------------------------------------
     // The boom trails the car rather than snapping to it, so a hard turn swings
     // the view around instead of teleporting it. Mouse look orbits the boom.
-    const roadY = ground.sample(this.x, this.z).y;
+    const roadY = ground.sample(this.x, this.z).y + this.hop;
     const camYaw = this.yaw + this.lookYaw;
     const bx = Math.sin(camYaw);
     const bz = Math.cos(camYaw);
@@ -752,6 +769,23 @@ export class Driving {
    * kinematic and has no lateral velocity to put a sideways shove into, so a
    * side impact arrives as a heading change and a jolt rather than as a slide.
    */
+  /**
+   * Height above the road, and the rate it is changing, for a car a blast threw.
+   *
+   * The driven car is kinematic: it has a speed along its heading and no
+   * velocity vector, which is why a sideways shove arrives as a heading change
+   * rather than as a slide. A blast's LIFT has nowhere to go in that model, so
+   * it gets its own one-dimensional ballistic state here and is published
+   * through `setPose`. Zero on every frame of ordinary driving.
+   *
+   * Without this, `TrafficSim.applyImpact` would hand a driven car the same
+   * vertical impulse it hands an ambient one and the pending-impulse queue
+   * would drop it on the floor - so the identical car would be thrown by a
+   * rocket when parked and merely shoved when the player was sitting in it.
+   */
+  private hop = 0;
+  private hopRate = 0;
+
   private absorbImpulse(): void {
     const handle = this.handle;
     if (!handle) return;
@@ -771,6 +805,31 @@ export class Driving {
       YAW_KICK_LIMIT,
     );
     this.pitchLean -= Math.min(0.09, Math.abs(deltaV) * 0.02);
+    // Straight up, in the same units the ambient body uses. Under the trigger
+    // the suspension absorbs it and the car stays on the road.
+    const lift = bump.lift / mass;
+    if (lift >= BLAST_LIFT_TRIGGER) this.hopRate += lift;
+  }
+
+  /**
+   * One step of the arc, and the way back down.
+   *
+   * Real gravity and a nearly inelastic landing, matching the ambient body so a
+   * car thrown by the same blast behaves the same whoever is in it.
+   */
+  private stepHop(dt: number): void {
+    if (this.hop <= 0 && this.hopRate <= 0) return;
+    this.hopRate -= BLAST_GRAVITY * dt;
+    this.hop += this.hopRate * dt;
+    if (this.hop <= 0) {
+      const landing = -this.hopRate;
+      this.hop = 0;
+      this.hopRate = landing > 1 ? landing * LANDING_RESTITUTION : 0;
+      if (this.hopRate <= 0.2) this.hopRate = 0;
+      // Coming down on the suspension takes speed off, and pitches the nose.
+      this.speed *= 0.7;
+      this.pitchLean -= Math.min(0.12, landing * 0.02);
+    }
   }
 
   dispose(): void {

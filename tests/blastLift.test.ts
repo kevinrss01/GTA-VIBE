@@ -324,6 +324,75 @@ describe('what must never lift a car', () => {
   });
 });
 
+// -- the player's own car ---------------------------------------------------
+
+describe('a blast reaches the car the player is sitting in', () => {
+  /*
+   * Found by the Greptile review, and it was real: `applyImpact` routes a
+   * player-controlled vehicle into `pendingImpulses`, which carried the
+   * horizontal shove, the yaw and the damage - and dropped the lift on the
+   * floor. The identical car was therefore thrown by a rocket when parked and
+   * merely shoved when the player happened to be in it.
+   *
+   * The queue now carries it. `Driving` integrates the arc, because the driven
+   * car is kinematic and the traffic layer is not integrating it, and publishes
+   * the height back through `setPose.lift`.
+   */
+  it('banks the lift for a driven car instead of dropping it', () => {
+    const { sim, laneId } = makeSim();
+    const car = seed(sim, laneId, 60);
+    sim.detach(car);
+    expect(car.control, 'detach hands the car to the player').toBe('player');
+    sim.applyImpact(car.id, {
+      x: car.x, y: 0.2, z: car.z, dirX: 1, dirZ: 0, impulse: 2000, lift: 5800, damage: 10,
+    });
+    const banked = sim.takeImpulse(car.id);
+    expect(banked).not.toBeNull();
+    expect(banked?.lift).toBe(5800);
+    // The horizontal half is untouched by carrying the vertical one.
+    expect(banked?.x).toBeCloseTo(2000, 6);
+  });
+
+  it('sums the lift when two blasts land inside one frame', () => {
+    const { sim, laneId } = makeSim();
+    const car = seed(sim, laneId, 60);
+    sim.detach(car);
+    sim.applyImpact(car.id, {
+      x: car.x, y: 0.2, z: car.z, dirX: 1, dirZ: 0, impulse: 1000, lift: 3000, damage: 5,
+    });
+    car.impactCooldown = 0;
+    sim.applyImpact(car.id, {
+      x: car.x, y: 0.2, z: car.z, dirX: 1, dirZ: 0, impulse: 1000, lift: 2000, damage: 5,
+    });
+    expect(sim.takeImpulse(car.id)?.lift).toBe(5000);
+  });
+
+  it('reports no lift for an ordinary collision on a driven car', () => {
+    const { sim, laneId } = makeSim();
+    const car = seed(sim, laneId, 60);
+    sim.detach(car);
+    sim.applyImpact(car.id, {
+      x: car.x, y: 0.6, z: car.z, dirX: 1, dirZ: 0, impulse: 12000, damage: 140,
+    });
+    expect(sim.takeImpulse(car.id)?.lift).toBe(0);
+  });
+
+  it('rides a driven car above the road when the pose publishes a lift', () => {
+    // The other half: the traffic layer has to ADD the published height to the
+    // ground it samples, or the driving layer's arc is overwritten before it is
+    // drawn - the same trap `settleBody` sets for an ambient body.
+    const { sim, laneId } = makeSim();
+    const car = seed(sim, laneId, 60);
+    sim.detach(car);
+    // `TrafficSystem.makeHandle` wires `setPose.lift` straight to this field;
+    // at the simulation level the observable contract is that `hop` is what
+    // lifts the drawn body off the ground the sampler assigned.
+    car.hop = 0.8;
+    sim.update(1 / 120, car.x, car.z, 0);
+    expect(car.y).toBeGreaterThan(0.5);
+  });
+});
+
 // -- the couple -------------------------------------------------------------
 
 describe('a lift under one side', () => {

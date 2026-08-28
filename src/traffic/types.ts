@@ -541,6 +541,17 @@ export interface VehicleHandle {
     speed: number;
     steer?: number;
     braking?: boolean;
+    /**
+     * Height above the ground, in metres, for a car a blast has thrown.
+     *
+     * Optional and zero by default, which is every frame of ordinary driving.
+     * The driving layer integrates the arc because it owns the car's motion
+     * while the player is in it; the traffic layer adds this to the ground it
+     * samples, exactly as it does for an ambient body's own `hop`. Without it a
+     * rocket would lift a parked car and not the identical one the player
+     * happens to be sitting in.
+     */
+    lift?: number;
   }): void;
   /**
    * Gives the vehicle up. It stays EXACTLY where it was left.

@@ -863,7 +863,7 @@ export class TrafficSim {
    */
   private readonly pendingImpulses = new Map<
     number,
-    { x: number; z: number; yaw: number; damage: number }
+    { x: number; z: number; yaw: number; lift: number; damage: number }
   >();
   /**
    * Vehicles the traffic AI is not driving that something can still run into:
@@ -2462,9 +2462,10 @@ export class TrafficSim {
         pending.x += jx;
         pending.z += jz;
         pending.yaw += yaw;
+        pending.lift += jy;
         pending.damage += hit.damage;
       } else {
-        this.pendingImpulses.set(vehicleId, { x: jx, z: jz, yaw, damage: hit.damage });
+        this.pendingImpulses.set(vehicleId, { x: jx, z: jz, yaw, lift: jy, damage: hit.damage });
       }
       return true;
     }
@@ -2567,7 +2568,9 @@ export class TrafficSim {
    * Collects and clears the impulse banked for a driven vehicle, in newton
    * seconds, or null when nothing hit it. Allocates only on a real contact.
    */
-  takeImpulse(vehicleId: number): { x: number; z: number; yaw: number; damage: number } | null {
+  takeImpulse(
+    vehicleId: number,
+  ): { x: number; z: number; yaw: number; lift: number; damage: number } | null {
     const pending = this.pendingImpulses.get(vehicleId);
     if (!pending) return null;
     this.pendingImpulses.delete(vehicleId);
