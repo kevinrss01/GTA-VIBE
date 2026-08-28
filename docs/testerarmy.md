@@ -158,3 +158,32 @@ it is the selected one.
 
 The run was not repeated. That is the instruction, and the finding did not need
 a second run to act on.
+
+## The airport repair pass
+
+| What | Id |
+| --- | --- |
+| Project — *Youtube videos GTA - TOOLS* | `c152f076-e9b6-4708-a104-cdcd1c06b5cc` |
+| *GTA Vibe - airport repair pass* | `8a5bf3d6-0945-4a35-997d-797f1a0e48be` |
+
+```bash
+ta tests run 8a5bf3d6-0945-4a35-997d-797f1a0e48be \
+  --local --url http://localhost:4183 --browser chrome --headed --json
+```
+
+**A run has a budget, and it is smaller than a long journey.** The first version
+of this test had 23 steps and covered boot, HUD, ramming a car, the drive south,
+the crowd, the terminal floor, the fit-out and boarding an aircraft. It returned
+`FAILED` with **`5/23 steps passed, 0 failed`** and **zero issues**: every step it
+reached passed, and it simply ran out of agent budget part-way into step 6. That
+is an infrastructure boundary, not a product defect, and it cost the one run this
+workstream was allowed.
+
+The skill says three to ten meaningful steps. Take it literally: a browser agent
+driving 600 m through traffic, walking into a building and crossing to an apron
+spends a great many tool calls inside a single "step".
+
+It is now 13 steps and **ordered so the checks that need no travel come first** —
+the abandoned-car check happens near the spawn point, before the long drive, so
+a run that exhausts its budget on the way south still returns signal on one of
+the headline repairs.

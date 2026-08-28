@@ -707,3 +707,85 @@ characters are 13.4 MB of VAT data and the terminal added 21 textures. The
 traveller characters are loaded eagerly on boot even for a player who never
 visits the airport; deferring them until the player is within about 220 m would
 recover most of it and is the obvious next optimisation.
+
+## Cross-agent review
+
+Two independent reviewers ran against the committed diff: Codex CLI (gpt-5.6-sol,
+high reasoning) and the Greptile CLI, the latter against a local
+`pre-repair-baseline` branch because the work was committed straight onto `main`
+and Greptile needs a branch delta.
+
+**Both found the same P1 independently**, which is the strongest signal either of
+them produced:
+
+> `iExtra.z` became the crowd's stipple dissolve when spawn and retire fading was
+> added, and the procedural shader discards a fragment whenever the noise
+> exceeds it. `OfficerRig` still wrote the zero that slot used to hold, so
+> **every fragment was discarded** — police officers that walk, shoot and arrest,
+> and cannot be seen at all.
+
+This only shows while the baked officer VAT is loading or if it fails to fetch,
+which is exactly why nothing caught it: a healthy browser resolves the VAT and
+never renders the fallback. `officerModel` reads `baked` in every live check.
+Officers are now written fully opaque and `tests/police.test.ts` asserts every
+drawn instance sits at or above the shader's own 0.996 threshold. The test was
+confirmed load-bearing by reverting the fix and watching it fail.
+
+Codex found two more, both real and both fixed:
+
+- **The stagger was never wired.** `PedestrianSystem.staggerAt` and the
+  `CrowdTargets` hook both existed, but `main.ts` connected only `removeAt` and
+  `alarmAt`, so a wounding round recorded damage and produced no visible
+  reaction. The combat workstream had deliberately withheld it until the crowd
+  offered a reaction that keeps the victim upright instead of flooring them;
+  the crowd workstream then built exactly that, and nobody joined the two ends.
+  A good illustration of the risk in parallel workstreams: both halves correct,
+  the seam missing.
+- **Per-frame allocation while flying.** `Flying.hintState` built a fresh object
+  every frame and `Hud.setFlightHints` mapped the unchanged hint list into new
+  strings and joined them, purely to rediscover that nothing had changed. The
+  state object is reused now and the hint list compared by identity.
+
+Codex reported the remaining `parked` control comparisons, the crowd mesh
+harvest, the footstep material-family contract and the disposal and bounded-pool
+paths as clean. Greptile's second pass returned **5/5 confidence, no review
+comments**.
+
+## TesterArmy
+
+Project *Youtube videos GTA - TOOLS* (`c152f076-e9b6-4708-a104-cdcd1c06b5cc`),
+test *GTA Vibe - airport repair pass*
+(`8a5bf3d6-0945-4a35-997d-797f1a0e48be`), run locally and headed against the
+production preview. One run, as instructed, and it is reported as it came back.
+
+**Result: `FAILED` — `5/23 steps passed, 0 failed`, zero issues raised.**
+
+Every step it reached passed:
+
+1. Boot, resume, HUD present.
+2. Daylight; "Harbourside / Harbour Walk" top left, "$25,000" top right,
+   "Music: Off".
+3. Walked onto the road; "Press E to drive the compact" appeared.
+4. Prompts confirmed for a second and third vehicle.
+5. Pressed E, entered the compact, drove into traffic.
+
+It then opened step 6 and stopped. **The run exhausted its agent budget; it did
+not find a defect.** That is an infrastructure boundary rather than a product
+failure, and the distinction matters because the run is not repeatable here —
+the instruction was one run, and this was it.
+
+The cause is a mistake in how the test was written rather than anything in the
+game: the skill asks for three to ten meaningful steps and it had twenty-three.
+A browser agent driving 600 m through traffic, walking into a terminal and
+crossing to an apron spends a very large number of tool calls inside what reads
+on paper as one step.
+
+The saved test has been rewritten to 13 steps and reordered so the checks that
+need no travel come first — the abandoned-car check now happens near the spawn
+point, ahead of the drive south, so a budget-limited run still returns signal on
+a headline repair. **It has not been re-run**, per the instruction.
+
+So of the eight behaviours this run was meant to cover, it independently
+confirmed boot, HUD and vehicle entry. The other seven rest on the deterministic
+suite and on the browser verification recorded above, which covered all of them
+except a lethal civilian takedown and grass footsteps.
