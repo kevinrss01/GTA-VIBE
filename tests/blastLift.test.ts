@@ -377,6 +377,29 @@ describe('a blast reaches the car the player is sitting in', () => {
     expect(sim.takeImpulse(car.id)?.lift).toBe(0);
   });
 
+  it('leaves nothing queued behind when the player steps out', () => {
+    /*
+     * The third Greptile finding. A blast that lands AFTER a frame's
+     * `driving.update` and before the player opens the door banks an impulse in
+     * the traffic layer that nothing would ever consume: `park` does not read
+     * the queue, and the driving layer is about to stop existing for that car.
+     *
+     * `Driving.exit` now drains it. At the simulation level the contract this
+     * rests on is the one asserted here: the queue is drainable exactly once,
+     * and a second read after it has been taken is empty rather than stale.
+     */
+    const { sim, laneId } = makeSim();
+    const car = seed(sim, laneId, 60);
+    sim.detach(car);
+    sim.applyImpact(car.id, {
+      x: car.x, y: 0.2, z: car.z, dirX: 1, dirZ: 0, impulse: 2000, lift: 5800, damage: 10,
+    });
+    expect(sim.takeImpulse(car.id)?.lift).toBe(5800);
+    // Drained, not merely read: a second consumer must not get it again, or the
+    // exit path and the next `update` would both spend the same blast.
+    expect(sim.takeImpulse(car.id)).toBeNull();
+  });
+
   it('carries the upward velocity across a handover, not just the height', () => {
     /*
      * The second Greptile finding, and it was real: publishing only the height

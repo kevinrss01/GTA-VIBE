@@ -348,6 +348,14 @@ export class Driving {
     }
     if (!placed) controller.teleport(this.x, this.z, this.yaw);
 
+    // DRAIN WHAT IS STILL QUEUED FIRST. A blast that lands after this frame's
+    // `update` and before the player steps out leaves an impulse banked in the
+    // traffic layer that nothing will ever consume: `park` does not read the
+    // queue, and the driving layer is about to stop existing for this car. This
+    // is the last moment anything can, so it folds the shove into the speed and
+    // the lift into the arc that the pose below hands over.
+    this.absorbImpulse();
+
     // HAND THE WHOLE ARC OVER, NOT JUST ITS HEIGHT. A car abandoned mid-flight
     // still has somewhere to be going: publishing the height alone would drop
     // the upward velocity, so it would stop climbing and fall from wherever it
