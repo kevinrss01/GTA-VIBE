@@ -32,8 +32,69 @@ export type VehicleKind =
   | 'patrolSedan'
   | 'patrolSuv';
 
-/** Who is driving. Ambient cars run the traffic AI; player cars do not. */
-export type VehicleControl = 'ambient' | 'player';
+/**
+ * Who is driving.
+ *
+ * `ambient` runs the traffic AI. `player` is a pose written from outside every
+ * frame - the driven car, and every police unit. `loose` is neither: the
+ * vehicle has been hit hard enough to leave its lane and is integrating as a
+ * free body until it comes to rest, at which point it rejoins traffic or is
+ * written off. See `TrafficSim.stepLoose`.
+ */
+export type VehicleControl = 'ambient' | 'player' | 'loose';
+
+/**
+ * Structural points a vehicle starts with, and the scale every system that
+ * damages one must speak.
+ *
+ * The number is the police system's original `VEHICLE_INTEGRITY` - roughly
+ * three rifle magazines - kept exactly so that a patrol car and an ordinary
+ * car are equally tough. There is one damage model in this game, not two.
+ */
+export const VEHICLE_INTEGRITY = 260;
+
+/**
+ * Structural damage from a collision impulse, in the scale above.
+ *
+ * Calibrated against one number: a 15 m/s closing hit between two 1400 kg cars
+ * transfers about 12 kN.s, and that is the crash a car does not drive away
+ * from. Everything else follows - a 3 m/s parking shunt costs a fifth of the
+ * shell, a 25 m/s head-on writes off both.
+ */
+export function impactDamage(impulse: number): number {
+  return Math.max(0, impulse) * (VEHICLE_INTEGRITY / 12000);
+}
+
+/**
+ * One collision, as the thing that detected it describes it.
+ *
+ * The direction and the contact point are what separate a shunt from a spin:
+ * `applyImpact` turns them into linear velocity, yaw and - if the hit is high
+ * and lateral enough for the track width to give up - roll.
+ */
+export interface VehicleImpact {
+  /** World contact point. */
+  readonly x: number;
+  readonly y: number;
+  readonly z: number;
+  /** Unit direction the impulse pushes the vehicle. */
+  readonly dirX: number;
+  readonly dirZ: number;
+  /** Impulse magnitude, newton-seconds. Scale from mass * closing speed. */
+  readonly impulse: number;
+  /** Structural damage, in the `VEHICLE_INTEGRITY` scale. */
+  readonly damage: number;
+}
+
+/** What an impact sounded like, for whoever is wiring audio to it. */
+export interface ImpactReport {
+  readonly x: number;
+  readonly y: number;
+  readonly z: number;
+  /** 0 for a nudge, 1 for a write-off. Drives the sample and its gain. */
+  readonly intensity: number;
+  readonly kind: 'vehicle' | 'world';
+}
 
 /**
  * A read-only snapshot of one vehicle.
@@ -81,6 +142,18 @@ export interface VehicleView {
    */
   readonly accelLong: number;
   readonly control: VehicleControl;
+  /**
+   * Structural points remaining, out of `VEHICLE_INTEGRITY`. Zero is a
+   * write-off: the shell is still there, it just cannot be driven again.
+   */
+  readonly integrity: number;
+  /** The same thing as a fraction, 0 undamaged to 1 written off. */
+  readonly damage: number;
+  /**
+   * True once the body has come to rest on its side or its roof. An overturned
+   * car never rejoins traffic and is never worth taking control of.
+   */
+  readonly overturned: boolean;
 }
 
 /**

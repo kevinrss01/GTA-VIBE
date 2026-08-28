@@ -23,12 +23,18 @@ import {
   type ListenerState,
 } from '../src/audio/AudioDirector';
 import {
+  AIRPORT_BED,
   AUDIO_ASSETS,
+  CONCRETE_STEPS,
   DISTRICT_AMBIENCE,
+  LAZY_ASSET_IDS,
   MUSIC_ASSET_ID,
+  POLICE_SOUNDS,
   PRELOAD_ASSET_IDS,
   SEA_BED,
+  STEP_MEAN_DB,
   STEP_SURFACES,
+  TERMINAL_STEPS,
   getAudioAsset,
 } from '../src/audio/manifest';
 import { getCityPlan } from '../src/world/CityPlan';
@@ -68,24 +74,66 @@ interface FakeSource {
   stop(): void;
 }
 
+/**
+ * A stand-in for `AudioParam` that refuses non-finite numbers, because the
+ * real one does.
+ *
+ * The browser throws `TypeError: Failed to set the 'value' property on
+ * 'AudioParam': The provided float value is non-finite`, and since the listener
+ * is written from inside the frame loop that exception takes rendering, input
+ * and the simulation down with it. A mock that quietly accepted NaN made the
+ * test guarding against it vacuous - it stayed green with the guard deleted.
+ * Caught by Greptile.
+ */
 class FakeParam {
-  value = 0;
+  private current = 0;
+
+  get value(): number {
+    return this.current;
+  }
+
+  set value(next: number) {
+    FakeParam.check(next);
+    this.current = next;
+  }
+
   setValueAtTime(v: number): FakeParam {
-    this.value = v;
+    FakeParam.check(v);
+    this.current = v;
     return this;
   }
   linearRampToValueAtTime(v: number): FakeParam {
-    this.value = v;
+    FakeParam.check(v);
+    this.current = v;
     return this;
   }
   cancelScheduledValues(): FakeParam {
     return this;
   }
+
+  private static check(v: number): void {
+    if (!Number.isFinite(v)) {
+      throw new TypeError(
+        "Failed to set the 'value' property on 'AudioParam': The provided float value is non-finite.",
+      );
+    }
+  }
+}
+
+interface FakeCompressor {
+  threshold: FakeParam;
+  knee: FakeParam;
+  ratio: FakeParam;
+  attack: FakeParam;
+  release: FakeParam;
+  connect(): void;
+  disconnect(): void;
 }
 
 interface Harness {
   fetched: string[];
   sources: FakeSource[];
+  compressors: FakeCompressor[];
   suspendCalls: number;
   resumeCalls: number;
   closed: boolean;
@@ -102,6 +150,7 @@ function installMocks(): void {
   h = {
     fetched: [],
     sources: [],
+    compressors: [],
     suspendCalls: 0,
     resumeCalls: 0,
     closed: false,
@@ -152,6 +201,20 @@ function installMocks(): void {
     return source;
   }
 
+  function makeCompressor(): FakeCompressor {
+    const node: FakeCompressor = {
+      threshold: new FakeParam(),
+      knee: new FakeParam(),
+      ratio: new FakeParam(),
+      attack: new FakeParam(),
+      release: new FakeParam(),
+      connect: () => undefined,
+      disconnect: () => undefined,
+    };
+    h.compressors.push(node);
+    return node;
+  }
+
   function makePanner(): unknown {
     return {
       panningModel: '',
@@ -185,6 +248,7 @@ function installMocks(): void {
     createGain = makeGain;
     createBufferSource = makeSource;
     createPanner = makePanner;
+    createDynamicsCompressor = makeCompressor;
     async decodeAudioData(bytes: ArrayBuffer): Promise<FakeBuffer> {
       const url = bufferUrls.get(bytes);
       if (!url) throw new Error('undecodable');
@@ -220,6 +284,22 @@ function installMocks(): void {
       );
     },
   };
+}
+
+/**
+ * Fires `ended` on every one-shot that has been started, the way a real context
+ * does when the buffer runs out. The mock never does it on its own, which is
+ * the right default for testing the hard voice caps and the wrong one for
+ * testing anything that happens across several steps.
+ */
+function endFinishedSources(): void {
+  for (const source of h.sources) {
+    if (source.loop || !source.started || source.stopped || !source.onended) continue;
+    const done = source.onended;
+    source.onended = null;
+    source.stopped = true;
+    done();
+  }
 }
 
 function fireVisibility(to: 'visible' | 'hidden'): void {
@@ -717,7 +797,13 @@ describe('surface coverage', () => {
   it('alternates the two variants for a surface', async () => {
     const audio = new AudioDirector();
     await audio.unlock();
-    for (let i = 0; i < 4; i += 1) audio.footstep('pavement', false);
+    // Ending each voice between steps is what a real context does: a 0.32 s
+    // asset is long finished by the next footfall at 0.518 s walking. Without
+    // it this would be testing the hard voice cap instead of the alternation.
+    for (let i = 0; i < 4; i += 1) {
+      audio.footstep('pavement', false);
+      endFinishedSources();
+    }
 
     const used = h.sources
       .filter((s) => s.buffer?.url.includes('/steps/') === true)
@@ -725,6 +811,256 @@ describe('surface coverage', () => {
     expect(used).toHaveLength(4);
     expect(used[0]).not.toBe(used[1]);
     expect(used[0]).toBe(used[2]);
+    audio.dispose();
+  });
+});
+
+describe('footstep loudness and cadence', () => {
+  /**
+   * The rebalance, asserted as arithmetic rather than as a listening opinion.
+   *
+   * The measured defect was a 15.5 dB spread in POST-TRIM MEAN level across the
+   * step set - grass-2 at -23.9 dB against grass-1 at -39.4 dB, alternating on
+   * every other step - caused by peak-normalising transients, which does not
+   * equalise loudness. `meanDb` in the manifest is the ffmpeg measurement of
+   * the shipped file, so trim + mean is exactly what a player hears.
+   */
+  const stepIds = [...new Set(Object.values(STEP_SURFACES).flat())];
+
+  it('levels every surface to within 4 dB of the others', () => {
+    const levels = stepIds.map((id) => {
+      const asset = getAudioAsset(id);
+      return { id, effective: STEP_MEAN_DB[id] + asset.trimDb };
+    });
+    const lowest = Math.min(...levels.map((l) => l.effective));
+    const highest = Math.max(...levels.map((l) => l.effective));
+    expect(highest - lowest, `spread across ${levels.length} step assets`).toBeLessThanOrEqual(4);
+  });
+
+  it('keeps the two variants of a surface within a step of each other', () => {
+    // The grass pair was 15.5 dB apart and alternated, which is heard as a
+    // limp rather than as variation. The runtime's own jitter is +/-2 dB, so
+    // anything inside 4 dB is indistinguishable from that jitter.
+    for (const [surface, variants] of Object.entries(STEP_SURFACES)) {
+      const [a, b] = variants;
+      const levelA = STEP_MEAN_DB[a] + getAudioAsset(a).trimDb;
+      const levelB = STEP_MEAN_DB[b] + getAudioAsset(b).trimDb;
+      expect(Math.abs(levelA - levelB), `${surface} variants`).toBeLessThanOrEqual(4);
+    }
+  });
+
+  it('is short enough that a running footstep cannot overlap the last one', () => {
+    // RUN_SPEED 6.0 m/s over a 1.95 m stride is a step every 0.325 s. Every
+    // asset used to be 0.680249 s, so two or three summed at a run.
+    const runningCadence = 1.95 / 6.0;
+    for (const id of stepIds) {
+      expect(getAudioAsset(id).duration, id).toBeLessThanOrEqual(runningCadence);
+    }
+  });
+
+  it('caps the player\'s own footsteps by count, not only by cadence', async () => {
+    const audio = new AudioDirector();
+    await audio.unlock();
+    // Nothing ends these sources, which is the frame-rate-collapse case: the
+    // ceiling has to hold without help from `onended`.
+    for (let i = 0; i < 40; i += 1) audio.footstep('pavement', true);
+    const live = h.sources.filter((s) => s.buffer?.url.includes('/steps/') === true && !s.stopped);
+    expect(live.length).toBeLessThanOrEqual(3);
+    audio.dispose();
+  });
+
+  it('gives the airfield its own materials rather than reusing the pavement', () => {
+    // Distinguishable is the requirement, and these are separate recordings
+    // with separate prompts rather than a remap of an existing pair.
+    const pairs = [CONCRETE_STEPS, TERMINAL_STEPS, STEP_SURFACES.pavement, STEP_SURFACES.interior];
+    const files = pairs.flat();
+    expect(new Set(files).size).toBe(files.length);
+    for (const id of [...CONCRETE_STEPS, ...TERMINAL_STEPS]) {
+      expect(() => getAudioAsset(id)).not.toThrow();
+    }
+  });
+});
+
+describe('footstep surface hysteresis', () => {
+  function stepFiles(): string[] {
+    return h.sources
+      .filter((s) => s.buffer?.url.includes('/steps/') === true)
+      .map((s) => (s.buffer?.url ?? '').replace(/.*\/steps\//, '').replace(/-\d\.mp3$/, ''));
+  }
+
+  it('does not flicker when the sampled surface alternates at a boundary', async () => {
+    const audio = new AudioDirector();
+    await audio.unlock();
+    // A player walking the edge of a path: the sampler returns a different
+    // material on every step. One of them has to win and stay won.
+    const walk: Array<'gravel' | 'grass'> = ['gravel', 'grass', 'gravel', 'grass', 'gravel'];
+    for (const surface of walk) {
+      audio.footstep(surface, false);
+      endFinishedSources();
+    }
+    expect(new Set(stepFiles()).size).toBe(1);
+    audio.dispose();
+  });
+
+  it('does commit to a surface the player has genuinely walked onto', async () => {
+    const audio = new AudioDirector();
+    await audio.unlock();
+    audio.footstep('gravel', false);
+    endFinishedSources();
+    for (let i = 0; i < 4; i += 1) {
+      audio.footstep('grass', false);
+      endFinishedSources();
+    }
+    const heard = stepFiles();
+    expect(heard[0]).toBe('gravel');
+    expect(heard[heard.length - 1]).toBe('grass');
+    audio.dispose();
+  });
+
+  it('switches immediately when the world says the foot is on a carriageway', async () => {
+    const audio = new AudioDirector();
+    await audio.unlock();
+    // `onRoad` is authoritative, so it beats both the sampled surface and the
+    // hysteresis: stepping off a kerb is heard on the step that makes it.
+    audio.footstep('pavement', false, false);
+    audio.footstep('grass', true, true);
+    const heard = stepFiles();
+    expect(heard[0]).toBe('pavement');
+    expect(heard[1]).toBe('asphalt');
+    audio.dispose();
+  });
+
+  it('ignores a sampled surface entirely while the foot is on the road', async () => {
+    const audio = new AudioDirector();
+    await audio.unlock();
+    for (const surface of ['grass', 'gravel', 'plaza'] as const) {
+      audio.footstep(surface, false, true);
+      endFinishedSources();
+    }
+    expect(new Set(stepFiles())).toEqual(new Set(['asphalt']));
+    audio.dispose();
+  });
+});
+
+describe('pausing', () => {
+  it('suspends the context and resumes it again', async () => {
+    const audio = new AudioDirector();
+    await audio.unlock();
+    const before = h.suspendCalls;
+
+    audio.setGamePaused(true);
+    expect(h.suspendCalls).toBe(before + 1);
+    expect(audio.suspended).toBe(true);
+
+    audio.setGamePaused(false);
+    expect(audio.suspended).toBe(false);
+    audio.dispose();
+  });
+
+  it('stays suspended through pause, tab away and tab back', async () => {
+    // The refcount requirement, stated as the sequence that breaks a naive
+    // implementation: a single boolean or an unbalanced counter resumes a
+    // PAUSED game the moment the tab comes back.
+    const audio = new AudioDirector();
+    await audio.unlock();
+
+    audio.setGamePaused(true);
+    fireVisibility('hidden');
+    fireVisibility('visible');
+
+    expect(audio.suspended).toBe(true);
+    audio.dispose();
+  });
+
+  it('stays suspended while hidden even after the game is unpaused', async () => {
+    const audio = new AudioDirector();
+    await audio.unlock();
+
+    audio.setGamePaused(true);
+    fireVisibility('hidden');
+    audio.setGamePaused(false);
+    expect(audio.suspended).toBe(true);
+
+    fireVisibility('visible');
+    expect(audio.suspended).toBe(false);
+    audio.dispose();
+  });
+
+  it('is idempotent, because visibilitychange fires more often than it changes', async () => {
+    const audio = new AudioDirector();
+    await audio.unlock();
+    fireVisibility('hidden');
+    fireVisibility('hidden');
+    fireVisibility('hidden');
+    fireVisibility('visible');
+    expect(audio.suspended).toBe(false);
+    audio.dispose();
+  });
+
+  it('never touches music state, so a playing track resumes rather than restarts', async () => {
+    const audio = new AudioDirector();
+    await audio.unlock();
+    await audio.setMusicEnabled(true);
+    const started = musicSources().length;
+    expect(started).toBe(1);
+
+    audio.setGamePaused(true);
+    fireVisibility('hidden');
+    fireVisibility('visible');
+    audio.setGamePaused(false);
+
+    // Same source, still running: no second buffer was started and the first
+    // was never stopped, which is what "resumes rather than restarts" means.
+    expect(audio.musicEnabled).toBe(true);
+    expect(musicSources()).toHaveLength(started);
+    expect(musicSources()[0]?.stopped).toBe(false);
+    audio.dispose();
+  });
+
+  it('leaves a stopped track stopped across a pause', async () => {
+    const audio = new AudioDirector();
+    await audio.unlock();
+    audio.setGamePaused(true);
+    audio.setGamePaused(false);
+    expect(audio.musicEnabled).toBe(false);
+    expect(musicFetches()).toHaveLength(0);
+    audio.dispose();
+  });
+
+  it('does not resume on unlock if the game was already paused', async () => {
+    const audio = new AudioDirector();
+    audio.setGamePaused(true);
+    await audio.unlock();
+    expect(audio.suspended).toBe(true);
+    audio.dispose();
+  });
+
+  it('never throws when driven while suspended', async () => {
+    const audio = new AudioDirector();
+    await audio.unlock();
+    audio.setGamePaused(true);
+    expect(() => audio.update(0.016, STATE)).not.toThrow();
+    expect(() => audio.footstep('pavement', true, false)).not.toThrow();
+    expect(() => audio.setVolume('effects', 0.4)).not.toThrow();
+    audio.dispose();
+  });
+});
+
+describe('output limiter', () => {
+  it('puts a limiter between the master gain and the output', async () => {
+    // There was no compressor or limiter anywhere in the graph, and the buses
+    // are trimmed for the average case: gunfire, a blast, five engines and a
+    // siren inside one 50 ms window are all individually correct and sum past
+    // full scale.
+    const audio = new AudioDirector();
+    await audio.unlock();
+    expect(h.compressors).toHaveLength(1);
+    const limiter = h.compressors[0];
+    expect(limiter?.ratio.value).toBeGreaterThanOrEqual(10);
+    expect(limiter?.threshold.value).toBeLessThan(0);
+    // Transparent, not a mix effect: it must do nothing until the sum is
+    // already close to clipping.
+    expect(limiter?.threshold.value).toBeGreaterThanOrEqual(-6);
     audio.dispose();
   });
 });
@@ -745,9 +1081,35 @@ describe('manifest integrity', () => {
     expect(new Set(paths).size).toBe(paths.length);
   });
 
-  it('excludes music from the preload set', () => {
+  it('preloads everything except the assets deliberately deferred', () => {
+    // This used to be `AUDIO_ASSETS.length - 1`, i.e. everything but music.
+    // The airfield moved it: eight aircraft assets and the apron bed are
+    // 1.08 MB of a manifest for one corner of the map that most sessions never
+    // visit, and every consumer of them already survives a null buffer for a
+    // frame. The assertion is now against the same declared set the runtime
+    // uses rather than a count, so deferring a ninth asset cannot silently
+    // change what is fetched without saying so in `LAZY_ASSET_IDS`.
     expect(PRELOAD_ASSET_IDS).not.toContain(MUSIC_ASSET_ID);
-    expect(PRELOAD_ASSET_IDS.length).toBe(AUDIO_ASSETS.length - 1);
+    expect(PRELOAD_ASSET_IDS.length).toBe(AUDIO_ASSETS.length - LAZY_ASSET_IDS.size);
+    for (const id of PRELOAD_ASSET_IDS) expect(LAZY_ASSET_IDS.has(id)).toBe(false);
+    for (const id of LAZY_ASSET_IDS) expect(() => getAudioAsset(id)).not.toThrow();
+  });
+
+  it('keeps the police siren eager, because a pursuit does not announce itself', () => {
+    // The one asset in this group whose lateness would be a product defect
+    // rather than a loading detail.
+    expect(PRELOAD_ASSET_IDS).toContain(POLICE_SOUNDS.siren);
+    expect(PRELOAD_ASSET_IDS).toContain(POLICE_SOUNDS.engine);
+  });
+
+  it('defers the whole airfield set and nothing else', () => {
+    const deferred = [...LAZY_ASSET_IDS].sort();
+    const expected = [
+      MUSIC_ASSET_ID,
+      AIRPORT_BED,
+      ...AUDIO_ASSETS.filter((a) => a.kind === 'aircraft').map((a) => a.id),
+    ].sort();
+    expect(deferred).toEqual(expected);
   });
 
   it('records provenance without leaking a key or a signed URL', () => {
@@ -835,5 +1197,37 @@ describe('robustness', () => {
     await audio.setMusicEnabled(true);
     expect(audio.musicEnabled).toBe(false);
     expect(musicFetches()).toHaveLength(0);
+  });
+});
+
+describe('the listener cannot take the game down with it', () => {
+  /*
+   * `AudioParam.value` throws on a non-finite number, and the listener is
+   * updated from inside the frame loop - so one NaN reaching it stops
+   * rendering, input and the simulation, not just the sound. Found by handing
+   * it a NaN position from a QA harness; the fix is that the audio layer is
+   * the wrong place to discover that something upstream produced one.
+   */
+  it('ignores a non-finite pose instead of throwing', async () => {
+    const audio = new AudioDirector();
+    await audio.unlock();
+    const good = {
+      x: 10, y: 1.7, z: 20, forwardX: 0, forwardZ: -1,
+      district: 'harbourside' as const, surface: 'pavement' as const,
+      indoors: false, speed: 0,
+    };
+    audio.update(1 / 60, good);
+    for (const bad of [
+      { ...good, x: Number.NaN },
+      { ...good, y: Number.POSITIVE_INFINITY },
+      { ...good, z: Number.NaN },
+      { ...good, forwardX: Number.NaN },
+      { ...good, forwardZ: Number.NEGATIVE_INFINITY },
+    ]) {
+      expect(() => audio.update(1 / 60, bad)).not.toThrow();
+    }
+    // And it is still working afterwards.
+    expect(() => audio.update(1 / 60, good)).not.toThrow();
+    audio.dispose();
   });
 });

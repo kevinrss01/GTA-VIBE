@@ -23,6 +23,8 @@ import type { SurfaceId } from '../world/CityGround';
 
 export type AudioAssetKind =
   | 'ambience'
+  | 'police'
+  | 'aircraft'
   | 'step'
   | 'sfx'
   | 'music'
@@ -35,6 +37,7 @@ export type AudioAssetKind =
 
 export type AmbienceBedId =
   | 'ambience/harbour'
+  | 'ambience/airport'
   | 'ambience/street'
   | 'ambience/old-quarter'
   | 'ambience/park'
@@ -54,7 +57,11 @@ export type StepAssetId =
   | 'steps/grass-1'
   | 'steps/grass-2'
   | 'steps/interior-1'
-  | 'steps/interior-2';
+  | 'steps/interior-2'
+  | 'steps/concrete-1'
+  | 'steps/concrete-2'
+  | 'steps/terminal-1'
+  | 'steps/terminal-2';
 
 /** One-shots the game triggers by name. */
 export type OneShotId = 'door-open' | 'door-close' | 'ui-tick';
@@ -84,7 +91,9 @@ export type VehicleAssetId =
   | 'veh/tyre-scrub'
   | 'veh/door-open'
   | 'veh/door-close'
-  | 'veh/impact';
+  | 'veh/impact'
+  | 'veh/impact-light'
+  | 'veh/impact-heavy';
 
 /**
  * Firing a weapon, and being on the receiving end of one.
@@ -121,6 +130,8 @@ export type WeaponAssetId =
 
 export type ImpactAssetId =
   | 'imp/concrete'
+  | 'imp/wood'
+  | 'imp/foliage'
   | 'imp/metal'
   | 'imp/flesh'
   | 'imp/glass'
@@ -145,7 +156,13 @@ export type DialogueAssetId =
   | 'dlg/teo-handover-1'
   | 'dlg/teo-handover-2'
   | 'dlg/sable-paid-1'
-  | 'dlg/sable-paid-2';
+  | 'dlg/sable-paid-2'
+  | 'dlg/sable-charter-1'
+  | 'dlg/sable-charter-2'
+  | 'dlg/sable-charter-2b'
+  | 'dlg/sable-charter-3'
+  | 'dlg/sable-handoff-1'
+  | 'dlg/sable-landed-1';
 
 /**
  * The distant traffic layer. Deliberately not an `AmbienceBedId`: like the sea,
@@ -155,8 +172,32 @@ export type DialogueAssetId =
  */
 export type StreetLayerId = 'ambience/traffic-hum';
 
+/**
+ * The pursuit, and the airfield.
+ *
+ * `police/*` is the only sound in the game that has to be recognisable through
+ * a wall and across a junction, which is why the siren is its own asset rather
+ * than a filtered horn: it is the player's warning that they are being chased.
+ * `air/*` is split by powerplant because a piston single, a turboprop, a
+ * business jet and a narrowbody airliner are four genuinely different noises
+ * and pitching one loop cannot fake the others.
+ */
+export type PoliceAssetId = 'police/siren' | 'police/engine';
+
+export type AircraftAssetId =
+  | 'air/prop-single'
+  | 'air/turboprop'
+  | 'air/turbofan'
+  | 'air/airliner'
+  | 'air/wind'
+  | 'air/runway-roll'
+  | 'air/touchdown'
+  | 'air/brake';
+
 export type AudioAssetId =
   | AmbienceBedId
+  | PoliceAssetId
+  | AircraftAssetId
   | StepAssetId
   | SfxAssetId
   | MusicAssetId
@@ -208,8 +249,17 @@ const SFX_MODEL = 'eleven_text_to_sound_v2';
 const MUSIC_MODEL = 'eleven_music_v2';
 const GENERATED_ON = '2026-08-17';
 
+const WORLD_GENERATED_ON = '2026-08-27';
+
 const LOOP_PARAMS = { duration_seconds: 15, prompt_influence: 0.4, loop: true } as const;
 const STEP_PARAMS = { duration_seconds: 0.7, prompt_influence: 0.75, loop: false } as const;
+/** The steps rendered in this session asked for a shorter, harder-adhering hit. */
+const REGENERATED_STEP_PARAMS = {
+  duration_seconds: 0.5,
+  prompt_influence: 0.85,
+  loop: false,
+  output_format: 'mp3_44100_128',
+} as const;
 
 function sfxGeneration(
   prompt: string,
@@ -321,6 +371,27 @@ const AMBIENCE: readonly AudioAsset[] = [
     ),
   },
   {
+    id: 'ambience/airport',
+    path: '/audio/ambience/airport.mp3',
+    kind: 'ambience',
+    duration: 15.0,
+    loop: true,
+    sampleRate: 44100,
+    channels: 2,
+    bytes: 241206,
+    // Mean-normalised towards -34 dBFS like the other beds, from -37.8.
+    trimDb: 3.8,
+    generation: {
+      provider: 'elevenlabs',
+      modelId: SFX_MODEL,
+      prompt:
+        'seamless looping airport ambience heard on the apron outside a terminal building, a steady low rumble of distant jet engines idling far across the field, ground power units and air conditioning plant humming nearby, a very distant aircraft taking off at the far end of the runway, faint wind over open concrete, no announcements, no speech, no music, no vehicles close by',
+      date: WORLD_GENERATED_ON,
+      credits: 50,
+      parameters: { duration_seconds: 15, prompt_influence: 0.45, loop: true, output_format: 'mp3_44100_128' },
+    },
+  },
+  {
     id: 'ambience/interior',
     path: '/audio/ambience/interior.mp3',
     kind: 'ambience',
@@ -346,8 +417,54 @@ interface StepSpec {
   readonly id: StepAssetId;
   readonly file: string;
   readonly prompt: string;
+  /** Measured mean level of the shipped 0.32 s file, in dBFS. */
+  readonly meanDb: number;
   readonly trimDb: number;
+  /** Set on the four surfaces rendered in this session rather than the first. */
+  readonly regenerated?: boolean;
+  readonly postProcess?: string;
 }
+
+/**
+ * The footstep set, levelled by LOUDNESS rather than by peak.
+ *
+ * ## What was wrong, measured
+ *
+ * The first render of this set was peak-normalised towards -6 dBFS, which does
+ * not equalise loudness for a transient: a sharp slap and a soft rustle with
+ * the same peak are nowhere near the same volume. Measured with
+ * `ffmpeg -af volumedetect`, post-trim MEAN levels spanned -23.9 to -39.4 dB, a
+ * 15.5 dB spread, and the two grass variants sat at opposite ends of it -
+ * `grass-2` was the loudest footstep in the game and `grass-1` the quietest,
+ * alternating on every other step, which the player heard as a limp.
+ *
+ * The set is now trimmed towards a mean of -22 dBFS with a -1.5 dBFS peak
+ * guard, and the measured effective spread is 3.0 dB (-25.0 to -22.0), which is
+ * inside the +/-2 dB per-step jitter the runtime already applies.
+ *
+ * ## Why every file is exactly 0.32 s
+ *
+ * Every original render was 0.680249 s, and the player controller emits a step
+ * every `strideLength / speed` seconds: 1.45 m at 2.8 m/s walking (0.518 s) and
+ * 1.95 m at 6.0 m/s running (0.325 s). At a run every footstep therefore
+ * overlapped the previous one and part of the one before it - two to three
+ * voices summing, +6 to +9.5 dB - and THAT, not the trim, was the reason
+ * footsteps were too loud. Measured per 26 ms window, every render had fallen
+ * at least 25 dB below its own peak by 0.30 s, so the overlap was buying tail
+ * and near-silence. `tools/generate-world-sfx.mjs --steps` cuts each file to
+ * 0.32 s around its own transient with a 5 ms/70 ms fade pair, which is under
+ * the running cadence: consecutive steps no longer sum at any gait.
+ *
+ * The cost is real and recorded: the hollow ring of the boardwalk and the
+ * reflection on the terminal floor are shortened. At a run that tail was never
+ * audible on its own anyway, because the next footstep landed on top of it.
+ */
+const STEP_CUT =
+  'Cut to 0.32 s around the transient with a 5 ms fade in and a 70 ms fade out, ' +
+  'so a running footstep no longer overlaps the previous one: ' +
+  'ffmpeg -ss <transient> -t 0.32 -i raw.mp3 ' +
+  '-af "afade=t=in:st=0:d=0.005,afade=t=out:st=0.25:d=0.07" ' +
+  '-c:a libmp3lame -b:a 128k -ar 44100 <file>.mp3';
 
 const STEP_SPECS: readonly StepSpec[] = [
   {
@@ -355,93 +472,163 @@ const STEP_SPECS: readonly StepSpec[] = [
     file: 'pavement-1',
     prompt:
       'one single footstep on a dry concrete paving slab, walking pace, close dry recording, no reverb, no music, no other sound',
-    trimDb: -5.7,
+    meanDb: -23.1,
+    trimDb: -0.8,
   },
   {
     id: 'steps/pavement-2',
     file: 'pavement-2',
     prompt:
       'one single footstep landing heel first on a dry concrete paving slab, walking pace, close dry recording, no reverb, no music, no other sound',
-    trimDb: -5.6,
+    meanDb: -24.3,
+    trimDb: -0.7,
   },
   {
     id: 'steps/asphalt-1',
     file: 'asphalt-1',
     prompt:
       'one single footstep on worn asphalt road surface, walking pace, close dry recording, no reverb, no music, no other sound',
-    trimDb: 2.6,
+    meanDb: -31.9,
+    trimDb: 7.3,
   },
   {
     id: 'steps/asphalt-2',
     file: 'asphalt-2',
     prompt:
       'one single scuffing footstep on worn gritty asphalt road surface, walking pace, close dry recording, no reverb, no music, no other sound',
-    trimDb: -6.0,
+    meanDb: -18.6,
+    trimDb: -3.4,
   },
   {
     id: 'steps/boardwalk-1',
     file: 'boardwalk-1',
     prompt:
       'one single footstep on hollow wooden decking boards, walking pace, close dry recording, no reverb, no music, no other sound',
-    trimDb: 4.0,
+    meanDb: -30.6,
+    trimDb: 8.6,
   },
   {
     id: 'steps/boardwalk-2',
     file: 'boardwalk-2',
     prompt:
       'one single footstep on a creaking hollow wooden boardwalk plank, walking pace, close dry recording, no reverb, no music, no other sound',
-    trimDb: -3.4,
+    meanDb: -23.6,
+    trimDb: 1.6,
   },
   {
     id: 'steps/gravel-1',
     file: 'gravel-1',
     prompt:
       'one single footstep crunching on loose gravel, walking pace, close dry recording, no reverb, no music, no other sound',
-    trimDb: -6.0,
+    meanDb: -22.5,
+    trimDb: -1.5,
   },
   {
     id: 'steps/gravel-2',
     file: 'gravel-2',
     prompt:
       'one single footstep shifting on loose gravel and small stones, walking pace, close dry recording, no reverb, no music, no other sound',
-    trimDb: 2.8,
+    meanDb: -31.2,
+    trimDb: 8.1,
   },
   {
     id: 'steps/grass-1',
     file: 'grass-1',
     prompt:
-      'one single footstep on soft grass and soil, walking pace, close dry recording, no reverb, no music, no other sound',
-    trimDb: 10.0,
+      'one single footstep pressing down into short dry grass over firm soil, a crisp rustle of grass blades with a dull earth thud underneath it, walking pace, recorded loud and close, close dry recording, no reverb, no music, no speech, no other sound',
+    meanDb: -31.4,
+    trimDb: 9.4,
+    regenerated: true,
+    postProcess:
+      STEP_CUT +
+      ' Then boosted 6 dB offline, the same remedy wpn/rifle and imp/flesh needed: ' +
+      'the render came back at -35.8 dBFS mean, which is past the +10 dB the trim ' +
+      'is allowed to apply, and leaving it there would have put the two grass ' +
+      'variants 3.9 dB apart - the exact defect being fixed: ' +
+      'ffmpeg -i cut.mp3 -af "volume=6dB" -c:a libmp3lame -b:a 128k -ar 44100 grass-1.mp3',
   },
   {
     id: 'steps/grass-2',
     file: 'grass-2',
     prompt:
-      'one single muffled footstep pressing into damp grass and soft earth, walking pace, close dry recording, no reverb, no music, no other sound',
-    trimDb: 10.0,
+      'one single footstep landing in longer damp grass and soft earth, a muffled swishing rustle with a soft low thump under it, walking pace, recorded loud and close, close dry recording, no reverb, no music, no speech, no other sound',
+    meanDb: -25.0,
+    trimDb: 3.0,
+    regenerated: true,
   },
   {
     id: 'steps/interior-1',
     file: 'interior-1',
     prompt:
       'one single footstep on a hard indoor tiled floor, walking pace, close dry recording, no reverb, no music, no other sound',
-    trimDb: 5.1,
+    meanDb: -30.4,
+    trimDb: 8.4,
   },
   {
     id: 'steps/interior-2',
     file: 'interior-2',
     prompt:
       'one single hard-soled footstep tapping on a smooth indoor ceramic tile floor, walking pace, close dry recording, no reverb, no music, no other sound',
-    trimDb: -3.2,
+    meanDb: -26.5,
+    trimDb: 1.6,
+  },
+  {
+    id: 'steps/concrete-1',
+    file: 'concrete-1',
+    prompt:
+      'one single heavy hard-soled work boot stamping down on a bare poured concrete apron, one loud flat hard slap at full volume with a little grit under the sole, recorded very close with the microphone at the shoe, close dry recording, no reverb, no music, no speech, no other sound',
+    meanDb: -22.5,
+    trimDb: -0.7,
+    regenerated: true,
+  },
+  {
+    id: 'steps/concrete-2',
+    file: 'concrete-2',
+    prompt:
+      'one single boot step scuffing on a bare dusty concrete apron outdoors, a hard flat contact ending in a short gritty scrape, walking pace, recorded loud and close, close dry recording, no reverb, no music, no speech, no other sound',
+    meanDb: -29.0,
+    trimDb: 6.4,
+    regenerated: true,
+  },
+  {
+    id: 'steps/terminal-1',
+    file: 'terminal-1',
+    prompt:
+      'one single loud sharp footstep on a hard polished tiled floor, a bright flat slap of a leather sole at full volume with a very short tail, recorded extremely close, no music, no speech, no other sound',
+    meanDb: -17.8,
+    trimDb: -4.2,
+    regenerated: true,
+  },
+  {
+    id: 'steps/terminal-2',
+    file: 'terminal-2',
+    prompt:
+      'one single hard leather heel striking a polished marble floor, one loud crisp high click at full volume with a very short tail, recorded extremely close with the microphone right at the shoe, no music, no speech, no other sound',
+    meanDb: -22.1,
+    trimDb: -0.5,
+    regenerated: true,
   },
 ];
 
 /**
- * Every footstep came back at 0.680249 s: the model rounds a 0.7 s request down
- * to a whole number of frames, so the value is recorded as measured, not as
- * requested.
+ * Every step is cut to the same window, so the duration is a constant rather
+ * than a per-clip measurement. See the note above STEP_SPECS for why 0.32 s.
  */
-const STEP_DURATION = 0.680249;
+const STEP_DURATION = 0.32;
+const STEP_BYTES = 6313;
+
+/**
+ * Measured mean level of each shipped step file, in dBFS.
+ *
+ * Kept as data rather than only in a comment because it is half of the
+ * invariant this set exists to hold: `STEP_MEAN_DB[id] + trimDb` is the level
+ * the player actually hears, and a test asserts the spread across the whole
+ * set from it. Re-measure with `tools/generate-world-sfx.mjs --steps` if a step
+ * is ever re-rendered.
+ */
+export const STEP_MEAN_DB: Readonly<Record<StepAssetId, number>> = Object.fromEntries(
+  STEP_SPECS.map((spec) => [spec.id, spec.meanDb]),
+) as Readonly<Record<StepAssetId, number>>;
 
 const STEPS: readonly AudioAsset[] = STEP_SPECS.map((spec) => ({
   id: spec.id,
@@ -451,9 +638,17 @@ const STEPS: readonly AudioAsset[] = STEP_SPECS.map((spec) => ({
   loop: false,
   sampleRate: 44100,
   channels: 2,
-  bytes: 29000,
+  bytes: STEP_BYTES,
   trimDb: spec.trimDb,
-  generation: sfxGeneration(spec.prompt, 2.3333, STEP_PARAMS),
+  generation: {
+    provider: 'elevenlabs' as const,
+    modelId: SFX_MODEL,
+    prompt: spec.prompt,
+    date: spec.regenerated === true ? WORLD_GENERATED_ON : GENERATED_ON,
+    credits: spec.regenerated === true ? 1.6667 : 2.3333,
+    parameters: spec.regenerated === true ? REGENERATED_STEP_PARAMS : STEP_PARAMS,
+  },
+  postProcess: spec.postProcess ?? STEP_CUT,
 }));
 
 // ---------------------------------------------------------------------------
@@ -670,6 +865,261 @@ const VEHICLE: readonly AudioAsset[] = [
   },
 ];
 
+/**
+ * The two collision variants either side of the shipped `veh/impact`.
+ *
+ * One asset scaled 0.5 to 1.0 by severity was not intensity variation: a graze
+ * and a head-on were the same recording at two volumes, which reads as one
+ * event heard from two distances rather than as two different events. A kerb
+ * nudge is a plastic knock with no metal in it and a high-speed hit is
+ * structural, and no gain curve turns one into the other.
+ */
+const VEHICLE_IMPACTS: readonly AudioAsset[] = [
+  {
+    id: 'veh/impact-light',
+    path: '/audio/veh/impact-light.mp3',
+    kind: 'vehicle',
+    duration: 1.0,
+    loop: false,
+    sampleRate: 44100,
+    channels: 2,
+    bytes: 17180,
+    trimDb: -2.9,
+    generation: vehicleGeneration(
+      'a car nudging something at walking pace, one dull soft plastic bumper knock with a faint creak of trim afterwards, quiet and unimpressive, no glass, no alarm, close dry recording, no reverb, no music, no speech, no other sound',
+      1.0,
+      0.8,
+      false,
+    ),
+  },
+  {
+    id: 'veh/impact-heavy',
+    path: '/audio/veh/impact-heavy.mp3',
+    kind: 'vehicle',
+    duration: 2.0,
+    loop: false,
+    sampleRate: 44100,
+    channels: 2,
+    bytes: 33062,
+    trimDb: -6.0,
+    generation: vehicleGeneration(
+      'a violent high speed car crash, an enormous crunch of sheet metal folding and tearing with a deep structural boom through it, debris and trim clattering onto the road afterwards, no alarm, close dry recording, no reverb, no music, no speech, no other sound',
+      2.0,
+      0.8,
+      false,
+    ),
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Police and aircraft
+// ---------------------------------------------------------------------------
+
+function worldGeneration(
+  prompt: string,
+  seconds: number,
+  promptInfluence: number,
+  loop: boolean,
+): AudioGeneration {
+  return {
+    provider: 'elevenlabs',
+    modelId: SFX_MODEL,
+    prompt,
+    date: WORLD_GENERATED_ON,
+    credits: Number((seconds * CREDITS_PER_SECOND).toFixed(4)),
+    parameters: {
+      duration_seconds: seconds,
+      prompt_influence: promptInfluence,
+      loop,
+      output_format: 'mp3_44100_128',
+    },
+  };
+}
+
+const POLICE: readonly AudioAsset[] = [
+  {
+    id: 'police/siren',
+    path: '/audio/police/siren.mp3',
+    kind: 'police',
+    duration: 8.0,
+    loop: true,
+    sampleRate: 44100,
+    channels: 2,
+    bytes: 129193,
+    trimDb: -20.4,
+    generation: worldGeneration(
+      'seamless looping police car siren, a single electronic siren speaker sweeping up and down in a steady continuous wail cycle at a constant close distance, no engine, no tyres, no traffic, no doppler, no approach and no departure, absolutely even and continuous, no music, no speech, no other sound',
+      8,
+      0.65,
+      true,
+    ),
+  },
+  {
+    id: 'police/engine',
+    path: '/audio/police/engine.mp3',
+    kind: 'police',
+    duration: 8.0,
+    loop: true,
+    sampleRate: 44100,
+    channels: 2,
+    bytes: 129193,
+    trimDb: -25.3,
+    generation: worldGeneration(
+      'seamless looping large V8 police interceptor engine held at high revs under hard acceleration, a hard aggressive exhaust drone with an urgent edge to it, steady pitch with no gear change and no rise or fall, no siren, no tyres, absolutely even and continuous, no music, no speech, no other sound',
+      8,
+      0.6,
+      true,
+    ),
+  },
+];
+
+const AIRCRAFT: readonly AudioAsset[] = [
+  {
+    id: 'air/prop-single',
+    path: '/audio/air/prop-single.mp3',
+    kind: 'aircraft',
+    duration: 8.0,
+    loop: true,
+    sampleRate: 44100,
+    channels: 2,
+    bytes: 129193,
+    trimDb: -24.1,
+    generation: worldGeneration(
+      'seamless looping single-engine light aircraft propeller, a small four-cylinder piston aero engine turning a two-blade propeller at steady cruise power, a hard regular blade chop over a rough mechanical engine beat, constant speed with no rise or fall, no wind, no radio, absolutely even and continuous, no music, no speech, no other sound',
+      8,
+      0.65,
+      true,
+    ),
+  },
+  {
+    id: 'air/turboprop',
+    path: '/audio/air/turboprop.mp3',
+    kind: 'aircraft',
+    duration: 8.0,
+    loop: true,
+    sampleRate: 44100,
+    channels: 2,
+    bytes: 129193,
+    trimDb: -22.5,
+    generation: worldGeneration(
+      'seamless looping twin turboprop commuter aircraft engines at steady cruise power, two large multi-blade propellers beating slightly out of phase with a smooth turbine whine behind them, constant speed with no rise or fall, no wind, no radio, absolutely even and continuous, no music, no speech, no other sound',
+      8,
+      0.65,
+      true,
+    ),
+  },
+  {
+    id: 'air/turbofan',
+    path: '/audio/air/turbofan.mp3',
+    kind: 'aircraft',
+    duration: 8.0,
+    loop: true,
+    sampleRate: 44100,
+    channels: 2,
+    bytes: 129193,
+    trimDb: -22.1,
+    generation: worldGeneration(
+      'seamless looping small business jet turbofan engines at steady cruise thrust, a smooth high tonal fan whine over a broad jet efflux roar, no propeller and no blade beat, constant thrust with no spool up or down, no wind, no radio, absolutely even and continuous, no music, no speech, no other sound',
+      8,
+      0.65,
+      true,
+    ),
+  },
+  {
+    id: 'air/airliner',
+    path: '/audio/air/airliner.mp3',
+    kind: 'aircraft',
+    duration: 8.0,
+    loop: true,
+    sampleRate: 44100,
+    channels: 2,
+    bytes: 129193,
+    trimDb: -21.3,
+    generation: worldGeneration(
+      'seamless looping large narrowbody airliner turbofan engines at steady high thrust heard from outside the aircraft, an enormous deep jet roar with a heavy low rumble and a distant fan tone in it, constant thrust with no spool up or down, no wind, no radio, absolutely even and continuous, no music, no speech, no other sound',
+      8,
+      0.65,
+      true,
+    ),
+  },
+  {
+    id: 'air/wind',
+    path: '/audio/air/wind.mp3',
+    kind: 'aircraft',
+    duration: 10.0,
+    loop: true,
+    sampleRate: 44100,
+    channels: 2,
+    bytes: 160958,
+    trimDb: -21.5,
+    generation: worldGeneration(
+      'seamless looping smooth rushing airflow over an aircraft airframe in flight, a broad even wind roar with no gusting and no whistling, no engine, no propeller, no turbine, absolutely even and continuous, no music, no speech, no other sound',
+      10,
+      0.55,
+      true,
+    ),
+  },
+  {
+    id: 'air/runway-roll',
+    path: '/audio/air/runway-roll.mp3',
+    kind: 'aircraft',
+    // 7 s, not the 8 s generated: see postProcess.
+    duration: 7.0,
+    loop: true,
+    sampleRate: 44100,
+    channels: 2,
+    bytes: 112893,
+    trimDb: -19.2,
+    generation: worldGeneration(
+      'seamless looping aircraft main landing gear tyres rolling fast along a concrete runway, a heavy continuous rumble with regular thumps as the wheels cross the expansion joints, no engine, no wind, no brakes, absolutely even and continuous, no music, no speech, no other sound',
+      8,
+      0.6,
+      true,
+    ),
+    postProcess:
+      'The 8 s render measured 5.7 dB of level difference between its first and ' +
+      'last 150 ms, which wraps as an audible bump under a sustained landing ' +
+      'roll. Rebuilt as a 7 s crossfade loop, the same treatment the music track ' +
+      'needed: ffmpeg -ss 7 -t 1 -i raw.mp3 -ss 0 -t 1 -i raw.mp3 -ss 1 -t 6 -i raw.mp3 ' +
+      '-filter_complex "[0:a][1:a]acrossfade=d=1:c1=tri:c2=tri[x];[x][2:a]concat=n=2:v=0:a=1[out]" ' +
+      '-map "[out]" -c:a libmp3lame -b:a 128k -ar 44100 runway-roll.mp3. Measured 2.7 dB after.',
+  },
+  {
+    id: 'air/touchdown',
+    path: '/audio/air/touchdown.mp3',
+    kind: 'aircraft',
+    duration: 1.2,
+    loop: false,
+    sampleRate: 44100,
+    channels: 2,
+    bytes: 20106,
+    trimDb: -3.2,
+    generation: worldGeneration(
+      'an aircraft main landing gear touching down on a runway, a sharp rubber chirp as the tyres spin up with a puff of smoke and a heavy suspension thump straight after it, one touchdown only, close dry recording, no reverb, no music, no speech, no other sound',
+      1.2,
+      0.8,
+      false,
+    ),
+  },
+  {
+    id: 'air/brake',
+    path: '/audio/air/brake.mp3',
+    kind: 'aircraft',
+    duration: 1.76,
+    loop: false,
+    sampleRate: 44100,
+    channels: 2,
+    bytes: 29301,
+    trimDb: -5.7,
+    generation: worldGeneration(
+      'an airliner slowing hard on the runway after landing, heavy wheel brakes grinding and rumbling with a rising roar of reverse thrust over them, decaying away as the aircraft slows, no engine idle, close dry recording, no reverb, no music, no speech, no other sound',
+      1.8,
+      0.7,
+      false,
+    ),
+  },
+];
+
 export const TRAFFIC_HUM: StreetLayerId = 'ambience/traffic-hum';
 
 const STREET_LAYER: AudioAsset = {
@@ -834,6 +1284,18 @@ const COMBAT_SPECS: readonly CombatSpec[] = [
       'a bullet ricocheting off stone and whining away into the distance, a short hard tick followed by a descending metallic whistling zing, close dry recording, no reverb, no music, no speech, no other sound',
   },
   {
+    id: 'imp/wood', file: 'imp/wood.mp3', kind: 'impact',
+    duration: 0.680249, bytes: 12164, trimDb: -6.0, seconds: 0.7, influence: 0.8,
+    prompt:
+      'a rifle bullet slamming into a thick timber plank at full volume, one loud hard dry woody crack with splinters tearing off and a short hollow ring afterwards, recorded very close, close dry recording, no reverb, no music, no speech, no other sound',
+  },
+  {
+    id: 'imp/foliage', file: 'imp/foliage.mp3', kind: 'impact',
+    duration: 0.680249, bytes: 12164, trimDb: 1.5, seconds: 0.7, influence: 0.8,
+    prompt:
+      'a bullet tearing through dense leafy foliage, a sharp burst of leaves and thin twigs snapping and shaking, soft and papery with no hard surface hit, close dry recording, no reverb, no music, no speech, no other sound',
+  },
+  {
     id: 'imp/debris', file: 'imp/debris.mp3', kind: 'impact',
     duration: 2.2, bytes: 36406, trimDb: -0.1, seconds: 2.2, influence: 0.7,
     prompt:
@@ -865,6 +1327,9 @@ const COMBAT_SPECS: readonly CombatSpec[] = [
   },
 ];
 
+/** Rendered in the later world batch rather than with the combat set. */
+const WORLD_BATCH_COMBAT: ReadonlySet<string> = new Set(['imp/wood', 'imp/foliage']);
+
 const COMBAT: readonly AudioAsset[] = COMBAT_SPECS.map((spec) => ({
   id: spec.id,
   path: `/audio/${spec.file}`,
@@ -879,7 +1344,7 @@ const COMBAT: readonly AudioAsset[] = COMBAT_SPECS.map((spec) => ({
     provider: 'elevenlabs' as const,
     modelId: SFX_MODEL,
     prompt: spec.prompt,
-    date: COMBAT_GENERATED_ON,
+    date: WORLD_BATCH_COMBAT.has(spec.id) ? WORLD_GENERATED_ON : COMBAT_GENERATED_ON,
     credits: Number((spec.seconds * CREDITS_PER_SECOND).toFixed(4)),
     parameters: {
       duration_seconds: spec.seconds,
@@ -909,16 +1374,41 @@ export const HANDLING_SOUNDS = {
   shell: 'wpn/shell',
 } as const satisfies Readonly<Record<string, WeaponAssetId>>;
 
-/** What the round arrives at. Keyed by `CombatFx`'s own impact kinds. */
+/**
+ * What the round arrives at.
+ *
+ * Keyed by the combat layer's own impact kinds, and deliberately wider than
+ * that layer currently emits: `stone`, `concrete`, `timber`, `wood` and
+ * `foliage` are here so the kinds being added there land on a real material
+ * instead of falling back. `impactSoundFor` is the lookup to use, because it
+ * degrades to concrete rather than throwing on a kind nobody has recorded yet.
+ */
 export const IMPACT_SOUNDS = {
   world: 'imp/concrete',
   ground: 'imp/concrete',
+  concrete: 'imp/concrete',
+  stone: 'imp/concrete',
   metal: 'imp/metal',
   glass: 'imp/glass',
   body: 'imp/flesh',
   ricochet: 'imp/ricochet',
   debris: 'imp/debris',
+  timber: 'imp/wood',
+  wood: 'imp/wood',
+  foliage: 'imp/foliage',
 } as const satisfies Readonly<Record<string, ImpactAssetId>>;
+
+/**
+ * The impact asset for a kind, falling back rather than failing.
+ *
+ * A round has to make a noise. When another layer grows a material this one has
+ * never heard of, concrete is the least wrong answer - it is the generic hard
+ * surface, and it is what `world` already resolves to - and a silent impact
+ * would read as a bug in the ballistics rather than as a missing asset.
+ */
+export function impactSoundFor(kind: string): ImpactAssetId {
+  return (IMPACT_SOUNDS as Readonly<Record<string, ImpactAssetId>>)[kind] ?? 'imp/concrete';
+}
 
 /** The player's own body. Never panned: it is not out there, it is you. */
 export const BODY_SOUNDS = {
@@ -968,6 +1458,18 @@ const DIALOGUE_SPECS: readonly DialogueSpec[] = [
   { id: 'dlg/teo-handover-2', file: 'teo-handover-2.mp3', speaker: 'teo', duration: 5.341, bytes: 86561, trimDb: -4.2, text: "Listen. I might have mentioned it to a man in a bar. I'm sorry. Drive fast." },
   { id: 'dlg/sable-paid-1', file: 'sable-paid-1.mp3', speaker: 'sable', duration: 3.901, bytes: 63573, trimDb: 1.6, text: "You made it. And it's still heavy. That's the part most people get wrong." },
   { id: 'dlg/sable-paid-2', file: 'sable-paid-2.mp3', speaker: 'sable', duration: 3.065, bytes: 50199, trimDb: -3.1, text: 'Seven and a half. Come back when you want the next one.' },
+  // The airport half of Last Call. Rendered by tools/generate-airport-voices.mjs
+  // with the same Sable voice and model as the lines above, and levelled the
+  // same way: dialogue stays peak-normalised because a spoken line already has
+  // a controlled crest factor, and these six measured -22.3 to -24.2 dB mean
+  // against the existing seven at -22.5 to -25.0, which is already inside the
+  // 3 dB the footstep rebalance was aiming for.
+  { id: 'dlg/sable-charter-1', file: 'sable-charter-1.mp3', speaker: 'sable', duration: 7.523265, bytes: 121252, trimDb: -0.2, text: "Don't put that in your pocket yet. Teo made his call, and whoever he called owns half the men who would come looking for this box tonight." },
+  { id: 'dlg/sable-charter-2', file: 'sable-charter-2.mp3', speaker: 'sable', duration: 8.405624, bytes: 135462, trimDb: -1.7, text: 'So it does not stay in Meridian Bay. There is an aircraft on stand four out at the regional field, fuelled, and in my name.' },
+  { id: 'dlg/sable-charter-2b', file: 'sable-charter-2b.mp3', speaker: 'sable', duration: 5.433469, bytes: 87815, trimDb: 0.6, text: 'Walk in through the terminal like a passenger, take her up, and carry that box out over the bay.' },
+  { id: 'dlg/sable-charter-3', file: 'sable-charter-3.mp3', speaker: 'sable', duration: 7.337506, bytes: 118326, trimDb: -0.6, text: 'Then bring my aircraft home and put it back on the runway. I am insured for the money. I am not insured for the plane.' },
+  { id: 'dlg/sable-handoff-1', file: 'sable-handoff-1.mp3', speaker: 'sable', duration: 9.520181, bytes: 153435, trimDb: 0.1, text: 'That is the hand-off. It is out of your hands and out of this city. Now turn her round, line up on the field, and land it like you want to walk away.' },
+  { id: 'dlg/sable-landed-1', file: 'sable-landed-1.mp3', speaker: 'sable', duration: 5.108390, bytes: 82799, trimDb: -0.1, text: 'Wheels down, and still in one piece. You will do, Marlo. Come back when you want the next one.' },
 ];
 
 const DIALOGUE: readonly AudioAsset[] = DIALOGUE_SPECS.map((spec) => ({
@@ -1064,6 +1566,9 @@ export const AUDIO_ASSETS: readonly AudioAsset[] = [
   ...STEPS,
   ...SFX,
   ...VEHICLE,
+  ...VEHICLE_IMPACTS,
+  ...POLICE,
+  ...AIRCRAFT,
   ...COMBAT,
   ...DIALOGUE,
   STREET_LAYER,
@@ -1081,12 +1586,36 @@ export function getAudioAsset(id: AudioAssetId): AudioAsset {
   return asset;
 }
 
+/** The apron bed. Lazily loaded; see LAZY_ASSET_IDS immediately below. */
+export const AIRPORT_BED: AmbienceBedId = 'ambience/airport';
+
 /**
- * Assets fetched eagerly once the context is unlocked. Music is deliberately
- * absent: it must not be fetched or decoded until the player enables it.
+ * Assets deliberately kept OUT of the eager preload.
+ *
+ * Music is a product decision: it must not be fetched or decoded until the
+ * player enables it.
+ *
+ * The aircraft set and the airport bed are a measured one: eight aircraft
+ * assets and the apron bed are 1.08 MB of the manifest, and the airfield is one
+ * corner of the map that most sessions never visit. Every consumer of them
+ * already tolerates a null buffer for a frame - `AircraftAudio` calls
+ * `requestAsset` and stays silent exactly as the sea bed does - so the cost of
+ * deferring is one quiet frame on first approach rather than a slower unlock
+ * for every player.
+ *
+ * The police siren is NOT deferred, and that is the whole reason this is a set
+ * rather than a rule about `kind`: a pursuit starts without warning, and a
+ * siren that arrives a second late has stopped being a warning.
  */
+export const LAZY_ASSET_IDS: ReadonlySet<AudioAssetId> = new Set<AudioAssetId>([
+  MUSIC_ASSET_ID,
+  ...AUDIO_ASSETS.filter((asset) => asset.kind === 'aircraft').map((asset) => asset.id),
+  AIRPORT_BED,
+]);
+
+/** Assets fetched eagerly once the context is unlocked. */
 export const PRELOAD_ASSET_IDS: readonly AudioAssetId[] = AUDIO_ASSETS.filter(
-  (asset) => asset.kind !== 'music',
+  (asset) => !LAZY_ASSET_IDS.has(asset.id),
 ).map((asset) => asset.id);
 
 // ---------------------------------------------------------------------------
@@ -1112,7 +1641,37 @@ export const STEP_SURFACES: Readonly<Record<SurfaceId, readonly [StepAssetId, St
   gravel: ['steps/gravel-1', 'steps/gravel-2'],
   water: ['steps/gravel-1', 'steps/gravel-2'],
   interior: ['steps/interior-1', 'steps/interior-2'],
+  // Airfield concrete. It takes the paving-slab pair rather than the asphalt
+  // one: a boot on a concrete apron is a hard flat slap, and asphalt is the
+  // grittier of the two recordings.
+  concrete: ['steps/pavement-1', 'steps/pavement-2'],
 };
+
+/**
+ * The surface a carriageway is. `GroundSample.onRoad` is the world's
+ * authoritative answer to "am I standing on a road", and the footstep mixer
+ * uses it to override a sampled surface that disagrees.
+ */
+export const ROAD_SURFACE: SurfaceId = 'asphalt';
+
+/**
+ * The two airfield pairs, exported for whoever adds the surfaces that use them.
+ *
+ * `STEP_SURFACES` is exhaustive over `SurfaceId`, so a new surface has to
+ * appear there or the file stops compiling. These are the pairs to map it to:
+ * `CONCRETE_STEPS` is a bare poured apron or taxiway, hard and flat with grit
+ * under the sole, and audibly not the same as the `pavement` slab; `TERMINAL_STEPS`
+ * is a polished hard floor with a bright leather click, and is not the same as
+ * the domestic `interior` tile.
+ */
+export const CONCRETE_STEPS: readonly [StepAssetId, StepAssetId] = [
+  'steps/concrete-1',
+  'steps/concrete-2',
+];
+export const TERMINAL_STEPS: readonly [StepAssetId, StepAssetId] = [
+  'steps/terminal-1',
+  'steps/terminal-2',
+];
 
 /**
  * The sea layer.
@@ -1143,6 +1702,7 @@ export const DISTRICT_AMBIENCE: Readonly<Record<DistrictId, AmbienceBedId>> = {
   core: 'ambience/street',
   civic: 'ambience/street',
   ridge: 'ambience/ridge',
+  airport: 'ambience/airport',
 };
 
 /**
@@ -1186,4 +1746,42 @@ export const VEHICLE_SOUNDS = {
   doorOpen: 'veh/door-open',
   doorClose: 'veh/door-close',
   impact: 'veh/impact',
+  impactLight: 'veh/impact-light',
+  impactHeavy: 'veh/impact-heavy',
 } as const satisfies Readonly<Record<string, VehicleAssetId>>;
+
+/**
+ * The pursuit pair. Both loops, both driven per unit by `PoliceAudio`.
+ *
+ * The siren is the identity and the engine is the weight behind it; they are
+ * separate assets because a parked patrol car is an engine with no siren, and a
+ * unit that has just lost the player is a siren fading with no engine near
+ * enough to hear.
+ */
+export const POLICE_SOUNDS = {
+  siren: 'police/siren',
+  engine: 'police/engine',
+} as const satisfies Readonly<Record<string, PoliceAssetId>>;
+
+/**
+ * The airfield.
+ *
+ * The four powerplant loops are keyed by the aircraft types the air layer
+ * publishes, so adding a type is a mapping change here rather than a branch in
+ * the mixer. `wind`, `runwayRoll`, `touchdown` and `brake` are shared by every
+ * type: airflow over an airframe and rubber on concrete do not care what is
+ * pulling the aeroplane along.
+ */
+export const AIRCRAFT_ENGINES = {
+  cessna: 'air/prop-single',
+  twin: 'air/turboprop',
+  jet: 'air/turbofan',
+  liner: 'air/airliner',
+} as const satisfies Readonly<Record<string, AircraftAssetId>>;
+
+export const AIRCRAFT_SOUNDS = {
+  wind: 'air/wind',
+  runwayRoll: 'air/runway-roll',
+  touchdown: 'air/touchdown',
+  brake: 'air/brake',
+} as const satisfies Readonly<Record<string, AircraftAssetId>>;

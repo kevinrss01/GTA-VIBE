@@ -107,3 +107,54 @@ QA agent are wrong here in ways that produce false failures:
   93–98 vehicles. The baseline now tells the agent to walk out to a road and
   look along it *before* judging, which is the action the assertion always
   needed rather than a weaker assertion.
+
+
+## The airport upgrade journey
+
+A second project holds the coverage for the airport, aircraft, pause, audio and
+combat work, because that is the project `AGENTS.md` was pointed at for it:
+
+| What | Id |
+| --- | --- |
+| Project — *Youtube videos GTA - TOOLS* | `c152f076-e9b6-4708-a104-cdcd1c06b5cc` |
+| *GTA Vibe - airport upgrade journey* | `73153284-b197-425e-9dc9-2a668e226044` |
+
+**A test may hold at most 30 steps.** The dashboard rejects 31 with
+`ValidationError: A test cannot have more than 30 steps`, which is a tighter
+limit than the CLI skill's own "maximum 50". The journey is ordered so that
+everything which needs no travel comes first — the pause menu, the map, the
+controls, resuming, the car collision, the police reaction, aiming, the rocket
+— and the long drive south to the airport is last. That ordering is deliberate:
+this runner has twice exhausted its per-step tool-call budget on traversal, so
+anything behind a drive is the first thing to be lost.
+
+Five project memories were added first, for the same reason the other project
+has four: the defaults of a web QA agent are wrong for a game in a canvas, and
+without them the run produces false negatives rather than findings.
+
+### What the run found
+
+Run once, headed, against a production preview on `http://localhost:4183`.
+Nine steps completed; eight passed.
+
+It confirmed the game boots into daylight with the HUD and `Music: Off`, that
+Escape opens a pause menu with all eight tabs and no clipping, that the Map tab
+draws Meridian Bay with **Meridian Bay Regional to the south of the city**, and
+that the Controls tab is selectable.
+
+Then it failed step 8, and it was right to:
+
+> *"Although the Controls tab is selected, the Map panel remains visible in the
+> foreground, obscuring the controls text."*
+
+**A real defect, and a new one.** Tab panels are hidden with the `hidden`
+attribute, which the user-agent stylesheet turns into `display: none` at the
+lowest specificity there is. The rule added to give the Map tab its full height
+set `display: flex` on it **by class** — which beats the UA sheet — so the map
+was drawn on top of whichever tab the player had actually chosen. It is fixed
+by scoping both rules with `:not([hidden])`, verified in the browser, and
+pinned by a jsdom test that asserts exactly one panel is ever showing and that
+it is the selected one.
+
+The run was not repeated. That is the instruction, and the finding did not need
+a second run to act on.

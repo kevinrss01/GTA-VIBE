@@ -35,7 +35,16 @@
  * detonates, and still leaves its trail.
  */
 
-import { Group, Quaternion, Vector3, type Object3D } from 'three';
+import {
+  Group,
+  Mesh,
+  Quaternion,
+  Vector3,
+  type BufferGeometry,
+  type Material,
+  type Object3D,
+  type Texture,
+} from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 
 /**
@@ -134,6 +143,8 @@ export class Projectiles {
   private readonly options: ProjectileOptions;
   private readonly rockets: Rocket[] = [];
   private template: Object3D | null = null;
+  /** Clones a rocket can borrow. See `attachView`. */
+  private readonly views: Object3D[] = [];
   private loading = false;
   private failed = false;
   private disposed = false;
@@ -300,7 +311,12 @@ export class Projectiles {
     this.disposed = true;
     this.clear();
     this.rockets.length = 0;
+    this.views.length = 0;
     this.group.clear();
+    // The downloaded model is GPU memory: buffers, programs and textures that
+    // no amount of dropping the JavaScript reference frees. Clones share all of
+    // it with the template, so walking the template once is the whole job.
+    if (this.template) releaseTree(this.template);
     this.template = null;
   }
 
@@ -326,9 +342,20 @@ export class Projectiles {
     this.options.onDetonate(x, y, z);
   }
 
+  /**
+   * Gives a rocket its model.
+   *
+   * POOLED. Every launch used to `clone(true)` the whole loaded scene and then
+   * drop the clone on arrival, so the launcher allocated a fresh object graph
+   * per shot and left it for the collector - and `MAX_LIVE` is 4, so the pool
+   * this replaces it with is at most four clones for the life of the session.
+   * The clone shares its geometry and materials with the template, which is
+   * why disposal only has to walk the template once.
+   */
   private attachView(rocket: Rocket): void {
     if (rocket.view || !this.template) return;
-    const view = this.template.clone(true);
+    const view = this.views.pop() ?? this.template.clone(true);
+    view.visible = true;
     rocket.view = view;
     this.group.add(view);
     this.poseView(rocket);
@@ -336,7 +363,10 @@ export class Projectiles {
 
   private detachView(rocket: Rocket): void {
     if (!rocket.view) return;
-    this.group.remove(rocket.view);
+    const view = rocket.view;
+    view.visible = false;
+    this.group.remove(view);
+    if (this.views.length < MAX_LIVE) this.views.push(view);
     rocket.view = null;
   }
 
@@ -355,6 +385,44 @@ export class Projectiles {
       rocket.view.quaternion.copy(this.turn);
     }
   }
+}
+
+/**
+ * Frees the GPU resources under a loaded model.
+ *
+ * Three.js disposes nothing on its own: dropping the scene graph leaves the
+ * vertex buffers, the compiled material and every texture it references
+ * resident until the context is lost. Materials and textures are shared freely
+ * inside a GLTF, so both are tracked and each is disposed exactly once.
+ */
+function releaseTree(root: Object3D): void {
+  const seenMaterials = new Set<Material>();
+  const seenTextures = new Set<Texture>();
+  const releaseMaterial = (material: Material): void => {
+    if (seenMaterials.has(material)) return;
+    seenMaterials.add(material);
+    // Every texture-valued slot, whatever the material type calls it. Reading
+    // the record rather than a fixed list of names is what makes this survive
+    // a model that arrives with, say, a clearcoat map nobody expected.
+    for (const value of Object.values(material as unknown as Record<string, unknown>)) {
+      const texture = value as Texture | null;
+      if (!texture || typeof texture !== 'object') continue;
+      if (!(texture as { isTexture?: boolean }).isTexture) continue;
+      if (seenTextures.has(texture)) continue;
+      seenTextures.add(texture);
+      texture.dispose();
+    }
+    material.dispose();
+  };
+
+  root.traverse((child: Object3D) => {
+    if (!(child instanceof Mesh)) return;
+    const geometry = child.geometry as BufferGeometry | undefined;
+    geometry?.dispose();
+    const material = child.material as Material | Material[] | undefined;
+    if (Array.isArray(material)) for (const one of material) releaseMaterial(one);
+    else if (material) releaseMaterial(material);
+  });
 }
 
 function snapshot(rocket: Rocket): RocketHandle {

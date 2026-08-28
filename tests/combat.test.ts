@@ -22,7 +22,11 @@ import {
   zoneMultiplier,
   shotInterval,
 } from '../src/combat/ballistics';
-import { CombatSystem, type CombatVehicleView } from '../src/combat/CombatSystem';
+import {
+  CombatSystem,
+  type CombatVehicleView,
+  type VehicleImpact,
+} from '../src/combat/CombatSystem';
 import { RespawnDirector } from '../src/combat/Respawn';
 import {
   hasLineOfSight,
@@ -113,15 +117,33 @@ class StubCrowd implements ActorSource {
 
 class StubFleet {
   readonly views: CombatVehicleView[] = [];
+  readonly impacts: { id: number; hit: VehicleImpact }[] = [];
+  readonly damaged: { id: number; amount: number }[] = [];
 
   add(view: CombatVehicleView): void {
     this.views.push(view);
   }
 
+  /** Matches CENTRES, exactly as the traffic system's broad phase does. */
   forEachNear(x: number, z: number, radius: number, visit: (v: CombatVehicleView) => void): void {
     for (const view of this.views) {
       if (Math.hypot(view.x - x, view.z - z) <= radius) visit(view);
     }
+  }
+
+  applyImpact(id: number, hit: VehicleImpact): boolean {
+    const view = this.views.find((v) => v.id === id);
+    if (!view) return false;
+    // Copied: the system reuses one object per impact, by design.
+    this.impacts.push({ id, hit: { ...hit } });
+    return true;
+  }
+
+  applyDamage(id: number, amount: number): boolean {
+    const view = this.views.find((v) => v.id === id);
+    if (!view) return false;
+    this.damaged.push({ id, amount });
+    return true;
   }
 }
 
@@ -455,7 +477,22 @@ describe('hit registration', () => {
     combat.dispose();
   });
 
-  it('registers a hit on a car without hurting anyone', () => {
+  /*
+   * THIS TEST CHANGED. It used to assert only that a round into a car
+   * "registers a hit and hurts nobody", which was all the game did: an
+   * ordinary car took the bullet, drew a spark, and was otherwise untouched -
+   * `damageVehicle` was reached only for the police, and there was nothing at
+   * all for a civilian vehicle. Every ambient car in Meridian Bay was
+   * indestructible. What is pinned now is that the round reaches the vehicle,
+   * with its damage, while still hurting nobody - which was and remains
+   * correct.
+   *
+   * It goes through `applyDamage` rather than `applyImpact` on purpose. The
+   * impulse path is rate limited to one hit per vehicle per 0.22 s, which is
+   * right for two cars in contact and wrong for a carbine putting nine rounds
+   * a second into a door: two thirds of the magazine would be swallowed.
+   */
+  it('puts a round through a car: damage, no shove, and nobody hurt', () => {
     const player = armed('pistol');
     const crowd = new StubCrowd();
     const fleet = new StubFleet();
@@ -469,6 +506,45 @@ describe('hit registration', () => {
 
     combat.fireOnce();
     expect(combat.stats.hits).toBe(1);
+    expect(combat.stats.civiliansHurt).toBe(0);
+    expect(combat.stats.civiliansKilled).toBe(0);
+
+    expect(fleet.damaged).toHaveLength(1);
+    expect(fleet.damaged[0]?.id).toBe(7);
+    // Inside the pistol's 45 m plateau, so the full figure arrives, on the
+    // 260-point scale a write-off sits at.
+    expect(fleet.damaged[0]?.amount).toBeCloseTo(WEAPONS.pistol.damage, 5);
+    // No impulse. A bullet dents a car; it does not move one, and sending it
+    // down the rate-limited path would have thrown most of a magazine away.
+    expect(fleet.impacts).toHaveLength(0);
+    combat.dispose();
+  });
+
+  it('writes a car off with a magazine, one round at a time', () => {
+    const player = armed('rifle');
+    const fleet = new StubFleet();
+    fleet.add({
+      id: 4, police: false, x: 14, y: 0.75, z: 0, yaw: 0,
+      halfLength: 2.25, halfWidth: 0.95, halfHeight: 0.75,
+    });
+    const camera = eastwardCamera(0, 0.75, 0);
+    const combat = build({ player, camera, fleet });
+
+    // The controller rewrites the camera pose absolutely every frame and the
+    // kick is applied on top of it; without a stand-in for that write the
+    // recoil would pile up and walk the burst over the roof.
+    const base = camera.quaternion.clone();
+    combat.setTrigger(true);
+    for (let frame = 0; frame < 180; frame += 1) {
+      camera.quaternion.copy(base);
+      camera.updateMatrixWorld(true);
+      combat.update(1 / 60, idle());
+    }
+    const total = fleet.damaged.reduce((sum, hit) => sum + hit.amount, 0);
+    // 260 points is a write-off in the traffic layer's own scale. Every round
+    // that landed has to count toward it, which is the whole reason gunfire
+    // does not go down the rate-limited impulse path.
+    expect(total).toBeGreaterThan(260);
     combat.dispose();
   });
 

@@ -456,3 +456,52 @@ describe('a blast', () => {
     expect(ped.state).not.toBe('down');
   });
 });
+
+/*
+ * Which way a shot civilian falls.
+ *
+ * `downNearest` used to hand `knockDown` the VICTIM'S OWN heading as the blow
+ * direction, so `dirX*facingX + dirZ*facingZ` was always positive and everybody
+ * folded forwards onto their face whichever side the shot came from. With two
+ * or three people going down in a firefight that reads as one canned animation.
+ * The shot's direction of travel is now carried from `CombatSystem` through
+ * `CrowdTargets.damage` and `PedestrianSystem.downAt` to here.
+ */
+describe('a shot civilian falls the way the round was going', () => {
+  it('goes over backwards when the shot comes at them head on', () => {
+    const { crowd, ped, px, pz } = stage();
+    crowd.update(1 / 30, { x: px, y: 0, z: pz, time: 1 / 30 });
+    // A round travelling straight INTO their face: opposite their facing.
+    const intoTheFace = { x: Math.sin(ped.heading), z: Math.cos(ped.heading) };
+    expect(crowd.downNearest(ped.x, ped.z, 1, true, intoTheFace.x, intoTheFace.z)).toBe(true);
+    expect(ped.fallSign).toBe(1);
+  });
+
+  it('folds forwards when the shot comes from behind', () => {
+    const { crowd, ped, px, pz } = stage();
+    crowd.update(1 / 30, { x: px, y: 0, z: pz, time: 1 / 30 });
+    // A round travelling the same way they are facing: it came from behind.
+    const fromBehind = { x: -Math.sin(ped.heading), z: -Math.cos(ped.heading) };
+    expect(crowd.downNearest(ped.x, ped.z, 1, true, fromBehind.x, fromBehind.z)).toBe(true);
+    expect(ped.fallSign).toBe(-1);
+  });
+
+  it('still falls sensibly when nobody said which way the shot was going', () => {
+    // A blast, or any caller that has no direction to give. The old behaviour
+    // is the fallback rather than an error, and it must still be a legal sign.
+    const { crowd, ped, px, pz } = stage();
+    crowd.update(1 / 30, { x: px, y: 0, z: pz, time: 1 / 30 });
+    expect(crowd.downNearest(ped.x, ped.z, 1, true)).toBe(true);
+    expect(Math.abs(ped.fallSign)).toBe(1);
+  });
+
+  it('ignores a direction that carries no direction at all', () => {
+    // A zero-length vector is not "straight ahead", it is "unknown". Dividing
+    // by its length would produce NaN and a body that never renders.
+    const { crowd, ped, px, pz } = stage();
+    crowd.update(1 / 30, { x: px, y: 0, z: pz, time: 1 / 30 });
+    expect(crowd.downNearest(ped.x, ped.z, 1, true, 0, 0)).toBe(true);
+    expect(Number.isFinite(ped.fallSign)).toBe(true);
+    expect(Math.abs(ped.fallSign)).toBe(1);
+  });
+});

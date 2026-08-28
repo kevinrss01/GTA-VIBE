@@ -34,9 +34,17 @@
  *   - up to five nearby ambient cars, one panned tyre-roll loop each;
  *   - tyre scrub when anything brakes hard, the player included;
  *   - the car door on the way in and the way out;
- *   - a collision thud when the player hits something;
+ *   - every collision in the city, the player's own included, through the
+ *     public `impact()` - see the impact bands for why one recording scaled by
+ *     severity was not intensity variation;
  *   - the footfalls of nearby pedestrians, on the right surface;
  *   - a distant traffic hum whose level is how much traffic is actually moving.
+ *
+ * It deliberately does NOT voice a police unit's engine. Police cars are taken
+ * over from ordinary traffic and stay in `traffic.vehicles`, so a `police` view
+ * is skipped here and voiced by `PoliceAudio` instead: two engine loops on one
+ * object phase against each other, and the pursuit voice is the one carrying
+ * the information.
  *
  * ## Budgets, because 140 cars and 270 people is not a mixing suggestion
  *
@@ -51,6 +59,8 @@
  *   distant hum       1 looping source, 1 gain               (allocated once)
  *   crowd footsteps   MAX_STEP_VOICES at a time, MAX 3 nodes each
  *   other one-shots   MAX_OTHER_VOICES at a time, self-releasing on `ended`
+ *                     (impacts included: a crash is a positional one-shot and
+ *                     is counted in exactly the same budget)
  *
  * 23 persistent nodes, and a transient tail capped by voice COUNT rather than
  * by a rate limiter - 65 nodes in the absolute worst case, whatever the
@@ -81,7 +91,13 @@ import {
   loadFromAcceleration,
   type EngineTone,
 } from './engineCurve';
-import { getAudioAsset, STEP_SURFACES, TRAFFIC_HUM, VEHICLE_SOUNDS } from './manifest';
+import {
+  getAudioAsset,
+  IMPACT_SOUNDS,
+  STEP_SURFACES,
+  TRAFFIC_HUM,
+  VEHICLE_SOUNDS,
+} from './manifest';
 import type { AudioAssetId } from './manifest';
 import type { SurfaceId } from '../world/CityGround';
 
@@ -133,6 +149,47 @@ const IMPACT_COOLDOWN = 0.35;
 
 /** Frames after a control handover in which speed steps are not real. */
 const SETTLE_FRAMES = 3;
+
+/**
+ * Collision intensity bands.
+ *
+ * THE OLD BEHAVIOUR WAS ONE ASSET AT TWO VOLUMES. `veh/impact` was played
+ * unpanned, unpitched, at `0.5 + 0.5 * severity`, which is a 6 dB range on a
+ * single recording: a kerb scrape and a head-on were the same event heard from
+ * two distances rather than two different events. The model for doing this
+ * properly is already in this file - see the tyre-scrub comment above
+ * TRAFFIC_SCRUB_DECEL, which records what happens when an intensity gate is
+ * wrong - so impacts now pick a MATERIAL by band and vary within it.
+ *
+ * The bands overlap the assets rather than butting them together: the medium
+ * clip covers the middle, and the light and heavy clips take the ends, so
+ * crossing a boundary changes the recording at the quietest point of the one
+ * being left rather than at its loudest.
+ */
+const IMPACT_LIGHT_MAX = 0.3;
+const IMPACT_HEAVY_MIN = 0.62;
+/** Pitch spread on an impact. Wider than a gunshot: no two crashes are alike. */
+const IMPACT_PITCH_JITTER = 0.11;
+/** How far an impact carries. A crash is heard across a junction. */
+const IMPACT_REF_DISTANCE = 8;
+const IMPACT_MAX_DISTANCE = 95;
+/**
+ * A hit hard enough to break glass, and how loud that layer sits under it.
+ *
+ * Layered rather than a fourth recording: glass is what is DIFFERENT about a
+ * heavy impact, not a different impact, and summing it lets the same threshold
+ * produce a hit with glass in it or without depending on what was struck.
+ */
+const IMPACT_GLASS_FROM = 0.72;
+const IMPACT_GLASS_DB = -7;
+/**
+ * Hitting scenery is duller than hitting another car.
+ *
+ * A wall or a bollard does not ring, deform or come apart; the same collision
+ * against sheet metal has a second panel resonating in it. One playback-rate
+ * step down is the cheapest honest way to say that with the assets available.
+ */
+const IMPACT_WORLD_RATE = 0.93;
 
 /** Player braking hard enough to scrub, and how often that may be heard. */
 const PLAYER_SCRUB_DECEL = 5.5;
@@ -271,7 +328,39 @@ export interface VehicleAudioView {
   readonly braking: boolean;
   /** Longitudinal acceleration in m/s². Negative under braking. */
   readonly accelLong: number;
-  readonly control: 'ambient' | 'player';
+  /**
+   * `loose` is a car that has been knocked out of the traffic AI and is rolling
+   * free; it is still an engine and a set of tyres, so it is voiced exactly as
+   * ambient traffic is. Only `player` is special here, because the driven car
+   * has its own engine note.
+   */
+  readonly control: 'ambient' | 'player' | 'loose';
+  /**
+   * True while this car is a police unit.
+   *
+   * `VehicleView.police` already exists in the traffic system; this view simply
+   * did not read it. It is accepted here so the plain tyre-roll voice can be
+   * kept off a unit that `PoliceAudio` is already voicing with a siren and an
+   * interceptor engine - two engine loops on one car is a phasey mess, and the
+   * pursuit voice is the one that carries the information.
+   */
+  readonly police?: boolean;
+}
+
+/**
+ * A collision worth hearing.
+ *
+ * Structurally the payload of `TrafficSystem.onImpact`, so that callback can be
+ * pointed straight at `street.impact` without either module importing the other.
+ */
+export interface VehicleImpact {
+  readonly x: number;
+  readonly y: number;
+  readonly z: number;
+  /** 0..1. Picks the recording as well as the level; see the impact bands. */
+  readonly intensity: number;
+  /** What was struck. `world` is scenery; `vehicle` is another car. */
+  readonly kind: 'vehicle' | 'world';
 }
 
 /**
@@ -476,6 +565,68 @@ export class StreetAudio {
     else this.releaseTracks();
   }
 
+  /**
+   * A collision anywhere in the city.
+   *
+   * Wired to `TrafficSystem.onImpact`, and used by this layer's own detector
+   * for the player's car, so every crash in the game goes through one place and
+   * sounds the same way for the same reason.
+   *
+   * `intensity` is 0..1 and is the only input that matters: it picks the
+   * recording, the level, the pitch and whether glass comes down with it.
+   * `kind` separates hitting another vehicle from hitting the world, which is
+   * a colour difference rather than a different event.
+   */
+  impact(info: VehicleImpact): void {
+    if (this.disposed) return;
+    const intensity = clamp01(info.intensity);
+
+    const id =
+      intensity <= IMPACT_LIGHT_MAX
+        ? VEHICLE_SOUNDS.impactLight
+        : intensity >= IMPACT_HEAVY_MIN
+          ? VEHICLE_SOUNDS.impactHeavy
+          : VEHICLE_SOUNDS.impact;
+
+    // Level within the chosen band, not across the whole range: the band has
+    // already done most of the work, so this is variation rather than a ramp.
+    const band =
+      intensity <= IMPACT_LIGHT_MAX
+        ? intensity / IMPACT_LIGHT_MAX
+        : intensity >= IMPACT_HEAVY_MIN
+          ? (intensity - IMPACT_HEAVY_MIN) / (1 - IMPACT_HEAVY_MIN)
+          : (intensity - IMPACT_LIGHT_MAX) / (IMPACT_HEAVY_MIN - IMPACT_LIGHT_MAX);
+    const scale = 0.62 + 0.38 * clamp01(band);
+
+    const jitter = 1 + (Math.random() * 2 - 1) * IMPACT_PITCH_JITTER;
+    const rate = jitter * (info.kind === 'world' ? IMPACT_WORLD_RATE : 1);
+
+    this.playPositional(
+      id,
+      info.x,
+      info.y,
+      info.z,
+      dbToGain(getAudioAsset(id).trimDb) * scale,
+      IMPACT_REF_DISTANCE,
+      IMPACT_MAX_DISTANCE,
+      rate,
+    );
+
+    if (intensity >= IMPACT_GLASS_FROM) {
+      const glass = IMPACT_SOUNDS.glass;
+      this.playPositional(
+        glass,
+        info.x,
+        info.y,
+        info.z,
+        dbToGain(getAudioAsset(glass).trimDb + IMPACT_GLASS_DB),
+        IMPACT_REF_DISTANCE,
+        IMPACT_MAX_DISTANCE,
+        0.95 + Math.random() * 0.12,
+      );
+    }
+  }
+
   // -- the player's car ------------------------------------------------------
 
   /**
@@ -527,9 +678,13 @@ export class StreetAudio {
       this.impactCooldown <= 0
     ) {
       this.impactCooldown = IMPACT_COOLDOWN;
-      // Harder hits are louder, but a graze is never silent.
-      const severity = clamp01((Math.abs(this.lastSpeed) - IMPACT_MIN_SPEED) / 12);
-      this.playOneShot(VEHICLE_SOUNDS.impact, 0.5 + 0.5 * severity);
+      // Routed through the same `impact` the traffic system's callback uses,
+      // so the player's own crash cannot drift away from everybody else's. It
+      // is panned at the car rather than played flat: the listener is inside
+      // that car, so the panner puts it where it belongs and the distance model
+      // leaves it at full level.
+      const intensity = clamp01((Math.abs(this.lastSpeed) - IMPACT_MIN_SPEED) / 14);
+      this.impact({ x: ctx.x, y: ctx.y, z: ctx.z, intensity, kind: 'world' });
     }
 
     if (
@@ -746,7 +901,22 @@ export class StreetAudio {
     const bestDistance: number[] = [];
 
     for (const vehicle of ctx.vehicles) {
-      if (vehicle.control === 'player') continue;
+      /*
+       * A car the player or the police are driving is not voiced here.
+       *
+       * `PoliceAudio` gives a pursuit unit its own engine and siren, and a
+       * civilian loop on the same object would be a second engine a few
+       * milliseconds out of phase with the first.
+       *
+       * The test is on CONTROL, not on `police`. A pursuit unit is taken over
+       * from ordinary traffic through `takeControl`, which sets its control to
+       * `'player'`, so the first clause already covers it. Skipping every
+       * police-LIVERIED car instead would silence the patrol cars that are
+       * simply driving around as part of the fleet - two of the eleven body
+       * kinds, and a measurable share of the traffic - and those are ordinary
+       * cars until somebody dispatches them.
+       */
+      if (vehicle.control !== 'ambient') continue;
       const dx = vehicle.x - ctx.x;
       const dz = vehicle.z - ctx.z;
       const distanceSq = dx * dx + dz * dz;

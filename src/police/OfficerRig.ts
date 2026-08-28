@@ -134,6 +134,27 @@ const BASE_CADENCE = 0.98;
  */
 const MAX_STEP_SQUARED = 2.25;
 
+/**
+ * How a shot officer goes down, in seconds from the round landing.
+ *
+ * The same numbers the CROWD uses for the civilians it lays in the road - see
+ * `FALL_TIME` in `src/agents/crowd.ts` - deliberately duplicated rather than
+ * imported, because `src/agents` belongs to another workstream and a body in
+ * the street has to read as one game whoever it was. If the crowd's fall is
+ * ever retuned, retune this with it.
+ */
+export const FALL_TIME = 0.34;
+
+/**
+ * How far a toppled body is lifted so it does not sink into the pavement.
+ *
+ * A body pivoting about its feet has its front-back axis lying along the
+ * vertical, so half its thickness - about 0.12 of a rig unit, and the rig is
+ * authored one unit tall - would be under the ground. Matches
+ * `PedestrianSystem`'s `DOWN_LIFT` for the same reason as `FALL_TIME`.
+ */
+const DOWN_LIFT = 0.12;
+
 export interface OfficerPose {
   x: number;
   y: number;
@@ -161,6 +182,20 @@ export interface OfficerPose {
    * and not as a pose snapping on.
    */
   aiming: number;
+  /**
+   * True once this officer has been put on the ground. Owned by the caller.
+   *
+   * Everything about DRAWING a body is this flag and the two fields under it:
+   * `tilt` folds them into the same instance matrix that already carries the
+   * heading and the build, so a body costs the police exactly nothing extra -
+   * no second mesh, no second material, no extra draw call. It is the crowd's
+   * knock-down renderer, applied to the people who wear uniforms.
+   */
+  down: boolean;
+  /** Seconds since they went down. Drives the topple. Owned by the caller. */
+  downFor: number;
+  /** Which way they topple: +1 over backwards, -1 onto their face. */
+  fallSign: number;
 }
 
 /** Fresh appearance for one officer, deterministic in `seed`. */
@@ -304,8 +339,25 @@ export class OfficerRig {
     this.proc.mesh.castShadow = enabled;
   }
 
+  /**
+   * How far over a downed officer has toppled, in radians, and which way.
+   *
+   * Zero on their feet, `±PI/2` flat out, eased out because a falling body
+   * accelerates and then stops dead on the ground. An officer never gets back
+   * up - the only thing that puts one down here is being killed - so unlike
+   * the crowd's version there is no rise to fold back in.
+   */
+  static tilt(pose: OfficerPose): number {
+    if (!pose.down) return 0;
+    const fall = clamp(pose.downFor / FALL_TIME, 0, 1);
+    const amount = 1 - (1 - fall) * (1 - fall);
+    return pose.fallSign * amount * Math.PI * 0.5;
+  }
+
   /** Advances one officer's walk cycle and distance accumulator. */
   static advance(pose: OfficerPose, dt: number): void {
+    // A body has no gait. Advancing one would walk the legs of a corpse.
+    if (pose.down) return;
     const cadence = gaitCadence(pose.speed, PREFERRED_SPEED, BASE_CADENCE, pose.height);
     pose.gait = damp(pose.gait, pose.speed > 0.16 ? 1 : 0, 6, dt);
     pose.phase = (pose.phase + cadence * dt * Math.max(pose.gait, 0.14)) % 1;
@@ -554,20 +606,29 @@ function writeMatrix(matrices: Float32Array, n: number, pose: OfficerPose): void
   const c = Math.cos(pose.heading);
   const s = Math.sin(pose.heading);
   const width = pose.girth;
+  const height = pose.height;
+  // `Ry(heading) * Rx(tilt) * scale(girth, height, girth)`, column-major.
+  // `tilt` is zero for anybody on their feet, which collapses this back to the
+  // yaw-and-scale form it used to be; for a body it is the topple. The slots a
+  // tilt uses are written unconditionally, because an instance slot that held
+  // a body last frame and a walking officer this one would keep the shear.
+  const tilt = OfficerRig.tilt(pose);
+  const ct = Math.cos(tilt);
+  const st = Math.sin(tilt);
   matrices[m] = c * width;
   matrices[m + 1] = 0;
   matrices[m + 2] = -s * width;
   matrices[m + 3] = 0;
-  matrices[m + 4] = 0;
-  matrices[m + 5] = pose.height;
-  matrices[m + 6] = 0;
+  matrices[m + 4] = s * height * st;
+  matrices[m + 5] = height * ct;
+  matrices[m + 6] = c * height * st;
   matrices[m + 7] = 0;
-  matrices[m + 8] = s * width;
-  matrices[m + 9] = 0;
-  matrices[m + 10] = c * width;
+  matrices[m + 8] = s * width * ct;
+  matrices[m + 9] = -width * st;
+  matrices[m + 10] = c * width * ct;
   matrices[m + 11] = 0;
   matrices[m + 12] = pose.x;
-  matrices[m + 13] = pose.y;
+  matrices[m + 13] = pose.y + DOWN_LIFT * width * Math.abs(st);
   matrices[m + 14] = pose.z;
   matrices[m + 15] = 1;
 }

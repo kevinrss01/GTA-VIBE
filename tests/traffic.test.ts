@@ -835,6 +835,75 @@ describe('traffic keeps moving', () => {
  * moves. See `TrafficSim.chooseNext` and `TrafficSim.exitHasRoom` for what
  * each of them was and what it measured before and after.
  */
+/*
+ * The interpenetration check again, wider and shorter.
+ *
+ * The ten-minute run above is the thorough one, but it is a SINGLE seed, and a
+ * single seed only catches a fault when the fleet happens to produce it. It
+ * did not, for a long time - then two new streets re-rolled the spawn draws
+ * and a pickup and a saloon spent 69 seconds inside one another at Anchor
+ * Street and Ferro Street, both turning into it, both holding
+ * `j:ferro-street:anchor-street`. The rule that now prevents that is in
+ * `TrafficSim.junctionConflict`: never take a box in front of a car already
+ * inside its own braking distance of its own stop line, because claiming ahead
+ * of that car does not stop it - it arrives anyway.
+ *
+ * Three seeds, two minutes each, at the same population the long run uses.
+ * Not a substitute for it; a guard against that one seed being lucky.
+ *
+ * The first thirty seconds are not counted, for the same reason the arterial
+ * test skips its first sixty: a cold fleet is placed lane by lane and has not
+ * yet met itself at a junction, and its first pass through one is a transient
+ * rather than the steady state anything here is about. The long run above hides
+ * this by inheriting a sim that two earlier tests have already warmed.
+ */
+describe('junction exclusion holds across seeds', () => {
+  it('never leaves two vehicles interpenetrated, whatever the fleet', () => {
+    for (const seed of ['meridian-traffic-01', 'probe-b', 'probe-c']) {
+      const sim = new TrafficSim({
+        network,
+        plan,
+        heightAt: (x, z) => ground.heightAt(x, z),
+        population: 160,
+        seed,
+      });
+      const step = 1 / 30;
+      const offending = new Map<string, number>();
+      let sustained = 0;
+      let worst = 0;
+      let where = '';
+      for (let i = 0; i < 120 / step; i += 1) {
+        const time = i * step;
+        sim.update(step, Math.sin(time * 0.05) * 150, Math.cos(time * 0.037) * 130, time);
+        if (time < 30 || i % 15 !== 0) continue;
+        const active = sim.vehicles.filter((v) => v.active);
+        const seen = new Set<string>();
+        for (let a = 0; a < active.length; a += 1) {
+          const va = active[a] as Vehicle;
+          for (let b = a + 1; b < active.length; b += 1) {
+            const vb = active[b] as Vehicle;
+            if (Math.abs(va.x - vb.x) > 9 || Math.abs(va.z - vb.z) > 9) continue;
+            const overlap = boxesOverlap(va, vb, 0.12);
+            if (overlap <= 0) continue;
+            if (overlap > worst) {
+              worst = overlap;
+              where = `${seed}: ${va.kind} on ${va.laneId} and ${vb.kind} on ${vb.laneId}`;
+            }
+            const key = va.id < vb.id ? `${va.id}:${vb.id}` : `${vb.id}:${va.id}`;
+            seen.add(key);
+            const run = (offending.get(key) ?? 0) + 1;
+            offending.set(key, run);
+            if (run >= 3) sustained += 1;
+          }
+        }
+        for (const key of offending.keys()) if (!seen.has(key)) offending.delete(key);
+      }
+      expect(sustained, `${seed}: ${where}`).toBe(0);
+      expect(worst, `${seed}: worst overlap ${worst.toFixed(3)} m — ${where}`).toBeLessThan(0.12);
+    }
+  }, 120000);
+});
+
 describe('traffic distributes itself and stays distributed', () => {
   const SEEDS = ['meridian-traffic-01', 'probe-b', 'probe-c'];
 

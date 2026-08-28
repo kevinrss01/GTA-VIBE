@@ -21,9 +21,10 @@ import type { PerspectiveCamera } from 'three';
 
 import { clamp } from '../core/mathx';
 import type { CityGround } from '../world/CityGround';
-import type { CollisionWorld, VehicleBoxSink } from './Collision';
+import type { CollisionWorld, VehicleBoxSink, VehicleContact } from './Collision';
 import type { FirstPersonController } from './FirstPersonController';
 import type { TrafficSystem } from '../traffic/TrafficSystem';
+import { impactDamage } from '../traffic/types';
 import type { VehicleHandle, VehicleView } from '../traffic/types';
 
 /** How close the player must be to a car to be offered it. */
@@ -98,6 +99,35 @@ const BODY_HEIGHT = 1.4;
  */
 const VEHICLE_QUERY_RADIUS = 12;
 
+/**
+ * Coefficient of restitution between two car bodies.
+ *
+ * Sheet metal, not rubber: almost all of the energy goes into the panels. 0.15
+ * is enough for the two cars to separate afterwards rather than travel on
+ * locked together, which is the only thing a higher number would buy.
+ */
+const CAR_RESTITUTION = 0.15;
+/**
+ * Closing speed, m/s, below which touching another car is a nudge.
+ *
+ * Below this the existing block-and-scrub already does the right thing, and
+ * generating an impulse for every kerb-crawling contact would have traffic
+ * being knocked loose in a car park.
+ */
+const CONTACT_SPEED = 1.4;
+/**
+ * How long a yaw impulse is credited for, in seconds.
+ *
+ * `Driving` integrates a heading, not an angular velocity - the steering model
+ * is kinematic - so a torque has to be spent as a heading change rather than
+ * as a spin that decays. A quarter of a second is about how long a real body
+ * takes to shed the yaw from a shunt, and it keeps the kick bounded whatever
+ * the mass ratio.
+ */
+const YAW_KICK_SECONDS = 0.25;
+/** Ceiling on the heading a single hit may change, radians. */
+const YAW_KICK_LIMIT = 0.7;
+
 export interface DrivingOptions {
   readonly traffic: TrafficSystem;
   readonly ground: CityGround;
@@ -141,6 +171,12 @@ export class Driving {
   private camZ = 0;
 
   private readonly keys = new Set<string>();
+
+  /**
+   * Where the last sub-step was refused, reused every frame so the collision
+   * resolve allocates nothing. `id` is -1 whenever a vehicle was not involved.
+   */
+  private readonly contact: VehicleContact = { id: -1, x: 0, y: 0, z: 0 };
 
   /**
    * Traffic, as the collision world wants to see it.
@@ -313,6 +349,12 @@ export class Driving {
     const { chassis } = handle;
     const { ground, collision, camera } = this.options;
 
+    // Anything that ran into THIS car since the last frame. The simulation
+    // cannot move a car it does not own, so it banks the exchange and the
+    // owner spends it - which is what makes an ambient driver running into the
+    // parked player shove them forward instead of stopping dead against them.
+    this.absorbImpulse();
+
     // -- input ---------------------------------------------------------------
     const throttle = this.pressed('ArrowUp', 'KeyW') ? 1 : 0;
     const brake = this.pressed('ArrowDown', 'KeyS') ? 1 : 0;
@@ -413,6 +455,7 @@ export class Driving {
     const startZ = this.z;
     let achieved = 0;
     let blocked = false;
+    let struck = false;
     for (let i = 0; i < steps; i += 1) {
       const stepX = dx / steps;
       const stepZ = dz / steps;
@@ -428,6 +471,7 @@ export class Driving {
         surface.y,
         BODY_HEIGHT,
         true,
+        this.contact,
       );
 
       // Refuse a sub-step that would put the car in the bay or outside the
@@ -452,18 +496,41 @@ export class Driving {
       const stepWanted = Math.hypot(stepX, stepZ);
       if (stepWanted > 1e-6 && Math.hypot(gotX, gotZ) < stepWanted - 1e-5) {
         blocked = true;
+        // A car refused this step, rather than a building. That is a collision
+        // between two bodies with masses, and momentum decides what happens to
+        // both of them.
+        if (this.contact.id >= 0) struck = this.strike();
         // Nothing further this frame: the remaining sub-steps would push into
         // whatever just stopped us.
         break;
       }
     }
 
-    if (blocked && wanted > 1e-5 && this.speed !== 0) {
+    if (blocked && !struck && wanted > 1e-5 && this.speed !== 0) {
       // Keep whatever sliding the world allowed and scrub speed by how much
       // was refused, so a glance costs less than a head-on hit.
+      //
+      // Skipped when the refusal was a car this frame actually struck: the
+      // momentum exchange has already taken the speed that went into the other
+      // vehicle, and scrubbing on top of it would stop a lorry dead against a
+      // hatchback it had just launched.
       const lost = Math.max(0, 1 - achieved / wanted);
+      const before = this.speed;
       this.speed *= Math.max(0, 1 - lost * 1.6);
       if (lost > 0.75) this.speed = -this.speed * 0.12;
+      const shed = Math.abs(before) - Math.abs(this.speed);
+      if (shed > 1.5) {
+        // Hitting the city itself: same hook, different material, so audio can
+        // tell a wall from a wing. The shell pays for it as well, at 40 per
+        // cent of the momentum the scrub took, because that scrub is a
+        // deliberately blunt instrument - it charges a glancing scrape along a
+        // building most of the car's speed, and charging the full impulse for
+        // that would write a car off on a kerb.
+        const roadY = ground.sample(this.x, this.z).y;
+        this.options.traffic.reportImpact(this.x, roadY + 0.6, this.z, shed / 12, 'world');
+        this.options.traffic.applyDamage(handle.id, impactDamage(shed * chassis.mass * 0.4));
+        this.pitchLean -= Math.min(0.09, shed * 0.006);
+      }
     }
     // The sub-step loop has already committed the movement.
     dx = 0;
@@ -530,6 +597,109 @@ export class Driving {
     camera.lookAt(this.x, roadY + CAM_LOOK_HEIGHT, this.z);
     // Body roll leans the frame a little, which sells the weight of a turn.
     camera.rotateZ(this.rollLean * 0.45);
+  }
+
+  /**
+   * Resolves this frame's contact with another car, in both directions.
+   *
+   * A one-dimensional inelastic collision along the line from this car's centre
+   * to the point it touched: the reduced mass is what makes the exchange read
+   * correctly whichever way round it happens. Two saloons at 12 m/s closing
+   * transfer 9.8 kN.s, which leaves the striker at 5.1 m/s and sends the struck
+   * car off at 6.9; the same arithmetic against a 4.2 tonne box truck leaves
+   * the saloon at 1.7 and moves the truck at 3.5. Nothing is special-cased.
+   *
+   * Returns false when the hit was not taken - too slow to count, or the same
+   * contact as last frame, which `TrafficSystem` refuses for a fifth of a
+   * second so that leaning on a car is one collision rather than a hundred.
+   */
+  private strike(): boolean {
+    const handle = this.handle;
+    if (!handle) return false;
+    const { traffic } = this.options;
+    const contact = this.contact;
+
+    let other: VehicleView | null = null;
+    for (const view of traffic.vehicles) {
+      if (view.id === contact.id) {
+        other = view;
+        break;
+      }
+    }
+    if (!other) return false;
+
+    // The line of the hit: from our centre out to where we touched them.
+    let nx = contact.x - this.x;
+    let nz = contact.z - this.z;
+    const range = Math.hypot(nx, nz);
+    if (range < 1e-4) return false;
+    nx /= range;
+    nz /= range;
+
+    const fx = -Math.sin(this.yaw);
+    const fz = -Math.cos(this.yaw);
+    const ofx = -Math.sin(other.yaw);
+    const ofz = -Math.cos(other.yaw);
+    const closing =
+      (fx * this.speed - ofx * other.speed) * nx + (fz * this.speed - ofz * other.speed) * nz;
+    if (closing < CONTACT_SPEED) return false;
+
+    const mass = handle.chassis.mass;
+    const otherMass = traffic.chassisOf(contact.id)?.mass ?? mass;
+    const impulse = (1 + CAR_RESTITUTION) * closing * ((mass * otherMass) / (mass + otherMass));
+    const damage = impactDamage(impulse);
+    if (
+      !traffic.applyImpact(contact.id, {
+        x: contact.x,
+        y: contact.y,
+        z: contact.z,
+        dirX: nx,
+        dirZ: nz,
+        impulse,
+        damage,
+      })
+    ) {
+      return false;
+    }
+
+    // Newton's third law, spent on the only degree of freedom this model has.
+    const deltaV = impulse / mass;
+    this.speed -= deltaV * (nx * fx + nz * fz);
+    this.speed = clamp(this.speed, -REVERSE_SPEED, TOP_SPEED);
+    // The striker's own shell takes slightly less than the car it hit: the
+    // front structure is what it was designed to crush.
+    traffic.applyDamage(handle.id, damage * 0.85);
+    this.pitchLean -= Math.min(0.09, deltaV * 0.02);
+    this.braking = true;
+    return true;
+  }
+
+  /**
+   * Spends whatever ran into this car while the simulation was stepping.
+   *
+   * Only the longitudinal component moves the car: the steering model here is
+   * kinematic and has no lateral velocity to put a sideways shove into, so a
+   * side impact arrives as a heading change and a jolt rather than as a slide.
+   */
+  private absorbImpulse(): void {
+    const handle = this.handle;
+    if (!handle) return;
+    const bump = this.options.traffic.takeImpulse(handle.id);
+    if (!bump) return;
+    const chassis = handle.chassis;
+    const mass = Math.max(1, chassis.mass);
+    const fx = -Math.sin(this.yaw);
+    const fz = -Math.cos(this.yaw);
+    const deltaV = (bump.x * fx + bump.z * fz) / mass;
+    this.speed = clamp(this.speed + deltaV, -REVERSE_SPEED, TOP_SPEED);
+    const yawInertia =
+      (mass * (chassis.length * chassis.length + chassis.width * chassis.width)) / 12;
+    this.yaw += clamp(
+      (bump.yaw / yawInertia) * YAW_KICK_SECONDS,
+      -YAW_KICK_LIMIT,
+      YAW_KICK_LIMIT,
+    );
+    this.pitchLean -= Math.min(0.09, Math.abs(deltaV) * 0.02);
   }
 
   dispose(): void {

@@ -30,9 +30,10 @@ export const GAME_TAGLINE = 'Come back to Meridian Bay and find out who owns it 
  */
 export const GAME_PREMISE =
   'Meridian Bay is a working coastal city: a container harbour, a close-grained ' +
-  'old quarter, a small downtown, and terraced streets climbing the ridge ' +
-  'behind it. The money comes off the water, and it belongs to whoever holds ' +
-  'the lock-ups it passes through on the way inland.';
+  'old quarter, a small downtown, terraced streets climbing the ridge behind ' +
+  'it, and a regional airfield out on the flats to the south. The money comes ' +
+  'off the water, and it belongs to whoever holds the lock-ups it passes ' +
+  'through on the way inland — or the aircraft it leaves on.';
 
 export const PROTAGONIST_PREMISE =
   'You are Marlo Vance. You have been away eight years, you own a car you did ' +

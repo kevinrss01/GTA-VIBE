@@ -26,13 +26,30 @@
  */
 
 import { smoothstep } from '../core/mathx';
+import { AIRFIELD_LEVEL, CAUSEWAY, airfieldWeight, causewayWeight } from './airport/layout';
 
-/** Playable world bounds, including the water and the outskirts. */
+/**
+ * Playable world bounds, including the water, the outskirts and the airfield.
+ *
+ * Grown south and east for Meridian Bay Regional. The east and south edges are
+ * set by the airfield's own blend, not by the platform: `AIRFIELD` reaches
+ * x = 430, z = 950 and `AIRFIELD_SKIRT` carries the embankment 46 m past that,
+ * so a boundary at the platform edge would have cut the mesh off mid-slope and
+ * left a 15 m wall of nothing where the runway looks south. 470 and 1000 clear
+ * the toe of the bank on both sides (measured weight at x = 470 is 0.048, and
+ * exactly 0 at z = 1000).
+ *
+ * The west and north edges are untouched. Everything the city occupies is at
+ * airfield weight 0 - the southernmost city surface is South Circuit's far
+ * pavement at z = 143, and the platform's influence starts at z = 154 - so the
+ * grid, the blocks and the parcels are bit-identical after this change.
+ * `tests/airport.test.ts` pins that.
+ */
 export const WORLD_BOUNDS = {
   minX: -232,
-  maxX: 214,
+  maxX: 470,
   minZ: -206,
-  maxZ: 186,
+  maxZ: 1000,
 } as const;
 
 /** Sea level. Water renders as a plane at exactly this height. */
@@ -66,9 +83,52 @@ export function minorProfile(z: number): number {
   );
 }
 
-/** Smooth land elevation. This is the ground everywhere on land. */
-export function landElevation(x: number, z: number): number {
+/**
+ * The untouched terrain profile, before any earthwork.
+ *
+ * Kept separate from `landElevation` because the airfield grading has to blend
+ * AGAINST it, and a self-referential blend would recurse.
+ */
+export function naturalElevation(x: number, z: number): number {
   return mainProfile(x) + minorProfile(z);
+}
+
+/**
+ * The airfield platform blended against natural ground.
+ *
+ * This is the formula the airfield survey specifies: `AIRFIELD_LEVEL` weighted
+ * in by `airfieldWeight`, which is 1 over the whole platform and eases to 0
+ * across `AIRFIELD_SKIRT` outside it. It is exact - not approximately 14.5 -
+ * everywhere the runway, taxiway, apron, terminal, forecourt and car park
+ * stand, and exactly 0 over every surface the city occupies.
+ */
+function platformElevation(x: number, z: number): number {
+  const weight = airfieldWeight(x, z);
+  const natural = naturalElevation(x, z);
+  return weight <= 0 ? natural : natural + weight * (AIRFIELD_LEVEL - natural);
+}
+
+/**
+ * Smooth land elevation. This is the ground everywhere on land, including the
+ * airfield platform and the causeway that carries its access road.
+ *
+ * Two earthworks, applied in the order they would be built: the platform is
+ * graded first, and the causeway is then cut and filled INTO that surface.
+ * Inside the causeway its weight is 1, so the level there is
+ * `platformElevation` read on the road's own centreline - a function of z
+ * alone. That is what makes Airport Approach exactly level across its width
+ * while still following the bank along its length; see the note above
+ * `CAUSEWAY` in `airport/layout.ts`.
+ *
+ * The early return is not decoration. This runs for every ground sample, every
+ * street quad corner and every prop placement in the city, and both weights are
+ * zero over all of it.
+ */
+export function landElevation(x: number, z: number): number {
+  const base = platformElevation(x, z);
+  const causeway = causewayWeight(x, z);
+  if (causeway <= 0) return base;
+  return base + causeway * (platformElevation(CAUSEWAY.crownX, z) - base);
 }
 
 /**

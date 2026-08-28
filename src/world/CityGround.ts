@@ -17,6 +17,7 @@ import { hash2 } from '../core/rng';
 import {
   blockSurfaceY,
   corridorHalfWidth,
+  courtyardSurfaceAt,
   KERB_HEIGHT,
   type CityBlock,
   type CityPlan,
@@ -24,6 +25,8 @@ import {
   type Street,
   type DistrictId,
 } from './CityPlan';
+import { airportSurfaceAt } from './airport/plan';
+import { TERMINAL, inRect } from './airport/layout';
 import { groundElevation, landElevation, SEA_LEVEL, shorelineX, WORLD_BOUNDS } from './elevation';
 
 export type SurfaceId =
@@ -35,15 +38,103 @@ export type SurfaceId =
   | 'sand'
   | 'gravel'
   | 'water'
-  | 'interior';
+  | 'interior'
+  /** Airfield concrete: runway, taxiway, apron, hangar hardstanding. */
+  | 'concrete';
+
+/** Surfaces a foot lands hard on. Nothing may report soft where these are drawn. */
+const HARD_SURFACES: ReadonlySet<SurfaceId> = new Set<SurfaceId>([
+  'asphalt',
+  'pavement',
+  'boardwalk',
+  'plaza',
+  'concrete',
+]);
+
+export function isHardSurface(surface: SurfaceId): boolean {
+  return HARD_SURFACES.has(surface);
+}
 
 export interface GroundSample {
   /** Walkable surface height in metres. */
   readonly y: number;
   readonly surface: SurfaceId;
-  /** True on a carriageway, so the footstep mixer can pick the right variant. */
+  /**
+   * True on a carriageway. Read by the prop scatterer, which may not stand
+   * anything in a live traffic lane; the footstep mixer keys off `surface`
+   * alone, since a carriageway and a car park are the same underfoot.
+   */
   readonly onRoad: boolean;
 }
+
+/**
+ * Scale of the scrub/gravel patchwork on open ground, in metres.
+ *
+ * The classification used to be `hash2(x * 0.25, z * 0.25, 7) < 0.6`, and
+ * `hash2` quantises its inputs at 1/8192, so that expression re-rolled every
+ * 0.5 MILLIMETRE: it was white noise, not patches. Standing still and turning
+ * on the spot changed the surface underfoot, and walking across open ground
+ * alternated grass and gravel footsteps at random - which is the "grass sounds
+ * on the wrong surface" the report describes.
+ *
+ * The replacement is value noise on a 34 m lattice: one draw per lattice point,
+ * smoothly interpolated, so a patch is tens of metres across and a footstep
+ * cannot disagree with the one before it. 34 m is about the width of a city
+ * block, which is the scale at which ground cover actually changes.
+ */
+const PATCH_CELL = 34;
+
+/**
+ * Fraction of open ground that reads as bare gravel rather than scrub.
+ *
+ * Bilinear value noise is centre-weighted, so this is not the gravel fraction:
+ * measured over the outskirts, 0.6 gives about a fifth of the open ground as
+ * gravel, in patches, which is the mix the terrain mesh now draws.
+ */
+const GRAVEL_THRESHOLD = 0.6;
+
+/**
+ * Smooth 2D value noise in [0, 1) on a `PATCH_CELL` lattice.
+ *
+ * Deliberately not a gradient noise: the only thing asked of it is that
+ * neighbouring metres agree, and one hash per lattice corner is the cheapest
+ * thing that does.
+ */
+function patchField(x: number, z: number): number {
+  const gx = x / PATCH_CELL;
+  const gz = z / PATCH_CELL;
+  const x0 = Math.floor(gx);
+  const z0 = Math.floor(gz);
+  const fx = gx - x0;
+  const fz = gz - z0;
+  const u = fx * fx * (3 - 2 * fx);
+  const v = fz * fz * (3 - 2 * fz);
+  const a = hash2(x0, z0, 7);
+  const b = hash2(x0 + 1, z0, 7);
+  const c = hash2(x0, z0 + 1, 7);
+  const d = hash2(x0 + 1, z0 + 1, 7);
+  return (a * (1 - u) + b * u) * (1 - v) + (c * (1 - u) + d * u) * v;
+}
+
+/**
+ * Ground cover outside the city, the airport and the beach.
+ *
+ * Exported because `Environment.buildTerrain` picks the material for each
+ * terrain quad from it. That is the whole point: the mesh and the sampler read
+ * one function, so the gravel the player hears is the gravel they can see.
+ */
+export function openGroundSurface(x: number, z: number): SurfaceId {
+  return patchField(x, z) > GRAVEL_THRESHOLD ? 'gravel' : 'grass';
+}
+
+/**
+ * How far inland the beach reaches, measured from the waterline.
+ *
+ * Matched to the sand the terrain mesh draws. It used to be 9 m against the
+ * mesh's 18, so the outer half of every beach in Meridian Bay looked like sand
+ * and sounded like grass.
+ */
+export const BEACH_WIDTH = 18;
 
 const CELL = 24;
 
@@ -164,8 +255,21 @@ export class CityGround {
   }
 
   /** True where a building stands, i.e. where the player cannot walk outdoors. */
+  /**
+   * True where the player is under a roof.
+   *
+   * Parcels answer for the city. The terminal is not a parcel - it is authored
+   * by the airport rather than subdivided out of a block - so it has to be
+   * asked for separately, or standing in the middle of a 62 by 190 metre
+   * building reads as being outdoors. That is not cosmetic: `indoors` is what
+   * switches the interior ambience bed on and ducks the street and the sea.
+   *
+   * The margin has the same sense it does for a parcel: negative to shrink,
+   * which is how callers ask "well inside" rather than "touching the wall".
+   */
   isBuilt(x: number, z: number, margin = 0): boolean {
-    return this.parcelAt(x, z, margin) !== null;
+    if (this.parcelAt(x, z, margin) !== null) return true;
+    return inRect(TERMINAL, x, z, margin);
   }
 
   /**
@@ -200,6 +304,24 @@ export class CityGround {
       };
     }
 
+    /*
+     * Meridian Bay Regional.
+     *
+     * Resolved after the street corridors, because the landside roads are
+     * ordinary streets and win on their own carriageway, and BEFORE the block
+     * lookup, because the airfield is a block only so `districtAt` has an
+     * answer out there - `buildBlockGround` never touches it and the airport
+     * builder draws every square metre of it.
+     *
+     * The height is `landElevation`, not one kerb above it, so the apron is
+     * flush with the carriageway of the service roads that run onto it and one
+     * kerb below their footways. That is what an apron edge actually is.
+     */
+    const airport = airportSurfaceAt(x, z);
+    if (airport) {
+      return { y: landElevation(x, z), surface: airport, onRoad: false };
+    }
+
     const block = this.blockAt(x, z);
     if (block) {
       // The block interior slopes with its four corner pavements, so it meets
@@ -213,17 +335,17 @@ export class CityGround {
       if (block.kind === 'plaza') {
         return { y, surface: 'plaza', onRoad: false };
       }
-      // Courtyards and service alleys behind the buildings.
-      return { y, surface: 'gravel', onRoad: false };
+      // Courtyards, their paved alley and their two service aprons. The same
+      // table the geometry builder lays them out from - see `courtyardSurfaceAt`.
+      return { y, surface: courtyardSurfaceAt(block, x, z), onRoad: false };
     }
 
     // Outside the street grid: the waterfront, the beach and the outskirts.
     const y = groundElevation(x, z);
     if (y < SEA_LEVEL) return { y: SEA_LEVEL, surface: 'water', onRoad: false };
     const shore = shorelineX(z);
-    if (x < shore + 9) return { y, surface: 'sand', onRoad: false };
-    // Rough ground beyond the loop reads as scrub, with a little variation.
-    return { y, surface: hash2(x * 0.25, z * 0.25, 7) < 0.6 ? 'grass' : 'gravel', onRoad: false };
+    if (x < shore + BEACH_WIDTH) return { y, surface: 'sand', onRoad: false };
+    return { y, surface: openGroundSurface(x, z), onRoad: false };
   }
 
   /** Convenience wrapper for callers that only need the height. */

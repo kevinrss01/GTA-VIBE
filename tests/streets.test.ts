@@ -403,16 +403,25 @@ describe('street surfaces', () => {
       emitted +=
         Math.abs((t.bx - t.ax) * (t.cz - t.az) - (t.cx - t.ax) * (t.bz - t.az)) * 0.5;
     }
+    // The window covers the whole plan, not just the city: the airport's
+    // landside roads are ordinary streets and `groundSink` holds their surface
+    // too, so integrating over the city alone counted their triangles as
+    // surplus and read as 19 per cent of double-drawing that is not there.
+    // Two-metre steps, each worth 4 square metres, keeps it under a second.
+    const STEP = 2;
     let expected = 0;
-    for (let x = -174; x < 172; x += 1) {
-      for (let z = -166; z < 148; z += 1) {
+    for (let x = -174; x < 470; x += STEP) {
+      for (let z = -166; z < 1000; z += STEP) {
         const inCorridor = plan.streets.some((street) => {
           const along = street.axis === 'x' ? z : x;
           if (along < street.from || along > street.to) return false;
           const across = Math.abs((street.axis === 'x' ? x : z) - street.position);
           return across <= corridorHalfWidth(street);
         });
-        if (inCorridor || ground.blockAt(x, z)) expected += 1;
+        const block = ground.blockAt(x, z);
+        // The airfield is a block that `buildBlockGround` deliberately skips.
+        const inBlock = block !== null && block.kind !== 'airfield';
+        if (inCorridor || inBlock) expected += STEP * STEP;
       }
     }
     expect(emitted / expected).toBeGreaterThan(0.97);
@@ -443,6 +452,9 @@ describe('street surfaces', () => {
 
   it('lays block interiors on the block surface', () => {
     for (const block of plan.blocks) {
+      // The airfield platform is a block only so `districtAt` has an answer out
+      // there; the airport builder draws its ground, not `buildBlockGround`.
+      if (block.kind === 'airfield') continue;
       const sink = new FakeSink();
       buildBlockGround(block, plan, sink);
       expect(sink.triangleCount, `${block.id} is empty`).toBeGreaterThan(0);

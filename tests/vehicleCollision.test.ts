@@ -17,7 +17,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { CollisionWorld, type VehicleBoxSink } from '../src/player/Collision';
+import { CollisionWorld, type VehicleBoxSink, type VehicleContact } from '../src/player/Collision';
 import { BODY_HEIGHT, BODY_RADIUS } from '../src/player/FirstPersonController';
 import type { ColliderBox } from '../src/world/build/types';
 
@@ -423,5 +423,116 @@ describe('a driven car against other traffic', () => {
       z = moved.z;
     }
     expect(z).toBeLessThan(-2);
+  });
+});
+
+/**
+ * Naming what was hit.
+ *
+ * `moveBox` used to answer only "how far did you get", which is enough to stop
+ * a car and nothing like enough to push the one it ran into. The optional
+ * contact record is what closes that: additive, so every call above still gets
+ * the same `{x, z, feetY}` it always did.
+ */
+describe('reporting the car that refused a move', () => {
+  const fresh = (): VehicleContact => ({ id: -1, x: 0, y: 0, z: 0 });
+
+  it('names the vehicle and where on it the contact was', () => {
+    const world = new CollisionWorld([]);
+    world.setVehicleSource(fleet([{ id: 2, x: 0, z: 0, yaw: 0 }]));
+    world.refreshVehicles(0, 12, 30, 1);
+
+    const contact = fresh();
+    let x = 0;
+    let z = 12;
+    for (let i = 0; i < 300; i += 1) {
+      const moved = world.moveBox(
+        x,
+        z,
+        0,
+        0,
+        -0.05,
+        CAR.halfLength,
+        CAR.halfWidth,
+        0,
+        1.4,
+        true,
+        contact,
+      );
+      x = moved.x;
+      z = moved.z;
+    }
+    expect(contact.id).toBe(2);
+    // The struck car's tail is at z = 2.25, on its centreline.
+    expect(contact.z).toBeCloseTo(CAR.halfLength, 3);
+    expect(contact.x).toBeCloseTo(0, 3);
+    // Bumper height: the middle of the span the two bodies share.
+    expect(contact.y).toBeGreaterThan(0);
+    expect(contact.y).toBeLessThan(1.4);
+  });
+
+  it('puts the contact on the corner when the corner is what was hit', () => {
+    const world = new CollisionWorld([]);
+    world.setVehicleSource(fleet([{ id: 5, x: 0, z: 0, yaw: 0 }]));
+    world.refreshVehicles(0, 12, 30, 1);
+
+    const contact = fresh();
+    // Closing on the off-side rear corner rather than square on the tail.
+    let x = 1.6;
+    let z = 12;
+    for (let i = 0; i < 300; i += 1) {
+      const moved = world.moveBox(
+        x,
+        z,
+        0,
+        0,
+        -0.05,
+        CAR.halfLength,
+        CAR.halfWidth,
+        0,
+        1.4,
+        true,
+        contact,
+      );
+      x = moved.x;
+      z = moved.z;
+    }
+    expect(contact.id).toBe(5);
+    // Off the struck car's centreline, which is what turns a shunt into a spin.
+    expect(contact.x).toBeGreaterThan(0.3);
+    expect(contact.x).toBeLessThanOrEqual(CAR.halfWidth + 1e-6);
+  });
+
+  it('reports nothing when the world refused the move, or nothing did', () => {
+    const world = new CollisionWorld([box(-40, 0, 40, 4)]);
+    world.setVehicleSource(fleet([{ id: 9, x: 30, z: 30, yaw: 0 }]));
+    world.refreshVehicles(0, 10, 30);
+
+    const contact = fresh();
+    let z = 10;
+    for (let i = 0; i < 200; i += 1) {
+      const moved = world.moveBox(
+        0,
+        z,
+        0,
+        0,
+        -0.05,
+        CAR.halfLength,
+        CAR.halfWidth,
+        0,
+        1.4,
+        true,
+        contact,
+      );
+      z = moved.z;
+    }
+    // Stopped by the building, so there is no vehicle to push.
+    expect(z).toBeGreaterThan(4 + CAR.halfLength - 0.06);
+    expect(contact.id).toBe(-1);
+
+    // And an unobstructed move leaves the record clear as well.
+    const open = new CollisionWorld([]);
+    open.moveBox(0, 0, 0, 0, -0.05, CAR.halfLength, CAR.halfWidth, 0, 1.4, true, contact);
+    expect(contact.id).toBe(-1);
   });
 });

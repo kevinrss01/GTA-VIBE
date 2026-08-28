@@ -35,15 +35,22 @@ import { formatMoney } from '../player/money';
 import type { PlayerState } from '../player/PlayerState';
 import { CAST } from '../story';
 import {
+  AIRBORNE_HEIGHT,
+  ARRIVAL_RADIUS,
+  CHARTER_FEE,
   CLUB_STREET_TOKEN,
   CONVERSATIONS,
+  DROP_POINT,
+  DROP_RADIUS,
   MISSION_FEE,
   MISSION_NAME,
   OBJECTIVES,
+  SHUTDOWN_SPEED,
   TIP_OFF_HEAT,
   type MissionStage,
   type Objective,
 } from './script';
+import { APRON, RUNWAY, STANDS, TERMINAL, inRect } from '../world/airport/layout';
 
 /** Enough of `Dialogue` for the director to drive it, and to fake in a test. */
 export interface DialoguePlayer {
@@ -79,6 +86,28 @@ export interface MissionOptions {
   readonly onCrateTaken?: (() => void) | undefined;
 }
 
+/**
+ * What the world looks like this frame, as far as the job cares.
+ *
+ * Optional in `update` so the three-quarters of the mission that happen on
+ * foot in the city still run in a test that knows nothing about aircraft -
+ * which is what `tests/mission.test.ts` has always done.
+ */
+export interface MissionContext {
+  readonly x: number;
+  readonly y: number;
+  readonly z: number;
+  /** Null unless the player is actually in an aircraft. */
+  readonly flight?:
+    | {
+        /** Height above the airfield surface, in metres. */
+        readonly altitude: number;
+        readonly speed: number;
+        readonly onGround: boolean;
+      }
+    | undefined;
+}
+
 /** Seconds the completion banner stays up. */
 const BANNER_SECONDS = 5;
 
@@ -92,6 +121,12 @@ const REWIND: Readonly<Partial<Record<MissionStage, MissionStage>>> = {
   briefing: 'offered',
   handover: 'collect',
   payout: 'deliver',
+  // The charter briefing is offered by standing at the bar, so it rewinds the
+  // same way. `handoff` and `shutdown` are radio calls with nobody to walk
+  // back to, so they rewind to the flying stage that triggers them again.
+  briefingFlight: 'chartered',
+  handoff: 'outbound',
+  shutdown: 'inbound',
 };
 
 export interface MissionSnapshot {
@@ -156,6 +191,7 @@ export class MissionDirector {
     if (id === this.barId) {
       if (this.stageValue === 'offered') return `Press E to speak to ${CAST.sable.shortName}`;
       if (this.stageValue === 'deliver') return `Press E to hand over the takings`;
+      if (this.stageValue === 'chartered') return `Press E to hear ${CAST.sable.shortName} out`;
       // Paid, and there is nothing more to say. Promising a conversation that
       // `activate` will not start is worse than promising nothing.
       return '';
@@ -184,12 +220,17 @@ export class MissionDirector {
       }
       if (this.stageValue === 'deliver') {
         this.enter('payout');
-        this.options.dialogue.say(CONVERSATIONS.payout, () => this.finish());
+        this.options.dialogue.say(CONVERSATIONS.payout, () => this.payDelivery());
         return true;
       }
-      // `payout` is claimed so a second press mid-payment does nothing; once
-      // it is `complete` the bar is an ordinary piece of scenery again.
-      return this.stageValue === 'payout';
+      if (this.stageValue === 'chartered') {
+        this.enter('briefingFlight');
+        this.options.dialogue.say(CONVERSATIONS.charter, () => this.enter('toAirport'));
+        return true;
+      }
+      // The talking stages are claimed so a second press mid-sentence does
+      // nothing; once it is `complete` the bar is scenery again.
+      return this.stageValue === 'payout' || this.stageValue === 'briefingFlight';
     }
 
     if (id === this.crateId) {
@@ -243,11 +284,70 @@ export class MissionDirector {
     if (back) this.enter(back);
   }
 
-  update(dt: number): void {
+  update(dt: number, ctx?: MissionContext): void {
     if (this.disposed) return;
     if (this.bannerLeft > 0) {
       this.bannerLeft = Math.max(0, this.bannerLeft - dt);
       if (this.bannerLeft === 0) this.options.onBanner?.(null, '');
+    }
+    if (ctx) this.advanceFlight(ctx);
+  }
+
+  /**
+   * The half of the job that is measured rather than pressed.
+   *
+   * Everything before the airport happens because the player walked up to
+   * somebody and pressed E. From here on the stages advance on WHERE the
+   * player is and WHAT they are flying, so this runs once a frame and each
+   * stage owns exactly one condition. A stage never skips: reaching the drop
+   * point while still on stage `boarding` does nothing, because the only test
+   * run is the current stage's own.
+   */
+  private advanceFlight(ctx: MissionContext): void {
+    if (this.options.dialogue.speaking) return;
+    switch (this.stageValue) {
+      case 'toAirport':
+        // The landside door, not the building: the terminal is 190 m long and
+        // arriving anywhere along its back wall is not arriving.
+        if (near(ctx.x, ctx.z, TERMINAL.minX - 6, mid(TERMINAL.minZ, TERMINAL.maxZ), ARRIVAL_RADIUS)) {
+          this.enter('concourse');
+        }
+        break;
+      case 'concourse':
+        // Out the other side and onto the apron. Crossing the terminal is the
+        // point, so this asks for airside, not for a door.
+        if (inRect(APRON, ctx.x, ctx.z, 8)) this.enter('boarding');
+        break;
+      case 'boarding':
+        if (ctx.flight) this.enter('departing');
+        break;
+      case 'departing':
+        if (ctx.flight && !ctx.flight.onGround && ctx.flight.altitude >= AIRBORNE_HEIGHT) {
+          this.enter('outbound');
+        }
+        break;
+      case 'outbound':
+        if (near(ctx.x, ctx.z, DROP_POINT.x, DROP_POINT.z, DROP_RADIUS)) {
+          this.enter('handoff');
+          this.options.dialogue.say(CONVERSATIONS.handoff, () => this.enter('inbound'));
+        }
+        break;
+      case 'inbound':
+        // Down, stopped, and actually on the field - not stopped in a street
+        // somewhere having given up. `onGround` alone would also be true a
+        // metre after a wheels-up arrival in a car park.
+        if (
+          ctx.flight &&
+          ctx.flight.onGround &&
+          ctx.flight.speed <= SHUTDOWN_SPEED &&
+          onAirfield(ctx.x, ctx.z)
+        ) {
+          this.enter('shutdown');
+          this.options.dialogue.say(CONVERSATIONS.landed, () => this.payCharter());
+        }
+        break;
+      default:
+        break;
     }
   }
 
@@ -311,18 +411,41 @@ export class MissionDirector {
     return this.options.plan.streets.find((street) => street.id === id)?.name ?? null;
   }
 
-  private finish(): void {
+  /**
+   * The delivery fee, at the bar.
+   *
+   * The box does NOT leave the player here, and that is the whole hinge of the
+   * second half: Sable pays for the run across town and then says the takings
+   * cannot stay in the city. `carrying` stays true until the aircraft reaches
+   * the drop point.
+   */
+  private payDelivery(): void {
     if (this.disposed) return;
-    this.carryingValue = false;
     this.paidValue = MISSION_FEE;
     this.options.player.earn(MISSION_FEE);
-    // The heat was somebody else's phone call, and the job is over.
+    // The heat was somebody else's phone call, and that part is over.
     this.options.player.clearHeat();
-    this.enter('complete');
+    this.enter('chartered');
     this.options.onPaid?.(MISSION_FEE);
     this.options.onBanner?.(
-      `${MISSION_NAME} — paid`,
+      `${MISSION_NAME} — the run`,
       `${formatMoney(MISSION_FEE)} from ${CAST.sable.name}`,
+    );
+    this.bannerLeft = BANNER_SECONDS;
+  }
+
+  /** The charter fee, on the ground back at the field. The job is over here. */
+  private payCharter(): void {
+    if (this.disposed) return;
+    this.carryingValue = false;
+    this.paidValue = MISSION_FEE + CHARTER_FEE;
+    this.options.player.earn(CHARTER_FEE);
+    this.options.player.clearHeat();
+    this.enter('complete');
+    this.options.onPaid?.(CHARTER_FEE);
+    this.options.onBanner?.(
+      `${MISSION_NAME} — paid`,
+      `${formatMoney(CHARTER_FEE)} from ${CAST.sable.name}`,
     );
     this.bannerLeft = BANNER_SECONDS;
   }
@@ -330,14 +453,69 @@ export class MissionDirector {
   private waypointFor(stage: MissionStage): Waypoint | null {
     const kind = OBJECTIVES[stage].waypoint;
     if (!kind) return null;
-    const parcel = kind === 'nightclub' ? this.club : this.lockup;
-    if (!parcel) return null;
-    return {
-      x: (parcel.rect.minX + parcel.rect.maxX) * 0.5,
-      z: (parcel.rect.minZ + parcel.rect.maxZ) * 0.5,
-      label: kind === 'nightclub' ? 'The Vibe' : 'Lock-up',
-    };
+    // The two city buildings are wherever the generator put them, so they are
+    // asked for by interior kind. The airport is surveyed infrastructure at
+    // fixed coordinates, so it is read straight out of the layout.
+    if (kind === 'nightclub' || kind === 'workshop') {
+      const parcel = kind === 'nightclub' ? this.club : this.lockup;
+      if (!parcel) return null;
+      return {
+        x: (parcel.rect.minX + parcel.rect.maxX) * 0.5,
+        z: (parcel.rect.minZ + parcel.rect.maxZ) * 0.5,
+        label: kind === 'nightclub' ? 'The Vibe' : 'Lock-up',
+      };
+    }
+    switch (kind) {
+      case 'terminalDoor':
+        return { x: TERMINAL.minX - 6, z: mid(TERMINAL.minZ, TERMINAL.maxZ), label: 'Terminal' };
+      case 'gateDoor':
+        return { x: TERMINAL.maxX + 4, z: mid(TERMINAL.minZ, TERMINAL.maxZ), label: 'Gates' };
+      case 'stand': {
+        // Stand four is the light stand, which is the one an aircraft Sable
+        // could plausibly own is parked on. Falls back to the first stand so a
+        // change to the apron layout cannot strand the job.
+        const stand = STANDS.find((s) => s.id === 'stand-4') ?? STANDS[0];
+        return stand ? { x: stand.x, z: stand.z, label: 'Stand 4' } : null;
+      }
+      case 'runway':
+        return {
+          x: RUNWAY.centreX,
+          z: mid(RUNWAY.northZ, RUNWAY.southZ),
+          label: 'Runway 18/36',
+        };
+      case 'dropPoint':
+        return { x: DROP_POINT.x, z: DROP_POINT.z, label: 'Drop point' };
+      default:
+        return null;
+    }
   }
+}
+
+function mid(a: number, b: number): number {
+  return (a + b) * 0.5;
+}
+
+function near(x: number, z: number, tx: number, tz: number, radius: number): boolean {
+  const dx = x - tx;
+  const dz = z - tz;
+  return dx * dx + dz * dz <= radius * radius;
+}
+
+/**
+ * On the field, loosely.
+ *
+ * The runway, the taxiway and the apron with a generous margin, because a
+ * light aircraft that rolls off the edge of the tarmac onto the grass beside
+ * the runway has still landed at Meridian Bay Regional, and refusing to pay
+ * for that would be pedantry rather than difficulty.
+ */
+function onAirfield(x: number, z: number): boolean {
+  return (
+    inRect(APRON, x, z, 40) ||
+    (Math.abs(x - RUNWAY.centreX) <= RUNWAY.halfWidth + 60 &&
+      z >= RUNWAY.northZ - RUNWAY.overrun &&
+      z <= RUNWAY.southZ + RUNWAY.overrun)
+  );
 }
 
 function findInterior(plan: CityPlan, kind: InteriorKind): Parcel | null {

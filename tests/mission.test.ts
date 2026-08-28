@@ -15,15 +15,19 @@ import { describe, expect, it } from 'vitest';
 
 import { getCityPlan } from '../src/world/CityPlan';
 import { PlayerState, STARTING_MONEY } from '../src/player/PlayerState';
-import { MissionDirector, type DialoguePlayer } from '../src/mission/Mission';
+import { MissionDirector, type DialoguePlayer, type MissionContext } from '../src/mission/Mission';
 import {
+  CHARTER_FEE,
   CLUB_STREET_TOKEN,
   CONVERSATIONS,
+  DROP_POINT,
   MISSION_FEE,
   OBJECTIVES,
   TIP_OFF_HEAT,
   type MissionStage,
 } from '../src/mission/script';
+import { AIRFIELD_LEVEL, APRON, RUNWAY, TERMINAL } from '../src/world/airport/layout';
+import { SEA_LEVEL, groundElevation } from '../src/world/elevation';
 import {
   interiorFurnishings,
   lockupCrateAt,
@@ -271,9 +275,10 @@ describe('Last Call', () => {
     h.dialogue.finish();
     h.mission.activate(h.barId);
     h.dialogue.finish();
-    expect(h.mission.stage).toBe('complete');
-    expect(h.mission.carrying).toBe(false);
-    // Paid, and the crate stays gone.
+    expect(h.mission.stage).toBe('chartered');
+    // The box is still being carried - it leaves on the aircraft, not at the
+    // bar - and the crate on the bench stays gone either way.
+    expect(h.mission.carrying).toBe(true);
     expect(h.taken.count).toBe(1);
   });
 
@@ -308,12 +313,16 @@ describe('Last Call', () => {
     expect(h.dialogue.spoken[2]).toEqual(CONVERSATIONS.payout.map((b) => b.line));
     h.dialogue.finish();
 
-    expect(h.mission.stage).toBe('complete');
-    expect(h.mission.carrying).toBe(false);
+    // Paid for the run across town - and NOT finished. Sable's next line is
+    // that the takings cannot stay in the city, so the box stays with the
+    // player and the job carries on out to the airport. The flight half is
+    // covered in 'the airport leg' below.
+    expect(h.mission.stage).toBe('chartered');
+    expect(h.mission.carrying).toBe(true);
     expect(h.player.money).toBe(STARTING_MONEY + MISSION_FEE);
-    // The heat was somebody else's phone call and the job is over.
+    // The heat was somebody else's phone call, and that part is over.
     expect(h.player.wanted).toBe(0);
-    expect(h.waypoints.at(-1)).toBeNull();
+    expect(h.waypoints.at(-1)).toBe('The Vibe');
 
     expect(h.objectives).toEqual([
       'offered',
@@ -322,7 +331,7 @@ describe('Last Call', () => {
       'handover',
       'deliver',
       'payout',
-      'complete',
+      'chartered',
     ]);
   });
 
@@ -340,8 +349,12 @@ describe('Last Call', () => {
       h.mission.activate(h.barId);
       h.dialogue.finish();
     }
+    // The delivery fee is paid exactly once however many times the player
+    // walks back. The bar has one more thing to say - the charter - so the
+    // fourth conversation is expected; a fifth would mean it repeats.
     expect(h.player.money).toBe(paid);
-    expect(h.dialogue.spoken).toHaveLength(3);
+    expect(h.dialogue.spoken).toHaveLength(4);
+    expect(h.dialogue.spoken[3]).toEqual(CONVERSATIONS.charter.map((b) => b.line));
   });
 
   it('says nothing while somebody is already speaking', () => {
@@ -472,7 +485,11 @@ describe('Last Call', () => {
     h.dialogue.finish();
     h.mission.activate(h.barId);
     h.dialogue.finish();
-    expect(h.mission.stage).toBe('complete');
+    // The charter is the last thing the bar has to say. Hear it, and the bar
+    // is scenery again.
+    h.mission.activate(h.barId);
+    h.dialogue.finish();
+    expect(h.mission.stage).toBe('toAirport');
 
     // Promising "Press E to speak to Sable" and then doing nothing when the
     // player presses it is worse than promising nothing.
@@ -485,5 +502,196 @@ describe('Last Call', () => {
     // free: one job buys the SMG and a magazine, and not much more.
     expect(MISSION_FEE).toBeGreaterThan(2000);
     expect(MISSION_FEE).toBeLessThan(STARTING_MONEY);
+  });
+});
+
+/*
+ * The airport leg.
+ *
+ * The first half of the job is pressed - walk up to somebody, press E. From
+ * the charter onwards it is MEASURED: the stages advance on where the player
+ * is and what they are flying, so these tests drive `update` with a position
+ * and a flight state rather than activating interaction points. That is the
+ * whole reason the second half can be tested at all without a renderer.
+ */
+describe('the airport leg', () => {
+  /** Plays the city half of the job and leaves the player paid, at the bar. */
+  function throughTheCity(h: Harness): void {
+    h.mission.activate(h.barId);
+    h.dialogue.finish(); // briefing -> collect
+    h.mission.activate(h.crateId);
+    h.dialogue.finish(); // handover -> deliver
+    h.mission.activate(h.barId);
+    h.dialogue.finish(); // payout -> chartered
+  }
+
+  function at(x: number, z: number, flight?: MissionContext['flight']): MissionContext {
+    return flight ? { x, y: AIRFIELD_LEVEL, z, flight } : { x, y: 2, z };
+  }
+
+  it('pays the delivery fee but does not end the job', () => {
+    const h = harness();
+    throughTheCity(h);
+    expect(h.mission.stage).toBe('chartered');
+    expect(h.player.money).toBe(STARTING_MONEY + MISSION_FEE);
+    // The box has NOT been handed over. That is the hinge of the second half.
+    expect(h.mission.carrying).toBe(true);
+  });
+
+  it('offers the charter at the bar, and only once it has been paid for the run', () => {
+    const h = harness();
+    expect(h.mission.promptFor(h.barId)).not.toContain('hear');
+    throughTheCity(h);
+    expect(h.mission.promptFor(h.barId)).toContain('hear');
+    h.mission.activate(h.barId);
+    expect(h.mission.stage).toBe('briefingFlight');
+    expect(h.dialogue.spoken.at(-1)).toEqual(CONVERSATIONS.charter.map((b) => b.line));
+    h.dialogue.finish();
+    expect(h.mission.stage).toBe('toAirport');
+  });
+
+  it('walks the player through the terminal, onto the apron and into the air', () => {
+    const h = harness();
+    throughTheCity(h);
+    h.mission.activate(h.barId);
+    h.dialogue.finish();
+
+    // Standing in the city does nothing.
+    h.mission.update(0.1, at(0, 0));
+    expect(h.mission.stage).toBe('toAirport');
+
+    // The landside door.
+    h.mission.update(0.1, at(TERMINAL.minX - 6, (TERMINAL.minZ + TERMINAL.maxZ) / 2));
+    expect(h.mission.stage).toBe('concourse');
+
+    // Airside, on the apron.
+    h.mission.update(0.1, at((APRON.minX + APRON.maxX) / 2, (APRON.minZ + APRON.maxZ) / 2));
+    expect(h.mission.stage).toBe('boarding');
+
+    // In an aircraft, still on the ground.
+    h.mission.update(0.1, at(240, 520, { altitude: 0, speed: 0, onGround: true }));
+    expect(h.mission.stage).toBe('departing');
+
+    // Rolling is not flying.
+    h.mission.update(0.1, at(RUNWAY.centreX, 500, { altitude: 2, speed: 30, onGround: true }));
+    expect(h.mission.stage).toBe('departing');
+
+    // Airborne.
+    h.mission.update(0.1, at(RUNWAY.centreX, 400, { altitude: 80, speed: 55, onGround: false }));
+    expect(h.mission.stage).toBe('outbound');
+  });
+
+  it('does not skip a stage when the player is already where a later one wants them', () => {
+    const h = harness();
+    throughTheCity(h);
+    h.mission.activate(h.barId);
+    h.dialogue.finish();
+    // Flying over the drop point while still being asked to reach the airport
+    // must do nothing at all: only the current stage's own condition is run.
+    h.mission.update(0.1, at(DROP_POINT.x, DROP_POINT.z, { altitude: 200, speed: 60, onGround: false }));
+    expect(h.mission.stage).toBe('toAirport');
+  });
+
+  it('hands the box off over the bay and sends the player home', () => {
+    const h = airborne();
+    h.mission.update(0.1, at(DROP_POINT.x, DROP_POINT.z, { altitude: 150, speed: 55, onGround: false }));
+    expect(h.mission.stage).toBe('handoff');
+    expect(h.dialogue.spoken.at(-1)).toEqual(CONVERSATIONS.handoff.map((b) => b.line));
+    h.dialogue.finish();
+    expect(h.mission.stage).toBe('inbound');
+  });
+
+  it('pays the charter only when the aircraft is down, stopped and on the field', () => {
+    const h = airborne();
+    h.mission.update(0.1, at(DROP_POINT.x, DROP_POINT.z, { altitude: 150, speed: 55, onGround: false }));
+    h.dialogue.finish();
+    const paidForTheRun = h.player.money;
+
+    // Still flying over the field.
+    h.mission.update(0.1, at(RUNWAY.centreX, 500, { altitude: 90, speed: 55, onGround: false }));
+    expect(h.mission.stage).toBe('inbound');
+    // Down but still rolling fast.
+    h.mission.update(0.1, at(RUNWAY.centreX, 500, { altitude: 0, speed: 40, onGround: true }));
+    expect(h.mission.stage).toBe('inbound');
+    // Stopped, but in a street in the city rather than at the airport.
+    h.mission.update(0.1, at(0, 0, { altitude: 0, speed: 0, onGround: true }));
+    expect(h.mission.stage).toBe('inbound');
+    expect(h.player.money).toBe(paidForTheRun);
+
+    // Down, stopped, on the runway.
+    h.mission.update(0.1, at(RUNWAY.centreX, 500, { altitude: 0, speed: 0, onGround: true }));
+    expect(h.mission.stage).toBe('shutdown');
+    h.dialogue.finish();
+    expect(h.mission.stage).toBe('complete');
+    expect(h.player.money).toBe(STARTING_MONEY + MISSION_FEE + CHARTER_FEE);
+    // The box is gone: it left on the aircraft.
+    expect(h.mission.carrying).toBe(false);
+  });
+
+  it('points the waypoint at a real place at every stage of the flight', () => {
+    const h = airborne();
+    // Every airport waypoint must resolve to somewhere inside the world, not
+    // to null - a stage that points nowhere is a stage the player cannot find.
+    const seen = h.waypoints.filter((label): label is string => label !== null);
+    expect(seen).toEqual(
+      expect.arrayContaining(['The Vibe', 'Lock-up', 'Terminal', 'Gates', 'Stand 4', 'Runway 18/36']),
+    );
+  });
+
+  it('rewinds a radio call the player died during, instead of paying for it', () => {
+    const h = airborne();
+    h.mission.update(0.1, at(DROP_POINT.x, DROP_POINT.z, { altitude: 150, speed: 55, onGround: false }));
+    h.dialogue.finish();
+    const before = h.player.money;
+    // Shot down while Sable is talking them onto the ground.
+    h.mission.update(0.1, at(RUNWAY.centreX, 500, { altitude: 0, speed: 0, onGround: true }));
+    expect(h.mission.stage).toBe('shutdown');
+    h.dialogue.cut();
+    h.mission.interrupt();
+    expect(h.mission.stage).toBe('inbound');
+    expect(h.player.money).toBe(before);
+    // And it can be finished properly afterwards.
+    h.mission.update(0.1, at(RUNWAY.centreX, 500, { altitude: 0, speed: 0, onGround: true }));
+    h.dialogue.finish();
+    expect(h.mission.stage).toBe('complete');
+    expect(h.player.money).toBe(before + CHARTER_FEE);
+  });
+
+  it('holds still while somebody is talking', () => {
+    const h = harness();
+    throughTheCity(h);
+    h.mission.activate(h.barId);
+    // Mid-briefing. Being at the airport already must not jump the stage.
+    expect(h.dialogue.speaking).toBe(true);
+    h.mission.update(0.1, at(TERMINAL.minX - 6, (TERMINAL.minZ + TERMINAL.maxZ) / 2));
+    expect(h.mission.stage).toBe('briefingFlight');
+  });
+
+  /** Plays the job as far as "airborne, on the way to the drop point". */
+  function airborne(): Harness {
+    const h = harness();
+    throughTheCity(h);
+    h.mission.activate(h.barId);
+    h.dialogue.finish();
+    h.mission.update(0.1, at(TERMINAL.minX - 6, (TERMINAL.minZ + TERMINAL.maxZ) / 2));
+    h.mission.update(0.1, at((APRON.minX + APRON.maxX) / 2, (APRON.minZ + APRON.maxZ) / 2));
+    h.mission.update(0.1, at(240, 520, { altitude: 0, speed: 0, onGround: true }));
+    h.mission.update(0.1, at(RUNWAY.centreX, 400, { altitude: 80, speed: 55, onGround: false }));
+    expect(h.mission.stage).toBe('outbound');
+    return h;
+  }
+});
+
+describe('the drop point', () => {
+  it('is out over the water, not on land', () => {
+    // A hand-off in the middle of a street would be a hand-off the player
+    // could drive to. It has to be somewhere only an aircraft reaches.
+    expect(groundElevation(DROP_POINT.x, DROP_POINT.z)).toBeLessThan(SEA_LEVEL);
+  });
+
+  it('is far enough from the runway to be a flight and near enough to be a short one', () => {
+    const gap = Math.hypot(DROP_POINT.x - RUNWAY.centreX, DROP_POINT.z - (RUNWAY.northZ + RUNWAY.southZ) / 2);
+    expect(gap).toBeGreaterThan(400);
+    expect(gap).toBeLessThan(1200);
   });
 });
