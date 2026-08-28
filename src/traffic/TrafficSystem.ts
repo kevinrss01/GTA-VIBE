@@ -291,6 +291,13 @@ export class TrafficSystem {
     // a car any more whatever state it is in.
     if (vehicle.control !== 'ambient' && vehicle.control !== 'parked') return null;
     if (vehicle.integrity <= 0 || vehicle.view.overturned) return null;
+    // NOR ONE THAT IS IN THE AIR. A blast can leave a parked car mid-arc, and
+    // the door of a car a metre off the road is not a door anybody can open.
+    // Refusing is also the only answer that keeps the arc continuous: taking
+    // control mid-flight would hand the body to a driving model that starts
+    // from the ground, and the car would snap down out of its own trajectory.
+    // It lasts as long as the hop does, which is under a second.
+    if (vehicle.hop > 0 || vehicle.hopRate > 0) return null;
     return this.makeHandle(vehicle);
   }
 

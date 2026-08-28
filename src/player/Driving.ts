@@ -270,7 +270,7 @@ export class Driving {
   candidateAt(x: number, z: number): { id: number; kind: string } | null {
     if (this.handle) return null;
     const view = this.options.traffic.nearestVehicle(x, z, ENTER_RADIUS);
-    if (!view || view.destroyed || view.overturned) return null;
+    if (!view || view.destroyed || view.overturned || view.airborne) return null;
     return { id: view.id, kind: view.kind };
   }
 

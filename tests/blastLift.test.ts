@@ -400,6 +400,32 @@ describe('a blast reaches the car the player is sitting in', () => {
     expect(sim.takeImpulse(car.id)).toBeNull();
   });
 
+  it('refuses to hand an airborne car back to a driver', () => {
+    /*
+     * The fourth Greptile finding, and the mirror of the one above: the exit
+     * path preserved the arc, and re-entry threw it away again, snapping a
+     * visibly airborne car down onto the road.
+     *
+     * Refusing is the answer rather than adopting the arc on entry, because the
+     * driving model is kinematic and starts from the ground; there is no honest
+     * way for it to continue somebody else's trajectory, and the door of a car
+     * a metre in the air is not a door anybody can open. It lasts under a
+     * second.
+     */
+    const { sim, laneId } = makeSim();
+    const car = seed(sim, laneId, 60);
+    sim.park(car);
+    car.hop = 0.9;
+    car.hopRate = 2;
+    sim.update(1 / 120, car.x, car.z, 0);
+    expect(car.view.airborne, 'the view has to say so').toBe(true);
+
+    // Land it, and it becomes takeable again.
+    for (let i = 0; i < 400; i += 1) sim.update(1 / 120, car.x, car.z, i / 120);
+    expect(car.hop).toBe(0);
+    expect(car.view.airborne).toBe(false);
+  });
+
   it('carries the upward velocity across a handover, not just the height', () => {
     /*
      * The second Greptile finding, and it was real: publishing only the height

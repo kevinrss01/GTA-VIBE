@@ -467,6 +467,7 @@ interface MutableView {
   smoke: number;
   fire: number;
   overturned: boolean;
+  airborne: boolean;
 }
 
 export interface Vehicle {
@@ -1228,6 +1229,7 @@ export class TrafficSim {
       smoke: 0,
       fire: 0,
       overturned: false,
+      airborne: false,
     };
     return {
       id,
@@ -3547,6 +3549,7 @@ export class TrafficSim {
     view.z = vehicle.z;
     view.yaw = vehicle.yaw;
     view.speed = vehicle.speed;
+    view.airborne = vehicle.hop > 0 || vehicle.hopRate > 0;
     // A rolled body sits on its flank or its roof, which raises the mesh off
     // its own origin and changes the vertical half-extent of the box every
     // other system tests against. The branch keeps the upright path - which is

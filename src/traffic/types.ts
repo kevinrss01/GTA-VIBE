@@ -494,6 +494,15 @@ export interface VehicleView {
    * car never rejoins traffic and is never worth taking control of.
    */
   readonly overturned: boolean;
+  /**
+   * True while a blast has the body off the ground.
+   *
+   * Sub-second and rare, but it is the difference between a prompt that offers
+   * a car the player cannot have and one that does not: `takeControl` refuses
+   * an airborne body, because taking it mid-arc would hand it to a driving
+   * model that starts from the road and snap it out of its own trajectory.
+   */
+  readonly airborne: boolean;
 }
 
 /**
