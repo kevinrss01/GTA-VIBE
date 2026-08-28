@@ -854,3 +854,59 @@ the team. Turning it off is an account-level change and was not made.
 `npm audit` reports 5 vulnerabilities (3 moderate, 1 high, 1 critical) in the
 dependency tree during install. They are pre-existing, unrelated to this pass,
 and were not touched.
+
+## The cold load, measured on the deployed site
+
+Reported as "stuck loading generated assets", and it was: **43 seconds** to reach
+the start button on a cold visit to `gta-vibe.com`.
+
+Measured from `performance.getEntriesByType('resource')` on the live site:
+
+| | before |
+| --- | --- |
+| time to the start button, cold | **43 s** |
+| requests before the start button | 107 |
+| downloaded before the start button | 21.9 MB |
+| of which GLB models | 21.4 MB across 38 files |
+
+The slowest single requests were 9 to 13 seconds each — for files of **360 to
+723 KB**. That is not bandwidth. Thirty-eight models were in flight at once over
+a handful of connections and each was queued behind the others.
+
+Three causes, all of them ours:
+
+**The blocking loads were serial.** `Promise.all([lamp, fountain, vehicles])`,
+then `await loadStreetPropModels`, then `await loadAirportModels` — three
+sequential batches, each paying the previous one's queueing tail. The comment
+above the first one already said serialising independent loads "made the slower
+of the two set the whole loading time"; two more awaits had since been added
+after it. All five groups are requested together now and awaited once.
+
+**Assets the player cannot see were downloading during the boot.** The waterfall
+before the start button contained `models/club/cash-box.glb`, six
+`models/interiors/*` pieces of café and workshop furniture, `models/shop/rifle.glb`
+and `models/aircraft/twin.glb` — a club interior, a café, a gun-shop display
+weapon and an aeroplane 600 m south. They were fire-and-forget rather than
+awaited, so they never blocked, but they competed for the same connections as
+the geometry the first frame does need, and with shader compilation. They are
+queued and released on the start click now. Every one already degrades to a
+procedural stand-in if it has not arrived, which is what makes that safe.
+
+**Nothing was cached.** Vercel's default for `public/` is
+`max-age=0, must-revalidate`, so a return visit revalidated all 107 files.
+`/models/*` and `/audio/*` now carry a week of `max-age` with a month of
+`stale-while-revalidate`. They are not content-hashed, so `immutable` would pin
+a regenerated asset forever; a week with background revalidation is the honest
+trade.
+
+Requests before the start button fell from **107 to 49** locally, with the
+deferred groups all arriving afterwards — five aircraft present, seven traveller
+characters with `missing: []`, the shop, the club and the interiors all loaded,
+and boarding at a sprint still ramping the throttle to 1.0.
+
+**What was NOT changed, and should be.** `models/street-lamp/model.glb` is
+2.18 MB for a street lamp, and `public/` is 72 MB in total against 65 MB of
+models. None of it is Draco or Meshopt compressed and none of the textures are
+KTX2. `AGENTS.md` asks for exactly that evaluation and it has not been done;
+compressing the meshes is a far larger win than anything above and is the
+obvious next piece of work.

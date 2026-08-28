@@ -211,6 +211,25 @@ async function boot(): Promise<void> {
   await nextFrame();
 
   const models = new ModelLibrary();
+  /*
+   * EVERY BLOCKING DOWNLOAD STARTS HERE, TOGETHER.
+   *
+   * These five groups are independent - a lamp, a fountain, the vehicle fleet,
+   * the street furniture and the airside equipment - and they are all needed
+   * before `sink.bake`, because baking is what folds their geometry into the
+   * chunk instancing. What is NOT allowed is waiting for one before asking for
+   * the next: measured cold against the deployed site, the street props and the
+   * airport models were awaited one after the other behind the fleet, and 38
+   * GLBs arriving in three sequential batches took **43 seconds** to reach the
+   * start button. Individual 400 KB files were spending nine and ten seconds
+   * queued, which is a connection-count problem and not a bandwidth one.
+   *
+   * `loadStreetPropModels` and `loadAirportModels` are therefore STARTED here
+   * and awaited below, after the geometry that does not depend on them is
+   * built.
+   */
+  const streetModelsPromise = loadStreetPropModels(import.meta.env.BASE_URL);
+  const airportModelsPromise = loadAirportModels(import.meta.env.BASE_URL);
   // The generated street lamp is normalised to 1 unit tall with a centre pivot;
   // ModelLibrary rescales it to a real 4.2 m and moves the origin to its base.
   // Loaded together, not one after the other: they are independent, and
@@ -232,6 +251,8 @@ async function boot(): Promise<void> {
     loadVehicleModels({ baseUrl: import.meta.env.BASE_URL, timeoutMs: 20000 }),
   ]);
 
+  const [streetModels, airportModels] = await Promise.all([streetModelsPromise, airportModelsPromise]);
+
   const propGeometry = new Map<PropKey, PropPart[]>();
   for (const key of ALL_PROP_KEYS) {
     const parts = createPropGeometry(key);
@@ -248,15 +269,9 @@ async function boot(): Promise<void> {
   // whatever downloads replaces it BEFORE the city is baked. Props therefore
   // keep their per-chunk instancing, distance culling and shadows, and a
   // failed download degrades to the authored shape rather than to nothing.
-  const streetModels = await loadStreetPropModels(import.meta.env.BASE_URL);
+  // The airside equipment takes the same route. Both were requested at the top
+  // of this block and are already in flight.
   for (const [key, parts] of streetModels.parts) propGeometry.set(key, parts as PropPart[]);
-
-  // The airside equipment takes the same route: overwrite the procedural entry
-  // before the city is baked, and it inherits per-chunk instancing, culling
-  // and shadows for nothing. The terminal's own furniture arrives with its own
-  // PBR materials and cannot go through the palette, so it comes back as a
-  // group of meshes instead - exactly what `Furnishings` does for the city.
-  const airportModels = await loadAirportModels(import.meta.env.BASE_URL);
   for (const [key, parts] of airportModels.parts) propGeometry.set(key, parts as PropPart[]);
 
   loading.setProgress(0.92, 'Baking the city');
@@ -561,7 +576,24 @@ async function boot(): Promise<void> {
     if (open) document.exitPointerLock();
     else controller.requestPointerLock();
   };
-  void shop.load();
+  /*
+   * DOWNLOADS THE PLAYER CANNOT SEE YET.
+   *
+   * The gun shop's display weapons, the aircraft on the apron, the terminal's
+   * travellers and the city's interior furnishings are all real downloads and
+   * none of them is visible from the spawn point - the shop is a walk away,
+   * the airfield is 600 m south, and an interior is behind a door. Started
+   * during the boot they competed with the geometry the first frame actually
+   * needs, and with shader compilation, for the same handful of connections.
+   *
+   * They are queued here and released on the start click instead, so the
+   * player is moving while they stream in. Every one of them already degrades
+   * to a procedural stand-in if it has not arrived, which is what makes this
+   * safe rather than merely faster.
+   */
+  const afterStart: (() => void)[] = [];
+
+  afterStart.push(() => void shop.load());
 
   /*
    * The airfield's aircraft, and the one the player can take.
@@ -578,7 +610,7 @@ async function boot(): Promise<void> {
     groundY: (x: number, z: number) => ground.sample(x, z).y,
   });
   engine.scene.add(aircraft.group);
-  void aircraft.load();
+  afterStart.push(() => void aircraft.load());
 
   const flying = new Flying({
     aircraft,
@@ -652,11 +684,11 @@ async function boot(): Promise<void> {
     quality: 'high',
   });
   engine.scene.add(terminal.group);
-  void terminal.load();
+  afterStart.push(() => void terminal.load());
 
   const furnishings = new Furnishings(plan, import.meta.env.BASE_URL);
   engine.scene.add(furnishings.group);
-  void furnishings.load();
+  afterStart.push(() => void furnishings.load());
 
   // -- law and order ---------------------------------------------------------
   const worldRays = new WorldRayIndex(sink.colliders);
@@ -1285,6 +1317,9 @@ async function boot(): Promise<void> {
   loading.setProgress(1, 'Ready');
   await loading.awaitStart();
   loading.hide();
+
+  // The queue above, released now that nothing is racing the first frame.
+  for (const start of afterStart) start();
 
   // The start click is the user gesture that lets us create the AudioContext.
   // Music stays off; only ambience and effects come up here.
