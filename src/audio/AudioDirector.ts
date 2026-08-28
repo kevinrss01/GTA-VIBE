@@ -56,13 +56,15 @@ import {
   MUSIC_ASSET_ID,
   ONE_SHOTS,
   PRELOAD_ASSET_IDS,
-  ROAD_SURFACE,
   SEA_BED,
-  STEP_SURFACES,
+  STEP_FAMILIES,
   SURFACE_AMBIENCE,
+  SURFACE_STEP_FAMILY,
+  stepFamilyForMaterial,
   type AmbienceBedId,
   type AudioAssetId,
   type OneShotId,
+  type StepFamily,
 } from './manifest';
 import { seaGain, shoreDistance, SEA_SILENT_DISTANCE } from './seaAudibility';
 import type { DistrictId } from '../world/CityPlan';
@@ -182,9 +184,62 @@ function loadVolumes(): Record<VolumeChannel, number> {
 /** Per-step variation. Enough to break the pattern, not enough to read as a bug. */
 const STEP_PITCH_JITTER = 0.06;
 const STEP_GAIN_JITTER_DB = 2;
-/** Running lands harder and faster than walking. */
-const RUN_GAIN_DB = 2.5;
-const RUN_PITCH = 1.05;
+
+/**
+ * How far the player's own footsteps sit under the rest of the effects bus.
+ *
+ * The report was that they are too loud, and they were: every step played at
+ * its full authored level, which is the level the assets are levelled to for
+ * a CLOSE recording of a shoe. What the player hears is their own feet from
+ * ear height, a metre and a half above them and behind, which is a good deal
+ * quieter than the microphone that recorded them was. 8 dB down puts them
+ * under the ambience bed instead of on top of it, and is the number the
+ * loudness test pins so it cannot creep back up.
+ */
+export const PLAYER_STEP_DB = -8;
+/**
+ * Ceiling on the step OFFSET - not on the total gain.
+ *
+ * This distinction is load-bearing and getting it wrong quietly undoes the
+ * asset rebalance. A step asset's `trimDb` is not a level, it is a per-file
+ * CORRECTION: the set is levelled to a -22 dBFS mean, and the trims that get it
+ * there run from -4.2 dB to +9.4 dB. Clamping `trimDb + offset` therefore
+ * attenuates exactly the files whose correction is largest - measured in the
+ * browser, grass would have lost 3.4 dB and boardwalk 2.6 dB while terminal and
+ * concrete lost nothing, which is the 15.5 dB loudness spread the 2026-08-27
+ * rebalance existed to remove, creeping back in through the mixer.
+ *
+ * So the ceiling applies to the offset alone - the trim, the run bonus, the
+ * foot accent and the jitter - and the asset's own correction passes through
+ * untouched. At -2 dB it is a guard rail rather than a limiter: the loudest the
+ * offset can legitimately reach is -8 + 3.5 (running) + 2 (jitter) = -2.5 dB.
+ */
+export const PLAYER_STEP_CEILING_DB = -2;
+
+/**
+ * Running lands HEAVIER, not higher.
+ *
+ * The old constants raised the pitch 5 per cent, which is what a lighter
+ * contact sounds like: exactly backwards. A running footfall carries roughly
+ * three times the body weight into the ground, which excites the lower modes
+ * of whatever it lands on - so it is louder AND lower, and the cadence (which
+ * the controller owns, through the stride length) supplies the "faster".
+ */
+const RUN_GAIN_DB = 3.5;
+const RUN_RATE = 0.94;
+
+/**
+ * Left and right, and why a walk cycle needs them.
+ *
+ * Real feet do not land in the same place or with the same weight: the trailing
+ * foot pushes off harder than the leading foot lands, and both are offset from
+ * the body's centre line. Alternating a small stereo offset and a small gain
+ * and rate offset between them is what turns two samples into a gait rather
+ * than a metronome, and it costs one `StereoPannerNode` per step.
+ */
+const STEP_PAN = 0.28;
+const STEP_FOOT_GAIN_DB = 1.1;
+const STEP_FOOT_RATE = 0.035;
 
 /**
  * Hard ceiling on the player's own footsteps sounding at once.
@@ -205,21 +260,18 @@ const RUN_PITCH = 1.05;
 const MAX_PLAYER_STEP_VOICES = 3;
 
 /**
- * How many consecutive footsteps a new surface must be reported on before the
- * sound actually changes.
+ * Where the footstep hysteresis went.
  *
- * The ground sampler resolves a surface per point, so a player walking along a
- * boundary - a kerb, the edge of an apron, a path across grass - can be given a
- * different surface on every step, which is heard as the material flickering
- * underfoot. Requiring two steps in a row costs at most one step of the old
- * material on a real crossing, which nobody notices, and removes the flicker
- * entirely.
- *
- * `onRoad` bypasses it: that flag is the world's authoritative "this is a
- * carriageway", not a sampled guess, so crossing on or off a road switches
- * immediately and correctly.
+ * There used to be a two-step hold here, plus a `GroundSample.onRoad` override
+ * that bypassed it. Both are gone, and neither was replaced in this file,
+ * because a hold counted in FOOTSTEPS cannot be prompt and stable at the same
+ * time: two steps is one step late on every genuine crossing, and one step
+ * flickers on every boundary. The controller now debounces the CONTINUOUS
+ * signal it samples 120 times a second instead - see `SURFACE_COMMIT_TIME` in
+ * `FirstPersonController` - which separates a crossing from chatter by
+ * duration and is both. This layer is a mixer again: a material arrives and
+ * the matching pair is played, with no memory and nothing to second-guess.
  */
-const SURFACE_HOLD_STEPS = 2;
 
 /**
  * The ferry terminal PA. Position mirrors the `ferry-terminal` landmark in
@@ -237,6 +289,51 @@ const HARBOUR_PA_MAX_GAP = 140;
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
+
+/**
+ * One footfall, as the caller knows it.
+ *
+ * Structurally the controller's `FootstepEvent`, so `controller.onFootstep` can
+ * be pointed straight at `audio.footstep` without either module importing the
+ * other. `material` is typed as a plain string because the collider material
+ * vocabulary belongs to the renderer, and this module deliberately imports
+ * nothing from it at runtime.
+ */
+export interface FootstepInput {
+  readonly surface: SurfaceId;
+  /** `ColliderBox.surface` under the sole, or null/absent on bare terrain. */
+  readonly material?: string | null | undefined;
+  readonly running?: boolean | undefined;
+  readonly foot?: 'left' | 'right' | undefined;
+  readonly speed?: number | undefined;
+}
+
+/**
+ * Which recording family a footfall belongs to.
+ *
+ * Exported because it is the whole of the surface decision and it is worth
+ * being able to assert it directly, table-driven, without a mocked context.
+ */
+export function footstepFamily(step: FootstepInput): StepFamily {
+  return (
+    stepFamilyForMaterial(step.material ?? undefined) ??
+    SURFACE_STEP_FAMILY[step.surface] ??
+    'pavement'
+  );
+}
+
+/** What the last footfall actually played. A QA field; see `debug`. */
+export interface FootstepReport {
+  readonly family: StepFamily;
+  readonly assetId: AudioAssetId;
+  /** What went to the gain node: the asset's own trim plus `offsetDb`. */
+  readonly gainDb: number;
+  /** The mixer's contribution alone. See `PLAYER_STEP_CEILING_DB`. */
+  readonly offsetDb: number;
+  readonly rate: number;
+  /** -1 hard left, +1 hard right. */
+  readonly pan: number;
+}
 
 export interface AudioDirectorOptions {
   /** Prefixed to every manifest path. Use for a sub-path deployment. */
@@ -415,14 +512,12 @@ export class AudioDirector implements AudioBusHost {
   private musicToken = 0;
 
   private readonly emitters = new Set<RegisteredEmitter>();
-  private readonly stepFlip = new Map<SurfaceId, number>();
+  private readonly stepFlip = new Map<StepFamily, number>();
   /** The player's own footsteps in flight; see MAX_PLAYER_STEP_VOICES. */
   private stepVoices = 0;
-  /** Surface hysteresis state; see `settleSurface`. */
-  private heldSurface: SurfaceId | null = null;
-  private pendingSurface: SurfaceId | null = null;
-  private pendingSteps = 0;
-  private heldOnRoad: boolean | null = null;
+  /** QA instrumentation; see `debug`. Two small maps, written once per step. */
+  private lastStep: FootstepReport | null = null;
+  private readonly stepCounts = new Map<StepFamily, number>();
 
   private readonly volumes: Record<VolumeChannel, number> = loadVolumes();
   private state: ListenerState | null = null;
@@ -494,6 +589,7 @@ export class AudioDirector implements AudioBusHost {
     }
 
     this.installLifecycleHook();
+    this.publishDebug();
 
     // Music is intentionally absent from PRELOAD_ASSET_IDS.
     await Promise.all(PRELOAD_ASSET_IDS.map((id) => this.load(id)));
@@ -939,77 +1035,54 @@ export class AudioDirector implements AudioBusHost {
   // -- footsteps and one-shots ---------------------------------------------
 
   /**
-   * Plays a footstep for the given surface, alternating the two variants.
+   * Plays one footfall.
    *
-   * `onRoad` is `GroundSample.onRoad`, which the world already computes and
-   * documents as being "so the footstep mixer can pick the right variant" but
-   * which nothing in audio read until now. It is the authoritative carriageway
-   * flag rather than a sampled material, so it wins outright over `surface`,
-   * and a change in it resets the hysteresis below - stepping off a kerb is a
-   * real transition and must be heard on the step that makes it.
+   * `material` is the collider's own `ColliderBox.surface`, which is the
+   * authoritative answer for a built floor, and it wins outright: a terminal
+   * slab, a hangar apron and a club floor are three different sounds even
+   * though the terrain under all three says something else. `surface` is the
+   * ground sampler's terrain classification and answers everywhere else.
    *
-   * Omitting it is legal and leaves the sampled surface in charge, which is
-   * what a caller with no ground sample (a cutscene, a test) should get.
+   * There is no third argument and no hysteresis. The caller reports what it
+   * is standing on and this plays it; see the note above where the hold used
+   * to be for why the debounce moved into the controller.
    */
-  footstep(surface: SurfaceId, running: boolean, onRoad?: boolean): void {
+  footstep(step: FootstepInput): void {
     if (this.disposed || !this.ctx) return;
     if (this.stepVoices >= MAX_PLAYER_STEP_VOICES) return;
 
-    const heard = this.settleSurface(surface, onRoad);
-    const variants = STEP_SURFACES[heard];
-    const flip = this.stepFlip.get(heard) ?? 0;
-    this.stepFlip.set(heard, flip ^ 1);
+    const family = footstepFamily(step);
+    const variants = STEP_FAMILIES[family];
+    const flip = this.stepFlip.get(family) ?? 0;
+    this.stepFlip.set(family, flip ^ 1);
     const assetId = variants[flip === 0 ? 0 : 1];
 
+    // The trailing foot pushes off harder than the leading foot lands.
+    const left = step.foot !== 'right';
+    const footGainDb = left ? 0 : -STEP_FOOT_GAIN_DB;
+    const footRate = left ? 1 : 1 - STEP_FOOT_RATE;
+    const running = step.running === true;
+
     const jitterDb = (Math.random() * 2 - 1) * STEP_GAIN_JITTER_DB;
-    const gainDb = getAudioAsset(assetId).trimDb + jitterDb + (running ? RUN_GAIN_DB : 0);
+    const offsetDb = Math.min(
+      PLAYER_STEP_CEILING_DB,
+      PLAYER_STEP_DB + footGainDb + jitterDb + (running ? RUN_GAIN_DB : 0),
+    );
+    const gainDb = getAudioAsset(assetId).trimDb + offsetDb;
     const rate =
-      (1 + (Math.random() * 2 - 1) * STEP_PITCH_JITTER) * (running ? RUN_PITCH : 1);
+      (1 + (Math.random() * 2 - 1) * STEP_PITCH_JITTER) * footRate * (running ? RUN_RATE : 1);
+    const pan = left ? -STEP_PAN : STEP_PAN;
 
-    this.playBuffered(assetId, dbToGain(gainDb), rate, true);
-  }
-
-  /**
-   * Which surface is actually heard for this step.
-   *
-   * Two rules, in order. A carriageway is a carriageway: if the world says the
-   * foot is on a road, the sound is asphalt whatever the sampler returned, and
-   * the moment `onRoad` flips the held surface is abandoned. Otherwise a new
-   * surface has to survive `SURFACE_HOLD_STEPS` consecutive footsteps before it
-   * is heard, which is what stops a boundary flickering between two materials
-   * step by step.
-   */
-  private settleSurface(surface: SurfaceId, onRoad?: boolean): SurfaceId {
-    if (onRoad !== undefined && onRoad !== this.heldOnRoad) {
-      this.heldOnRoad = onRoad;
-      this.heldSurface = onRoad ? ROAD_SURFACE : surface;
-      this.pendingSurface = null;
-      this.pendingSteps = 0;
-      return this.heldSurface;
-    }
-    if (onRoad === true) return ROAD_SURFACE;
-
-    if (this.heldSurface === null) {
-      this.heldSurface = surface;
-      return surface;
-    }
-    if (surface === this.heldSurface) {
-      this.pendingSurface = null;
-      this.pendingSteps = 0;
-      return this.heldSurface;
-    }
-
-    if (surface === this.pendingSurface) this.pendingSteps += 1;
-    else {
-      this.pendingSurface = surface;
-      this.pendingSteps = 1;
-    }
-    if (this.pendingSteps < SURFACE_HOLD_STEPS) return this.heldSurface;
-
-    this.heldSurface = surface;
-    this.pendingSurface = null;
-    this.pendingSteps = 0;
-    return surface;
+    this.lastStep = {
+      family,
+      assetId,
+      gainDb: Number(gainDb.toFixed(2)),
+      offsetDb: Number(offsetDb.toFixed(2)),
+      rate,
+      pan,
+    };
+    this.stepCounts.set(family, (this.stepCounts.get(family) ?? 0) + 1);
+    this.playBuffered(assetId, dbToGain(gainDb), rate, true, pan);
   }
 
   playOneShot(id: OneShotId): void {
@@ -1028,6 +1101,7 @@ export class AudioDirector implements AudioBusHost {
     gainValue: number,
     rate: number,
     step = false,
+    pan = 0,
   ): void {
     const ctx = this.ctx;
     const buffer = this.buffers.get(assetId);
@@ -1036,9 +1110,21 @@ export class AudioDirector implements AudioBusHost {
       return;
     }
 
+    // A stereo panner rather than a full `PannerNode`: the player's own feet
+    // are not somewhere in the world to be spatialised, they are a fixed
+    // half-metre either side of the listener, and an equal-power pan says that
+    // for one node instead of three. Falls back to a straight connection where
+    // the constructor is missing, which is what a headless mock usually is.
+    let panner: StereoPannerNode | null = null;
+    if (pan !== 0 && typeof ctx.createStereoPanner === 'function') {
+      panner = ctx.createStereoPanner();
+      panner.pan.value = pan;
+      panner.connect(this.sfxBus as GainNode);
+    }
+
     const gain = ctx.createGain();
     gain.gain.value = gainValue;
-    gain.connect(this.sfxBus as GainNode);
+    gain.connect(panner ?? (this.sfxBus as GainNode));
 
     const source = ctx.createBufferSource();
     source.buffer = buffer;
@@ -1049,8 +1135,50 @@ export class AudioDirector implements AudioBusHost {
       if (step) this.stepVoices = Math.max(0, this.stepVoices - 1);
       this.disconnect(source);
       this.disconnect(gain);
+      if (panner) this.disconnect(panner);
     };
     source.start();
+  }
+
+  /**
+   * Read-only instrumentation for automated QA, and nothing else.
+   *
+   * The point of it is that "the runway sounds like concrete" can be PROVEN
+   * from a browser rather than asserted from a screenshot: `lastFootstep` says
+   * which recording the last footfall actually played, at what level and at
+   * what pan, and `footstepsByFamily` counts them so a walk across a boundary
+   * can be checked for a family that should never have fired.
+   *
+   * Allocates, so it is for verification only and never for the frame loop.
+   * It is also published on `window.__meridianAudio` once the context is
+   * unlocked, for the same reason `main.ts` publishes `window.__meridian`.
+   */
+  get debug(): {
+    lastFootstep: FootstepReport | null;
+    footstepsByFamily: Record<string, number>;
+    stepVoices: number;
+  } {
+    return {
+      lastFootstep: this.lastStep,
+      footstepsByFamily: Object.fromEntries(this.stepCounts),
+      stepVoices: this.stepVoices,
+    };
+  }
+
+  /**
+   * Publishes `debug` on the window, so browser QA can read it without a
+   * handle on this object. Never throws, and is a no-op outside a browser.
+   */
+  private publishDebug(): void {
+    if (typeof window === 'undefined') return;
+    try {
+      Object.defineProperty(window, '__meridianAudio', {
+        configurable: true,
+        get: () => this.debug,
+      });
+    } catch {
+      /* A frozen window is not a reason to lose audio. */
+    }
   }
 
   // -- positional -----------------------------------------------------------
@@ -1269,6 +1397,15 @@ export class AudioDirector implements AudioBusHost {
       document.removeEventListener('visibilitychange', this.visibilityHandler);
     }
     this.visibilityHandler = null;
+    // The QA getter closes over `this`; leaving it on the window would keep a
+    // disposed director, its buffers and its counters alive across a teardown.
+    if (typeof window !== 'undefined') {
+      try {
+        delete (window as unknown as Record<string, unknown>)['__meridianAudio'];
+      } catch {
+        /* A non-configurable property is not a reason to fail a teardown. */
+      }
+    }
 
     for (const voice of [...this.beds.values(), ...this.dyingBeds]) {
       voice.source.onended = null;
@@ -1316,10 +1453,8 @@ export class AudioDirector implements AudioBusHost {
     this.loading.clear();
     this.stepFlip.clear();
     this.stepVoices = 0;
-    this.heldSurface = null;
-    this.pendingSurface = null;
-    this.pendingSteps = 0;
-    this.heldOnRoad = null;
+    this.stepCounts.clear();
+    this.lastStep = null;
     this.activeBed = null;
     this.seaTarget = 0;
     this.seaRequested = false;

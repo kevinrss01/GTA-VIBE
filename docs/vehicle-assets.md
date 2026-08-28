@@ -284,3 +284,130 @@ saloon, twenty of 758 rays, all of them between 5 and 17 cm off the ground.
 
 `tests/wheelArch.test.ts` asserts the geometric properties on synthetic
 bodywork; `tests/vehicleModels.test.ts` asserts them on the shipped assets.
+
+## Abandoned cars, wrecks and localized damage
+
+### A car the player gets out of stays where they left it
+
+`Driving.exit` finishes by giving the vehicle up, and what "giving it up" means
+used to be `TrafficSim.attach`: the traffic AI searched the whole lane graph
+for the nearest lane pointing roughly the way the car happened to be facing,
+wrote the car onto it, zeroed its velocity and picked it a new destination.
+Within a frame or two the pure-pursuit steering and the 1.6 m centreline snap
+had dragged the body onto that lane, rotated it to the lane's heading and
+driven it away. When no lane scored well enough — a forecourt, a car park, a
+car left at an angle — `attach` called `recycle` instead, so the car the player
+had just parked disappeared and reappeared somewhere across the city in a
+different colour.
+
+Releasing now **parks** the vehicle instead. `VehicleState` gains `'parked'`
+alongside `'ambient'`, `'player'` and `'loose'`, and `TrafficSim.park` touches
+nothing about the transform: same x, z and yaw, same resting height, pitch and
+roll, same damage. Whatever speed the car still had becomes real velocity, so
+one let go of at a roll coasts to a stop against the road rather than stopping
+dead in mid-air, and once it stops it is latched — the pose is frozen and the
+only thing that still runs is the ground contact.
+
+A parked car is published as an obstacle exactly as a wreck or a driven car is,
+so traffic queues behind it and steers around it; it collides; and it can be
+got back into. `VehicleView.control` still publishes `'loose'` for it, because
+that is the honest answer to the question `control` asks — nobody is driving —
+and it keeps every existing consumer correct. `VehicleView.state` carries the
+difference.
+
+**Lifecycle.** At most `PARKED_LIMIT` = 12 abandoned cars and wrecks are kept,
+out of a fleet of about 120. Removal is oldest-first and only beyond
+`detailDistance + 20` m — that is, strictly beyond the renderer's own render
+distance, 170 to 280 m by quality — so nothing is ever tidied away on screen.
+A player who abandons more than twelve cars inside that radius leaves nothing
+out of sight to remove, so the pool is allowed to reach `PARKED_HARD_LIMIT` =
+16 before the oldest goes regardless; that is a visible pop for a player who
+went out of their way to cause it, and it is the only thing standing between
+the pool and unbounded growth. `TrafficSystem.stats` reports `parked`,
+`wrecks`, `parkedLimit` and `parkedRemoveDistance`.
+
+### Damage is somewhere, and does something
+
+`integrity` is still the whole shell on the `VEHICLE_INTEGRITY` scale, and it
+still decides when a car is a write-off. Alongside it every hit is now recorded
+against the part of the body it landed on:
+
+| Region | Capacity | What it does |
+| --- | --- | --- |
+| front, rear, left, right | `REGION_CAPACITY` = 156 pts | front is the engine bay: power falls off past `ENGINE_SOFT` = 0.55 and is gone at 1.0 |
+| glass | `GLASS_CAPACITY` = 40 pts | glazing goes dark and opaque |
+| tyres, per corner | `TYRE_CAPACITY` = 30 pts | `TYRE_GRIP_LOSS` = 0.22 of grip each, `TYRE_PULL` = 0.055 rad of steering bias, and the wheel visibly squats |
+
+The two accounts are deliberately not a partition of each other: five carbine
+rounds (34 points apiece) concentrated on a bonnet finish the engine bay while
+the shell still has 90 of its 260 points left, which is exactly what "shot the
+engine out" should mean. The same five rounds spread over the car destroy
+nothing. `VehicleView.regions` publishes the fractions and
+`VehicleView.handling` the one rule that turns them into power, grip and pull —
+shared by the traffic AI and the player's own driving layer, so a damaged car
+drives the same whoever is in it.
+
+The public seam is unchanged in shape and widened in place:
+
+```ts
+applyImpact(vehicleId: number, hit: VehicleImpact): boolean;
+applyDamage(vehicleId: number, amount: number, x?: number, y?: number, z?: number): boolean;
+```
+
+Passing the world point the round landed on is what makes the damage local.
+Without it the points are spread evenly over the four panels, which is the
+right answer for damage that genuinely has no location and a poor one for a
+bullet.
+
+**A blast is not a bullet.** One blow costing more than `BLAST_SHARE` = 0.25 of
+the shell — the launcher's warhead is 190 points, a rifle round is 34, and
+nothing sits between them — puts every window out, shreds the tyres on the side
+it came from and wraps the panel damage around the body instead of marking one
+panel. Everything else about it already came out of the impulse.
+
+**Destruction.** Zero integrity flags the vehicle abandoned, cuts an ambient
+one loose so it coasts to a stop where it was rather than carrying on with no
+engine, and starts the fire: it smoulders for 1.2 s, burns for 14 s and then
+goes out, leaving a permanently blackened shell that smoulders away over
+another 10 s. The shell itself never leaves except through the parked
+lifecycle above.
+
+### It all stays inside one draw call
+
+Damage is instanced. How wrecked each region is travels on the instance
+(`aDamage`, `aWear`); where each vertex sits on the body travels on the vertex
+(`aSurf.zw`); their dot product is how bad it is at that fragment, and it
+drives an inward crumple of up to 9 cm along the normal, the loss of gloss and
+colour, the dark glazing and the soot. A wrecked car is the same draw an
+undamaged one is.
+
+Smoke, fire and sparks share ONE further instanced batch capped at
+`MAX_PARTICLES` = 96 billboards, emitted only within 110 m and staggered per
+vehicle so a dozen burning cars cannot starve the pool in a single frame. The
+fleet's colour-pass draw calls go from 12 to 13, and never higher.
+
+**The vertex attribute budget is the constraint that shapes all of this.**
+WebGL guarantees sixteen attribute slots and an attribute of one component
+costs the same slot as one of four; an instanced vehicle spends four on
+`instanceMatrix` before declaring anything of its own. Adding the damage
+attributes took the shell to eighteen and the driver refused the program with
+"Too many attributes" — which draws no cars at all, silently, with nothing
+failing where a test would normally look. `aPaint`, `aChan` and `aTex` are
+therefore packed into one `aMask`, and `aSurf` grew from two components to four
+to carry the body coordinates, for a total of fifteen.
+`tests/traffic.test.ts` asserts the ceiling on every batch the system adds to
+the scene.
+
+### Measured
+
+Production build, Meridian Bay promenade, 3840x2160 at pixel ratio 2, 150
+rendered frames per sample, same session and same scene:
+
+| | mean | median | p95 | draw calls | triangles |
+| --- | --- | --- | --- | --- | --- |
+| before this work | 15.62 / 15.97 ms | 15.5 / 16.0 | 17.3 / 17.8 | 374 | 7.089 M |
+| after, clean city | 14.97 ms | 14.7 | 17.2 | 373 | 7.103 M |
+| after, 16 parked / 6 burning / 93 particles | 14.82 ms | 14.9 | 16.4 | 375 | 7.184 M |
+
+The traffic system's own draw calls are 12 before and 13 after, and stay at 13
+with a street full of burnt-out wrecks.

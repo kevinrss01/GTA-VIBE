@@ -69,10 +69,12 @@ import {
   Armoury,
   damageAtRange,
   FALLOFF_END,
+  hitZone,
   recoilKick,
   spreadDirection,
   zoneMultiplier,
   type Direction,
+  type HitZone,
 } from './ballistics';
 import { CombatFx, impactSound, surfaceImpact, type ImpactKind, type ImpactSound } from './CombatFx';
 import { Projectiles, type RocketHandle } from './Projectiles';
@@ -95,6 +97,17 @@ import { WeaponViewmodel, type ViewmodelSet } from './WeaponViewmodel';
 
 /** How close somebody has to be to notice a gunshot. */
 export const WITNESS_RADIUS = 34;
+
+/**
+ * Shortest gap between two "a gun went off here" alarms, in seconds.
+ *
+ * The alarm is raised per trigger pull, and a carbine pulls its own trigger
+ * nine times a second. Whoever receives it - the crowd - would then be asked
+ * to re-scatter the whole street nine times for one burst. Firing immediately
+ * and then going quiet for a third of a second makes a burst one event without
+ * ever delaying the first shot's alarm, which is the one that matters.
+ */
+const ALARM_INTERVAL = 0.35;
 
 /**
  * How far ahead of the eye the viewmodel's clearance probe looks.
@@ -253,14 +266,48 @@ export interface VehicleQuery {
    * wants to be shot AT rather than damaged - keeps working. Without them a
    * round still registers as a hit and still draws its impact; the car simply
    * does not care, which is what the whole fleet did before.
+   *
+   * `x`/`y`/`z` are the WORLD CONTACT POINT of the round - the point the ray
+   * test found on the body, not the vehicle's centre. The traffic layer
+   * accumulates damage per region (front, rear, the two flanks, the glazing
+   * and each of the four tyres) and that point is the only thing that says
+   * which region took it: the HEIGHT picks glazing out from panel and the
+   * CORNER picks one tyre out from four, so `y` carries as much as `x` and `z`.
+   * They are optional, so a fleet that keeps one scalar still compiles;
+   * omitted, damage lands uniformly over the shell, which is what shipped.
+   *
+   * A ROCKET IS TOLD FROM A BULLET BY SIZE, NOT BY WEAPON ID. The fleet treats
+   * any single blow past a quarter of the shell as the thing that blows every
+   * window and shreds the tyres on the struck side; a warhead is 190 points
+   * against a carbine round's 34. Passing the real damage figure and the real
+   * contact point is therefore the whole contract, and nothing on this side
+   * special-cases the launcher.
    */
-  applyDamage?(vehicleId: number, amount: number): boolean;
+  applyDamage?(
+    vehicleId: number,
+    amount: number,
+    x?: number,
+    y?: number,
+    z?: number,
+  ): boolean;
 }
 
 /** What the crowd adapter adds on top of a plain `ActorSource`. */
 export interface WitnessSource extends ActorSource {
-  refresh(dt: number): void;
+  /**
+   * Once per frame, before any hit test. The player's position is passed so a
+   * source that keeps casualty records can apply a distance rule to them.
+   */
+  refresh(dt: number, playerX: number, playerZ: number): void;
   hasWitnessWithin(x: number, z: number, radius: number): boolean;
+  /**
+   * A gun went off at `(x, z)`; anybody within `radius` heard it.
+   *
+   * Optional, so an `ActorSource` with nothing to scatter - and every existing
+   * test double - keeps working. Fired for a miss as readily as for a hit:
+   * this is the SOUND, not the wound.
+   */
+  alarm?(x: number, z: number, radius: number): void;
 }
 
 export interface CombatHud {
@@ -466,6 +513,19 @@ export class CombatSystem {
   private recoilYaw = 0;
   private dryClick = 0;
   /**
+   * The player is in a vehicle, latched from the last `update`.
+   *
+   * ON FOOT ONLY is a rule of this system - see the header - and it used to
+   * live only in the trigger POLLING, so `fireOnce` fired happily from the
+   * cockpit of an aeroplane. That is not academic: it is how a respawn that
+   * left the player nominally still flying passed an automated check that
+   * pulled the trigger directly, while the player saw no weapon, no flash and
+   * no round. The rule belongs on the trigger itself.
+   */
+  private inVehicle = false;
+  /** Seconds until the crowd may be told about gunfire again. */
+  private alarmCooldown = 0;
+  /**
    * Where the player was on the last frame.
    *
    * Latched because a blast has to be measured from the PLAYER and the camera
@@ -484,6 +544,17 @@ export class CombatSystem {
   private readonly probeCast = createScratch();
   private readonly hurtCivilians: number[] = [];
   private readonly hurtOfficers: number[] = [];
+  /**
+   * Victims that have already been given their impact effect this trigger pull.
+   *
+   * A shotgun shell is eight pellets arriving on one chest in the same
+   * millisecond. Drawing eight impacts and playing eight body sounds for it is
+   * what made a civilian look like they had been blown apart; one wound cluster
+   * per victim per shot is both truer and a twelfth of the particle budget.
+   * Encoded as `id * 2 + faction` so a civilian and an officer with the same
+   * index are different people. Reused, so a burst allocates nothing.
+   */
+  private readonly struckThisShot: number[] = [];
 
   private readonly eye = new Vector3();
   private readonly aim = new Vector3();
@@ -492,10 +563,22 @@ export class CombatSystem {
   private readonly muzzle = new Vector3();
   private readonly right = new Vector3();
   private readonly up = new Vector3();
-  /** Reused so a burst, or a blast in a car park, allocates nothing. */
-  private readonly blow: { dirX: number; dirZ: number; speed: number } = {
-    dirX: 0, dirZ: 0, speed: 0,
-  };
+  /**
+   * Reused so a burst, or a blast in a car park, allocates nothing.
+   *
+   * Carries the CONTACT POINT and the damage zone as well as the direction,
+   * because a source that forwards the casualty on - the crowd does - needs to
+   * say where the round arrived and what it arrived on. See `Blow`.
+   */
+  private readonly blow: {
+    dirX: number;
+    dirZ: number;
+    speed: number;
+    x: number | undefined;
+    y: number | undefined;
+    z: number | undefined;
+    zone: HitZone | undefined;
+  } = { dirX: 0, dirZ: 0, speed: 0, x: undefined, y: undefined, z: undefined, zone: undefined };
   private readonly contact: BoxPoint = { x: 0, y: 0, z: 0, distance: 0 };
   private readonly vehicleHit: {
     x: number; y: number; z: number;
@@ -670,6 +753,18 @@ export class CombatSystem {
     return this.viewmodel?.ready ?? false;
   }
 
+  /**
+   * The weapon the overlay is currently holding, or null.
+   *
+   * Distinct from `viewmodelReady`, which is also false while an asset is
+   * downloading. This one says whether the game has ASKED for a weapon to be
+   * in the player's hands at all - the difference between "the gun is still
+   * loading" and "the gun is gone".
+   */
+  get viewmodelWeapon(): WeaponId | null {
+    return this.viewmodel?.drawn ?? null;
+  }
+
   /** Weapon models that failed to download. The game plays on without them. */
   get viewmodelFailures(): number {
     return this.viewmodel?.failedCount ?? 0;
@@ -711,6 +806,10 @@ export class CombatSystem {
     this.stowed = false;
     this.recoilPitch = 0;
     this.recoilYaw = 0;
+    this.alarmCooldown = 0;
+    // NOT `inVehicle`: whether the player is in a car is a fact about the
+    // world, not a cooldown, and the next `update` is the thing that knows it.
+    // Clearing it here would let one frame's trigger pull leave a cockpit.
   }
 
   /**
@@ -724,9 +823,11 @@ export class CombatSystem {
     this.playerX = ctx.playerX;
     this.playerY = ctx.playerY;
     this.playerZ = ctx.playerZ;
-    this.witnesses?.refresh(dt);
+    this.inVehicle = ctx.driving;
+    this.witnesses?.refresh(dt, ctx.playerX, ctx.playerZ);
     this.armoury.update(dt);
     if (this.dryClick > 0) this.dryClick = Math.max(0, this.dryClick - dt);
+    if (this.alarmCooldown > 0) this.alarmCooldown = Math.max(0, this.alarmCooldown - dt);
     // BEFORE the trigger is polled. When the kick lives here rather than in the
     // controller it is a rotation applied on top of the controller's absolute
     // write, and the whole point is that the shot leaves from the pose the
@@ -790,7 +891,11 @@ export class CombatSystem {
   private pullTrigger(): boolean {
     const player = this.options.player;
     const id = player.equipped;
-    if (!id || !player.alive || this.stowed) return false;
+    // `inVehicle` is the ON FOOT ONLY rule, and it is enforced HERE rather
+    // than only where the held trigger is polled, so every way of asking for a
+    // shot - the mouse, `setTrigger`, `fireOnce` from automated QA - gets the
+    // same answer the player gets.
+    if (!id || !player.alive || this.stowed || this.inVehicle) return false;
     const outcome = this.armoury.fire(id);
     if (!outcome.fired) {
       if (outcome.reason === 'magazine') {
@@ -845,6 +950,7 @@ export class CombatSystem {
       this.fireProjectile(spec, mx, my, mz);
       this.counters.shotsFired += 1;
       if (this.witnessed()) player.addHeat(HEAT.gunshot);
+      this.raiseAlarm(this.eye.x, this.eye.z, WITNESS_RADIUS);
       this.fx.muzzle(mx, my, mz, 1.9);
       this.kick(recoilKick(spec), 0);
       this.viewmodel?.punch(2.4);
@@ -866,6 +972,7 @@ export class CombatSystem {
 
     this.hurtCivilians.length = 0;
     this.hurtOfficers.length = 0;
+    this.struckThisShot.length = 0;
     let killedCivilians = 0;
     let killedOfficers = 0;
     let hitPolice = false;
@@ -889,16 +996,24 @@ export class CombatSystem {
       // Where the blood pool goes. For anything that is not a person this is
       // unused; for a person it is their own feet, which is exact.
       let floorY = endY;
+      // One impact effect and one impact sound per victim per trigger pull.
+      // A miss, a wall and a car are unaffected; only a body coalesces.
+      let drawImpact = true;
       const base = damageAtRange(spec, hit.t);
 
       if (hit.kind === 'civilian' || hit.kind === 'police') {
         impact = 'body';
         floorY = hit.footY;
+        const zone = hitZone(endY, hit.footY, hit.height);
         const damage = base * zoneMultiplier(endY, hit.footY, hit.height);
         const source = hit.kind === 'civilian' ? this.civilians : (this.options.law ?? EMPTY_ACTORS);
-        // A shot person falls the way the round was travelling, which is the
-        // only thing here that knows which way that was.
-        const result = source.damage(hit.actor, damage, this.aimBlow(direction, BULLET_THROW));
+        // A shot person falls the way the round was travelling, and is hit
+        // where the ray actually met them rather than at their own centre.
+        const result = source.damage(
+          hit.actor,
+          damage,
+          this.aimBlow(direction, BULLET_THROW, endX, endY, endZ, zone),
+        );
         // A victim wounded by one pellet and killed by the next is ONE offence,
         // the worse of the two, so the wounding is withdrawn when the killing
         // lands. Without this a shotgun charged both for the same person.
@@ -912,6 +1027,9 @@ export class CombatSystem {
           list.push(hit.actor);
         }
         if (hit.kind === 'police') hitPolice = true;
+        const token = hit.actor * 2 + (hit.kind === 'police' ? 1 : 0);
+        if (this.struckThisShot.includes(token)) drawImpact = false;
+        else this.struckThisShot.push(token);
       } else if (hit.kind === 'policeVehicle' || hit.kind === 'vehicle') {
         impact = this.vehicleSurface(hit, endY);
         // The sheet metal takes the round whoever is driving. `damageVehicle`
@@ -920,7 +1038,11 @@ export class CombatSystem {
         // so a patrol car pays both and an ordinary car pays the one that
         // exists for it. No impulse: a bullet dents a car, it does not move
         // one, and the impulse path is rate limited against exactly this.
-        this.options.vehicles?.applyDamage?.(hit.vehicleId, base);
+        // The contact point goes with it. The fleet accumulates damage per
+        // region, and glass is selected by hit height and a tyre by corner, so
+        // a round that arrives without a point can only be spread over the
+        // whole shell - which is the uniform damage this replaces.
+        this.options.vehicles?.applyDamage?.(hit.vehicleId, base, endX, endY, endZ);
         if (hit.kind === 'policeVehicle') {
           hitPoliceVehicle = true;
           this.options.law?.damageVehicle(hit.vehicleId, base);
@@ -939,6 +1061,7 @@ export class CombatSystem {
         impact = surfaceImpact(hit.box.surface);
       }
 
+      if (!drawImpact) continue;
       this.fx.impact(
         endX,
         endY,
@@ -958,6 +1081,10 @@ export class CombatSystem {
     // pellet: eight shotgun pellets in one officer is one offence.
     const consequences = this.options.player;
     if (seen) consequences.addHeat(HEAT.gunshot);
+    // The street reacts to the SOUND, whether or not anything was hit and
+    // whether or not the shot counted as public - a miss into a wall is still
+    // a gunshot to everybody who heard it.
+    this.raiseAlarm(this.eye.x, this.eye.z, WITNESS_RADIUS);
     for (let i = 0; i < this.hurtCivilians.length; i += 1) consequences.addHeat(HEAT.civilianHurt);
     for (let i = 0; i < killedCivilians; i += 1) consequences.addHeat(HEAT.civilianKilled);
     for (let i = 0; i < this.hurtOfficers.length; i += 1) consequences.addHeat(HEAT.policeHurt);
@@ -1178,13 +1305,44 @@ export class CombatSystem {
     camera.updateMatrixWorld();
   }
 
-  /** The shot direction as a blow, flattened and normalised. Reused. */
-  private aimBlow(direction: Direction, speed: number): Blow {
+  /**
+   * The shot as a blow: which way it was going, where it arrived, and on what.
+   *
+   * Flattened and normalised for the direction, because a body topples in the
+   * horizontal plane, and exact for the contact point, because that is what
+   * identifies WHICH person was hit to a source that has to look one up.
+   * Reused, so a shotgun's eight pellets allocate nothing.
+   */
+  private aimBlow(
+    direction: Direction,
+    speed: number,
+    x: number,
+    y: number,
+    z: number,
+    zone: HitZone,
+  ): Blow {
     const flat = Math.hypot(direction.x, direction.z);
     this.blow.dirX = flat > 1e-4 ? direction.x / flat : 0;
     this.blow.dirZ = flat > 1e-4 ? direction.z / flat : 0;
     this.blow.speed = speed;
+    this.blow.x = x;
+    this.blow.y = y;
+    this.blow.z = z;
+    this.blow.zone = zone;
     return this.blow;
+  }
+
+  /**
+   * Tells the crowd a gun went off, at most once every `ALARM_INTERVAL`.
+   *
+   * A no-op against a source with no `alarm` - which is every existing test
+   * double, and the crowd itself until it grows one - so a build without it
+   * behaves exactly as it does today.
+   */
+  private raiseAlarm(x: number, z: number, radius: number): void {
+    if (this.alarmCooldown > 0) return;
+    this.alarmCooldown = ALARM_INTERVAL;
+    this.witnesses?.alarm?.(x, z, radius);
   }
 
   /**
@@ -1323,6 +1481,10 @@ export class CombatSystem {
     const player = this.options.player;
 
     this.fx.explosion(x, y, z, radius, () => this.rng.next());
+    // Heard a great deal further than a gunshot, and unthrottled relative to
+    // one: a detonation is never part of a burst.
+    this.alarmCooldown = 0;
+    this.raiseAlarm(x, z, Math.max(WITNESS_RADIUS, radius * 3));
 
     let civiliansHurt = 0;
     let civiliansKilled = 0;
@@ -1352,6 +1514,13 @@ export class CombatSystem {
         this.blow.dirX = flat > 1e-4 ? dx / flat : 0;
         this.blow.dirZ = flat > 1e-4 ? dz / flat : 0;
         this.blow.speed = BLAST_THROW * share;
+        // A blast has no contact point and no damage zone: it arrives on all
+        // of somebody at once. Cleared rather than left holding whatever the
+        // last bullet wrote, which would file a rocket at a rifle's wound.
+        this.blow.x = undefined;
+        this.blow.y = undefined;
+        this.blow.z = undefined;
+        this.blow.zone = undefined;
         const result = source.damage(target.id, damage, this.blow);
         if (result === 'killed') {
           if (police) officersKilled += 1;

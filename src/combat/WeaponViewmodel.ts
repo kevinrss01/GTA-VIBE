@@ -489,6 +489,17 @@ export class WeaponViewmodel {
     return out;
   }
 
+  /**
+   * Which weapon the overlay is currently holding, or null for empty hands.
+   *
+   * The answer to "is the gun gone, or merely invisible": `ready` is false
+   * both while an asset is still downloading and when nothing is being held at
+   * all, and those are very different bugs. Diagnostics only.
+   */
+  get drawn(): WeaponId | null {
+    return this.current;
+  }
+
   /** True once the equipped weapon's asset is on screen. Diagnostics only. */
   get ready(): boolean {
     const entry = this.current ? this.entries.get(this.current) : undefined;
@@ -725,46 +736,61 @@ export class WeaponViewmodel {
     const entry = this.entries.get(id);
     if (!entry || entry.object || entry.loading || entry.failed) return;
     entry.loading = true;
-    this.loader.load(
-      entry.spec.url,
-      (gltf) => {
-        entry.loading = false;
-        if (this.disposed) return;
-        entry.object = this.prepare(gltf.scene, entry.spec);
-        if (this.current === id) this.setCurrent(id);
-      },
-      undefined,
-      () => {
-        // A weapon the player cannot see still fires: the asset is cosmetic.
-        entry.loading = false;
-        entry.failed = true;
-      },
-    );
+    // Guarded because `FileLoader.load` THROWS synchronously on a URL it
+    // cannot parse - a wrong `BASE_URL` is enough - and this runs inside the
+    // frame loop. An asset that cannot be fetched is already handled as
+    // cosmetic below; one that cannot be addressed must be too, rather than
+    // taking the whole update out with it.
+    try {
+      this.loader.load(
+        entry.spec.url,
+        (gltf) => {
+          entry.loading = false;
+          if (this.disposed) return;
+          entry.object = this.prepare(gltf.scene, entry.spec);
+          if (this.current === id) this.setCurrent(id);
+        },
+        undefined,
+        () => {
+          // A weapon the player cannot see still fires: the asset is cosmetic.
+          entry.loading = false;
+          entry.failed = true;
+        },
+      );
+    } catch {
+      entry.loading = false;
+      entry.failed = true;
+    }
   }
 
   private ensureHands(): void {
     const spec = this.handsSpec;
     if (!spec || this.handsObject || this.handsLoading || this.handsFailed) return;
     this.handsLoading = true;
-    this.loader.load(
-      spec.url,
-      (gltf) => {
-        this.handsLoading = false;
-        if (this.disposed) return;
-        const prepared = this.prepareHands(gltf.scene, spec);
-        this.handsObject = prepared;
-        this.rightHand.add(prepared);
-        // `clone` shares geometry and material; only the transform is new,
-        // which is the whole point of mirroring one asset into two hands.
-        this.leftHand.add(prepared.clone());
-      },
-      undefined,
-      () => {
-        // A weapon with no hands behind it is the old behaviour, not a crash.
-        this.handsLoading = false;
-        this.handsFailed = true;
-      },
-    );
+    try {
+      this.loader.load(
+        spec.url,
+        (gltf) => {
+          this.handsLoading = false;
+          if (this.disposed) return;
+          const prepared = this.prepareHands(gltf.scene, spec);
+          this.handsObject = prepared;
+          this.rightHand.add(prepared);
+          // `clone` shares geometry and material; only the transform is new,
+          // which is the whole point of mirroring one asset into two hands.
+          this.leftHand.add(prepared.clone());
+        },
+        undefined,
+        () => {
+          // A weapon with no hands behind it is the old behaviour, not a crash.
+          this.handsLoading = false;
+          this.handsFailed = true;
+        },
+      );
+    } catch {
+      this.handsLoading = false;
+      this.handsFailed = true;
+    }
   }
 
   /**

@@ -20,6 +20,8 @@ import {
   AudioDirector,
   HARBOUR_PA_POSITION,
   INDOOR_DUCK_DB,
+  PLAYER_STEP_CEILING_DB,
+  PLAYER_STEP_DB,
   type ListenerState,
 } from '../src/audio/AudioDirector';
 import {
@@ -32,6 +34,7 @@ import {
   POLICE_SOUNDS,
   PRELOAD_ASSET_IDS,
   SEA_BED,
+  STEP_FAMILIES,
   STEP_MEAN_DB,
   STEP_SURFACES,
   TERMINAL_STEPS,
@@ -801,7 +804,7 @@ describe('surface coverage', () => {
     // asset is long finished by the next footfall at 0.518 s walking. Without
     // it this would be testing the hard voice cap instead of the alternation.
     for (let i = 0; i < 4; i += 1) {
-      audio.footstep('pavement', false);
+      audio.footstep({ surface: 'pavement' });
       endFinishedSources();
     }
 
@@ -863,9 +866,110 @@ describe('footstep loudness and cadence', () => {
     await audio.unlock();
     // Nothing ends these sources, which is the frame-rate-collapse case: the
     // ceiling has to hold without help from `onended`.
-    for (let i = 0; i < 40; i += 1) audio.footstep('pavement', true);
+    for (let i = 0; i < 40; i += 1) audio.footstep({ surface: 'pavement', running: true });
     const live = h.sources.filter((s) => s.buffer?.url.includes('/steps/') === true && !s.stopped);
     expect(live.length).toBeLessThanOrEqual(3);
+    audio.dispose();
+  });
+
+  it('keeps the player\'s own footsteps under the documented ceiling', async () => {
+    // The complaint was that they are too loud. The trim is 8 dB, the running
+    // bonus 3.5 and the jitter +/-2, so the loudest OFFSET the mixer can
+    // produce is -2.5 dB; the ceiling is asserted here rather than trusted.
+    const audio = new AudioDirector();
+    await audio.unlock();
+    let loudest = -Infinity;
+    for (let i = 0; i < 400; i += 1) {
+      audio.footstep({ surface: 'pavement', running: true, foot: i % 2 ? 'left' : 'right' });
+      endFinishedSources();
+      const last = audio.debug.lastFootstep;
+      if (last) loudest = Math.max(loudest, last.offsetDb);
+    }
+    expect(loudest).toBeLessThanOrEqual(PLAYER_STEP_CEILING_DB);
+    // And genuinely quieter than the raw asset trim it used to play at.
+    expect(PLAYER_STEP_DB).toBeLessThanOrEqual(-6);
+    audio.dispose();
+  });
+
+  it('does not undo the asset rebalance while it is turning the volume down', async () => {
+    /*
+     * A step asset's `trimDb` is a per-file CORRECTION towards a -22 dBFS mean,
+     * not a level, and the corrections run from -4.2 to +9.4 dB. Clamping
+     * `trim + offset` therefore attenuates exactly the files whose correction
+     * is largest, which is the 15.5 dB loudness spread the 2026-08-27 rebalance
+     * removed, creeping back in through the mixer. Measured in the browser
+     * before this was fixed: grass lost 3.4 dB and boardwalk 2.6 dB while
+     * terminal and concrete lost nothing.
+     *
+     * The invariant: whatever the mixer does, `gainDb - offsetDb` is exactly
+     * the asset's own trim, for every family.
+     */
+    const audio = new AudioDirector();
+    await audio.unlock();
+    const families = Object.keys(STEP_FAMILIES) as Array<keyof typeof STEP_FAMILIES>;
+    const material: Partial<Record<string, string>> = {
+      terminal: 'tileFloor',
+      concrete: 'concrete',
+      boardwalk: 'timber',
+      asphalt: 'asphalt',
+      pavement: 'pavement',
+      gravel: 'gravel',
+      grass: 'grass',
+    };
+    for (const family of families) {
+      for (const running of [false, true]) {
+        audio.footstep({
+          surface: 'interior',
+          material: material[family],
+          running,
+        });
+        endFinishedSources();
+        const last = audio.debug.lastFootstep;
+        expect(last, family).not.toBeNull();
+        if (!last) continue;
+        expect(last.family, `material ${String(material[family])}`).toBe(family);
+        expect(last.gainDb - last.offsetDb).toBeCloseTo(getAudioAsset(last.assetId).trimDb, 6);
+      }
+    }
+    audio.dispose();
+  });
+
+  it('makes a run heavier and lower, not merely higher', async () => {
+    const audio = new AudioDirector();
+    await audio.unlock();
+    const sample = (running: boolean): { gainDb: number; rate: number } => {
+      let gain = 0;
+      let rate = 0;
+      for (let i = 0; i < 200; i += 1) {
+        audio.footstep({ surface: 'pavement', running, foot: i % 2 === 0 ? 'left' : 'right' });
+        endFinishedSources();
+        const last = audio.debug.lastFootstep;
+        if (!last) continue;
+        gain += last.gainDb;
+        rate += last.rate;
+      }
+      return { gainDb: gain / 200, rate: rate / 200 };
+    };
+    const walking = sample(false);
+    const running = sample(true);
+    expect(running.gainDb).toBeGreaterThan(walking.gainDb);
+    // Heavier lands LOWER. The old constants raised the pitch, which is what a
+    // lighter contact sounds like.
+    expect(running.rate).toBeLessThan(walking.rate);
+    audio.dispose();
+  });
+
+  it('places the two feet either side of the listener', async () => {
+    const audio = new AudioDirector();
+    await audio.unlock();
+    audio.footstep({ surface: 'pavement', foot: 'left' });
+    const left = audio.debug.lastFootstep?.pan ?? 0;
+    endFinishedSources();
+    audio.footstep({ surface: 'pavement', foot: 'right' });
+    const right = audio.debug.lastFootstep?.pan ?? 0;
+    expect(left).toBeLessThan(0);
+    expect(right).toBeGreaterThan(0);
+    expect(Math.abs(left)).toBeLessThanOrEqual(0.5);
     audio.dispose();
   });
 
@@ -881,63 +985,48 @@ describe('footstep loudness and cadence', () => {
   });
 });
 
-describe('footstep surface hysteresis', () => {
+describe('footstep material selection', () => {
   function stepFiles(): string[] {
     return h.sources
       .filter((s) => s.buffer?.url.includes('/steps/') === true)
       .map((s) => (s.buffer?.url ?? '').replace(/.*\/steps\//, '').replace(/-\d\.mp3$/, ''));
   }
 
-  it('does not flicker when the sampled surface alternates at a boundary', async () => {
+  /**
+   * The mixer is now a mixer: a material arrives and the matching pair plays.
+   *
+   * The two-step hold and the `onRoad` override that used to live here are
+   * gone - see the note in `AudioDirector` where they were, and
+   * `tests/footsteps.test.ts` for the debounce that replaced them, which is
+   * asserted for promptness AND stability rather than only for stability.
+   */
+  it('plays the collider material rather than the terrain under it', async () => {
     const audio = new AudioDirector();
     await audio.unlock();
-    // A player walking the edge of a path: the sampler returns a different
-    // material on every step. One of them has to win and stay won.
-    const walk: Array<'gravel' | 'grass'> = ['gravel', 'grass', 'gravel', 'grass', 'gravel'];
-    for (const surface of walk) {
-      audio.footstep(surface, false);
-      endFinishedSources();
-    }
-    expect(new Set(stepFiles()).size).toBe(1);
+    // Standing on the terminal slab: the sampler says the airfield concrete
+    // the building stands on, the collider says the floor that was laid on it.
+    audio.footstep({ surface: 'concrete', material: 'tileFloor' });
+    expect(stepFiles()[0]).toBe('terminal');
     audio.dispose();
   });
 
-  it('does commit to a surface the player has genuinely walked onto', async () => {
+  it('falls back to the terrain when nothing built is underfoot', async () => {
     const audio = new AudioDirector();
     await audio.unlock();
-    audio.footstep('gravel', false);
+    audio.footstep({ surface: 'concrete', material: null });
+    expect(stepFiles()[0]).toBe('concrete');
+    audio.dispose();
+  });
+
+  it('switches material on the step that reports it, with no hold', async () => {
+    const audio = new AudioDirector();
+    await audio.unlock();
+    audio.footstep({ surface: 'pavement' });
     endFinishedSources();
-    for (let i = 0; i < 4; i += 1) {
-      audio.footstep('grass', false);
-      endFinishedSources();
-    }
-    const heard = stepFiles();
-    expect(heard[0]).toBe('gravel');
-    expect(heard[heard.length - 1]).toBe('grass');
-    audio.dispose();
-  });
-
-  it('switches immediately when the world says the foot is on a carriageway', async () => {
-    const audio = new AudioDirector();
-    await audio.unlock();
-    // `onRoad` is authoritative, so it beats both the sampled surface and the
-    // hysteresis: stepping off a kerb is heard on the step that makes it.
-    audio.footstep('pavement', false, false);
-    audio.footstep('grass', true, true);
+    audio.footstep({ surface: 'asphalt' });
     const heard = stepFiles();
     expect(heard[0]).toBe('pavement');
     expect(heard[1]).toBe('asphalt');
-    audio.dispose();
-  });
-
-  it('ignores a sampled surface entirely while the foot is on the road', async () => {
-    const audio = new AudioDirector();
-    await audio.unlock();
-    for (const surface of ['grass', 'gravel', 'plaza'] as const) {
-      audio.footstep(surface, false, true);
-      endFinishedSources();
-    }
-    expect(new Set(stepFiles())).toEqual(new Set(['asphalt']));
     audio.dispose();
   });
 });
@@ -1040,7 +1129,7 @@ describe('pausing', () => {
     await audio.unlock();
     audio.setGamePaused(true);
     expect(() => audio.update(0.016, STATE)).not.toThrow();
-    expect(() => audio.footstep('pavement', true, false)).not.toThrow();
+    expect(() => audio.footstep({ surface: 'pavement', running: true })).not.toThrow();
     expect(() => audio.setVolume('effects', 0.4)).not.toThrow();
     audio.dispose();
   });
@@ -1102,14 +1191,37 @@ describe('manifest integrity', () => {
     expect(PRELOAD_ASSET_IDS).toContain(POLICE_SOUNDS.engine);
   });
 
-  it('defers the whole airfield set and nothing else', () => {
+  it('defers the airfield set and the class engines, and nothing else', () => {
+    // Spelled out rather than derived, so adding an asset to the lazy set is a
+    // deliberate act with a reason attached rather than something that happens
+    // by accident. The class engine layers and the tyre bed are 1.07 MB that a
+    // player who never gets into a box truck never needs; `StreetAudio` asks
+    // for them on the frame the player takes a car.
     const deferred = [...LAZY_ASSET_IDS].sort();
     const expected = [
       MUSIC_ASSET_ID,
       AIRPORT_BED,
       ...AUDIO_ASSETS.filter((a) => a.kind === 'aircraft').map((a) => a.id),
+      'veh/engine-small-idle',
+      'veh/engine-small-load',
+      'veh/engine-sport-idle',
+      'veh/engine-sport-load',
+      'veh/engine-diesel-idle',
+      'veh/engine-diesel-load',
+      'veh/engine-truck-idle',
+      'veh/engine-truck-load',
+      'veh/engine-v8-idle',
+      'veh/engine-v8-load',
+      'veh/tyre-roll',
     ].sort();
     expect(deferred).toEqual(expected);
+  });
+
+  it('keeps the saloon engine pair eager, because it is the fallback voice', () => {
+    // A class whose own layers have not arrived yet speaks with this pair, so
+    // it has to be resident before the first car door closes.
+    expect(PRELOAD_ASSET_IDS).toContain('veh/engine-idle');
+    expect(PRELOAD_ASSET_IDS).toContain('veh/engine-load');
   });
 
   it('records provenance without leaking a key or a signed URL', () => {
@@ -1144,7 +1256,7 @@ describe('robustness', () => {
     await audio.unlock();
 
     expect(() => audio.update(0.016, STATE)).not.toThrow();
-    expect(() => audio.footstep('pavement', true)).not.toThrow();
+    expect(() => audio.footstep({ surface: 'pavement', running: true })).not.toThrow();
     expect(() => audio.playOneShot('door-open')).not.toThrow();
     audio.dispose();
   });
@@ -1152,10 +1264,23 @@ describe('robustness', () => {
   it('is inert before unlock and never throws', () => {
     const audio = new AudioDirector();
     expect(() => audio.update(0.016, STATE)).not.toThrow();
-    expect(() => audio.footstep('gravel', false)).not.toThrow();
+    expect(() => audio.footstep({ surface: 'gravel' })).not.toThrow();
     expect(() => audio.playOneShot('ui-tick')).not.toThrow();
     expect(h.sources).toHaveLength(0);
     audio.dispose();
+  });
+
+  it('takes the QA hook off the window on dispose', async () => {
+    // The getter closes over the director, so leaving it behind keeps a
+    // disposed instance and every decoded buffer it holds alive.
+    const scope = globalThis as unknown as Record<string, unknown>;
+    scope['window'] = scope['window'] ?? {};
+    const audio = new AudioDirector();
+    await audio.unlock();
+    expect((scope['window'] as Record<string, unknown>)['__meridianAudio']).toBeDefined();
+    audio.dispose();
+    expect((scope['window'] as Record<string, unknown>)['__meridianAudio']).toBeUndefined();
+    delete scope['window'];
   });
 
   it('closes the context and detaches its listener on dispose', async () => {

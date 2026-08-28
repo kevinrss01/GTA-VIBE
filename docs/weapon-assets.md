@@ -236,3 +236,26 @@ rides on the shoulder, and its butt is a third of a metre behind its middle.
 Centred where the carbine is, the butt plate ended up behind the near plane and
 the player was looking down the inside of their own launch tube. It is centred
 0.56 m out and pushed down and right so the tube clears the crosshair.
+
+## An unreachable asset must not take the frame loop with it
+
+`WeaponViewmodel` has always treated a weapon model that fails to DOWNLOAD as
+cosmetic: the entry is marked failed, the weapon still fires, and the game plays
+on without it. It did not treat a model that cannot be ADDRESSED the same way.
+`THREE.FileLoader.load` throws synchronously on a URL it cannot parse - a
+`BASE_URL` that is empty or wrong is enough - and `ensureLoaded` runs inside
+`update`, so a single bad path took the whole frame with it and the game
+appeared to freeze on the first weapon the player equipped.
+
+Both `ensureLoaded` and `ensureHands` now wrap the call and fall into the same
+failed state the error callback uses. `viewmodelFailures` counts it, exactly as
+it counts a 404.
+
+## Telling "the gun is loading" from "the gun is gone"
+
+`CombatSystem.viewmodelReady` is false in two completely different situations:
+while a generated model is still downloading, and when nothing has been asked
+for at all. `CombatSystem.viewmodelWeapon` (`WeaponViewmodel.drawn`) reports the
+second one directly - which weapon the overlay has been told to hold, or null -
+so a QA pass can distinguish an asset that has not arrived yet from a player who
+has been left with empty hands. It is a diagnostic; nothing renders from it.

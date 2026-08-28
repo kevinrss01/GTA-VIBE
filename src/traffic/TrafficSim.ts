@@ -35,7 +35,7 @@
  * as a real car does, while the 1-D bookkeeping keeps the guarantees.
  */
 
-import { clamp, damp } from '../core/mathx';
+import { clamp, damp, smoothstep } from '../core/mathx';
 import { createRng, type Rng } from '../core/rng';
 import {
   exitsFrom,
@@ -56,12 +56,21 @@ import {
   type VehicleBlueprint,
 } from './VehicleCatalogue';
 import {
+  BLAST_SHARE,
+  ENGINE_DEAD,
+  ENGINE_SOFT,
+  GLASS_CAPACITY,
+  REGION_CAPACITY,
+  TYRE_CAPACITY,
+  TYRE_GRIP_LOSS,
+  TYRE_PULL,
   VEHICLE_INTEGRITY,
   impactDamage,
   type TrafficObstacle,
   type VehicleControl,
   type VehicleImpact,
   type VehicleKind,
+  type VehicleState,
   type VehicleView,
 } from './types';
 
@@ -254,6 +263,60 @@ const CONTACT_SPEED = 1.4;
 /** Coefficient of restitution between two cars. Sheet metal absorbs most of it. */
 const CAR_RESTITUTION = 0.15;
 
+// -- abandoned cars and wrecks ----------------------------------------------
+
+/**
+ * How many abandoned cars and burnt-out wrecks the city keeps at once.
+ *
+ * A parked vehicle costs nothing to allocate - it is the same pooled object it
+ * always was, in the same instance slot - so this is not a memory limit. It is
+ * a limit on how much of the FLEET the player is allowed to take out of
+ * circulation: at the shipping density of about a hundred and twenty cars,
+ * twelve is a tenth of the traffic, which is the most that can be parked
+ * before the streets visibly thin out.
+ */
+const PARKED_LIMIT = 12;
+/**
+ * The hard ceiling, and the reason there are two numbers.
+ *
+ * Nothing is ever removed in front of the player: `parkedRemoveDistance` is
+ * strictly beyond the render distance, so a car being tidied away has already
+ * stopped being drawn. That rule cannot be honoured unconditionally, though -
+ * a player who abandons fifteen cars in one street has put every one of them
+ * inside the render radius, and there is nothing out of sight to remove. Past
+ * this second, higher count the oldest abandoned car is removed anyway, which
+ * is a visible pop for a player who has gone out of their way to cause it and
+ * is far better than an unbounded pool.
+ */
+const PARKED_HARD_LIMIT = 16;
+/**
+ * Metres past the render distance at which a parked vehicle may be removed.
+ *
+ * Expressed against `detailDistance` - which IS the renderer's render distance,
+ * 150 to 260 m by quality - rather than as a constant, because "out of view"
+ * is a property of the renderer and a fixed number would silently become wrong
+ * the moment the render distance changed. The margin covers the frame or two
+ * between the sim's opinion and the renderer's.
+ */
+const PARKED_REMOVE_MARGIN = 20;
+
+// -- destruction ------------------------------------------------------------
+
+/**
+ * Seconds a write-off burns before it is a blackened shell.
+ *
+ * Long enough that the player who caused it sees the fire from across a couple
+ * of streets, short enough that a street full of wrecks is not a permanent
+ * bonfire. The soot it leaves behind is permanent; the flame is not.
+ */
+const FIRE_SECONDS = 14;
+/** Seconds a write-off smoulders before the flame takes, so the fire builds. */
+const IGNITION_SECONDS = 1.2;
+/** Engine-bay damage at which an intact car starts smoking. */
+const SMOKE_ONSET = 0.35;
+/** Seconds the blackened shell smoulders after the flame is out. */
+const SMOULDER_SECONDS = 10;
+
 // -- lane metadata ----------------------------------------------------------
 
 /**
@@ -327,6 +390,25 @@ interface LaneInfo {
 
 // -- vehicles ---------------------------------------------------------------
 
+/** Mutable twin of `VehicleDamageRegions`. Allocated once per vehicle. */
+interface MutableRegions {
+  front: number;
+  rear: number;
+  left: number;
+  right: number;
+  glass: number;
+  /** Front left, front right, rear left, rear right. Fixed length four. */
+  readonly tyres: number[];
+}
+
+/** Mutable twin of `VehicleHandling`. */
+interface MutableHandling {
+  power: number;
+  grip: number;
+  pull: number;
+  destroyed: boolean;
+}
+
 interface MutableView {
   id: number;
   kind: VehicleKind;
@@ -344,8 +426,14 @@ interface MutableView {
   braking: boolean;
   accelLong: number;
   control: VehicleControl;
+  state: VehicleState;
   integrity: number;
   damage: number;
+  destroyed: boolean;
+  readonly regions: MutableRegions;
+  readonly handling: MutableHandling;
+  smoke: number;
+  fire: number;
   overturned: boolean;
 }
 
@@ -354,7 +442,11 @@ export interface Vehicle {
   kind: VehicleKind;
   blueprint: VehicleBlueprint;
   active: boolean;
-  control: VehicleControl;
+  /**
+   * The internal state, which unlike the published `view.control` includes
+   * `'parked'`. See `VehicleState`.
+   */
+  control: VehicleState;
 
   laneId: string;
   along: number;
@@ -408,6 +500,38 @@ export interface Vehicle {
   integrity: number;
   /** The same as a fraction, 0 to 1. Cached because the renderer reads it per frame. */
   damage: number;
+  /**
+   * Damage points taken by each region and each tyre, in the same scale as
+   * `integrity`. Kept in points rather than fractions so a capacity can be
+   * retuned in one place without rescaling anything already on a car.
+   */
+  readonly regionPoints: {
+    front: number;
+    rear: number;
+    left: number;
+    right: number;
+    glass: number;
+    readonly tyres: number[];
+  };
+  /** Seconds since the shell was written off, for the fire. -1 while intact. */
+  burnTimer: number;
+  /**
+   * True once nothing will ever drive this vehicle again.
+   *
+   * Set when the player gets out of it and when it is written off or rolled.
+   * It is what stops a shunted abandoned car quietly rejoining the traffic AI
+   * on the next kerb it comes to rest against: there is nobody in it, and a
+   * car with nobody in it does not drive away.
+   */
+  abandoned: boolean;
+  /**
+   * Frame on which this vehicle was parked, for the abandoned-car lifecycle.
+   * -1 when it is not parked. Ordering by it is what makes "the oldest one"
+   * mean something without a second list to keep in step.
+   */
+  parkedFrame: number;
+  /** True once a parked body has stopped moving and no longer needs stepping. */
+  parkedAtRest: boolean;
 
   desiredSpeed: number;
   braking: boolean;
@@ -694,8 +818,21 @@ export class TrafficSim {
     number,
     { x: number; z: number; yaw: number; damage: number }
   >();
-  /** Driven vehicles this frame, rebuilt in place. Usually one, never many. */
+  /**
+   * Vehicles the traffic AI is not driving that something can still run into:
+   * the player's car, every police unit, and every abandoned car or wreck near
+   * enough to matter. Rebuilt in place each frame, and bounded by
+   * `PARKED_LIMIT` plus the handful of units in play.
+   */
   private readonly driven: Vehicle[] = [];
+  /**
+   * Every parked vehicle, oldest first.
+   *
+   * Append-ordered, so index 0 is the least recently abandoned - which is what
+   * `enforceParkedLimit` removes first. Length is bounded by
+   * `PARKED_HARD_LIMIT`.
+   */
+  private readonly parked: Vehicle[] = [];
   private time = 0;
   private cameraX = 0;
   private cameraZ = 0;
@@ -1034,8 +1171,14 @@ export class TrafficSim {
       braking: false,
       accelLong: 0,
       control: 'ambient',
+      state: 'ambient',
       integrity: VEHICLE_INTEGRITY,
       damage: 0,
+      destroyed: false,
+      regions: { front: 0, rear: 0, left: 0, right: 0, glass: 0, tyres: [0, 0, 0, 0] },
+      handling: { power: 1, grip: 1, pull: 0, destroyed: false },
+      smoke: 0,
+      fire: 0,
       overturned: false,
     };
     return {
@@ -1076,6 +1219,11 @@ export class TrafficSim {
       impactCooldown: 0,
       integrity: VEHICLE_INTEGRITY,
       damage: 0,
+      regionPoints: { front: 0, rear: 0, left: 0, right: 0, glass: 0, tyres: [0, 0, 0, 0] },
+      burnTimer: -1,
+      abandoned: false,
+      parkedFrame: -1,
+      parkedAtRest: false,
       desiredSpeed: 10,
       braking: false,
       brakeHold: 0,
@@ -1185,6 +1333,7 @@ export class TrafficSim {
       vehicle.active = true;
       vehicle.control = 'ambient';
       vehicle.view.control = 'ambient';
+      vehicle.view.state = 'ambient';
       // The view has to be valid the instant a vehicle appears: a consumer
       // reading it before the first step would otherwise see the origin.
       this.syncView(vehicle);
@@ -1379,9 +1528,16 @@ export class TrafficSim {
         continue;
       }
       if (vehicle.impactCooldown > 0) vehicle.impactCooldown -= step;
+      // Smoke and fire are the only things a car does on its own once it is
+      // damaged, so the check that skips it is one comparison for the fleet.
+      if (vehicle.burnTimer >= 0 || vehicle.damage > 0) this.updateBurn(vehicle, step);
       const dx = vehicle.x - cameraX;
       const dz = vehicle.z - cameraZ;
       const distance = Math.hypot(dx, dz);
+      if (vehicle.control === 'parked') {
+        this.stepParked(vehicle, step, distance);
+        continue;
+      }
       if (vehicle.control === 'player') {
         // Still settle a player car on the road. `settleBody` is what reads the
         // terrain into `vehicle.y`, and it only ran inside `stepVehicle` - which
@@ -1412,6 +1568,7 @@ export class TrafficSim {
     }
 
     this.resolveDrivenContacts();
+    this.enforceParkedLimit();
 
     this.views.length = 0;
     for (const vehicle of this.vehicles) {
@@ -1439,6 +1596,15 @@ export class TrafficSim {
         if (info) info.occupants.push(vehicle);
         if (vehicle.claim) this.addClaim(vehicle, vehicle.claim);
       } else if (vehicle.control === 'player') this.driven.push(vehicle);
+      else if (vehicle.control === 'parked') {
+        // An abandoned car is something traffic can run into, but only while
+        // it is near enough for anyone to be near it: a wreck on the far side
+        // of the city would cost a broad-phase walk a frame for nothing.
+        const dx = vehicle.x - this.cameraX;
+        const dz = vehicle.z - this.cameraZ;
+        const reach = this.detailDistance;
+        if (dx * dx + dz * dz < reach * reach) this.driven.push(vehicle);
+      }
       const key = TrafficSim.cellKey(vehicle.x, vehicle.z);
       const cell = this.grid.get(key);
       if (cell) cell.push(vehicle);
@@ -1576,7 +1742,15 @@ export class TrafficSim {
 
     // Once past the end of the lane the vehicle is on the junction arc and
     // committed to the turn, so the speed target becomes the corner's.
-    let desired = vehicle.desiredSpeed;
+    //
+    // A damaged engine is expressed as a lower TARGET rather than as a lower
+    // `accelMax`, deliberately: IDM's braking term divides by the square root
+    // of the acceleration limit, so scaling that towards zero makes the model
+    // unstable exactly when a car is at its most fragile. Capping the speed it
+    // is trying to reach produces the same behaviour - a misfiring car falls
+    // back through the traffic and a dead one rolls to a stop - out of
+    // arithmetic that cannot blow up.
+    let desired = vehicle.desiredSpeed * vehicle.view.handling.power;
     const arc = vehicle.nextArc;
     if (arc && arc.length > 0.2 && vehicle.along > arc.startAlong) {
       desired = Math.min(desired, this.arcSpeed(arc));
@@ -2033,8 +2207,9 @@ export class TrafficSim {
    */
   private movementsConflict(vehicle: Vehicle, info: LaneInfo, other: Vehicle): boolean {
     const otherInfo = this.laneInfo.get(other.laneId);
-    // A player-driven car has no lane; never contest a junction with one.
-    if (other.control === 'player' || !otherInfo) return true;
+    // Anything the traffic AI is not driving has no meaningful lane - a driven
+    // car, a wreck, an abandoned one - so never contest a junction with it.
+    if (other.control !== 'ambient' || !otherInfo) return true;
     if (otherInfo.lane.axis !== info.lane.axis) return true;
     if (otherInfo.lane.travel === info.lane.travel) return false;
     return vehicle.turn === 1 || other.turn === 1;
@@ -2107,10 +2282,18 @@ export class TrafficSim {
     const sinAlpha = clamp(-lateral / range, -1, 1);
     let wanted = Math.atan2(2 * chassis.wheelbase * sinAlpha, range);
     if (forward < 0) wanted = Math.sign(sinAlpha) * chassis.maxSteer;
+    // A flat tyre drags the car towards its own side. Added to what the driver
+    // wants rather than to the steering angle itself, so they can hold it
+    // straight - badly - instead of being steered off the road.
+    const handling = vehicle.view.handling;
+    wanted += handling.pull;
 
-    // Grip ceiling: v^2 * tan(d) / L must stay under what the tyres will hold.
+    // Grip ceiling: v^2 * tan(d) / L must stay under what the tyres will hold,
+    // less whatever the tyres have already lost.
     const speed = Math.max(vehicle.speed, 0.5);
-    const gripSteer = Math.atan((chassis.gripLateral * chassis.wheelbase) / (speed * speed));
+    const gripSteer = Math.atan(
+      (chassis.gripLateral * handling.grip * chassis.wheelbase) / (speed * speed),
+    );
     const limit = Math.min(chassis.maxSteer, gripSteer);
     wanted = clamp(wanted, -limit, limit);
 
@@ -2170,6 +2353,11 @@ export class TrafficSim {
     vehicle.claim = null;
     vehicle.stuck = 0;
     vehicle.speed = 0;
+    this.unpark(vehicle);
+    vehicle.abandoned = false;
+    vehicle.control = 'ambient';
+    vehicle.view.control = 'ambient';
+    vehicle.view.state = 'ambient';
   }
 
   // -- impacts and free bodies ----------------------------------------------
@@ -2206,7 +2394,7 @@ export class TrafficSim {
     const jz = hit.dirZ * impulse;
     const deltaV = impulse / mass;
 
-    this.damage(vehicle, hit.damage);
+    this.damage(vehicle, hit.damage, hit.x, hit.y, hit.z, true);
     this.report(hit.x, hit.y, hit.z, deltaV / 12, 'vehicle');
 
     if (vehicle.control === 'player') {
@@ -2227,13 +2415,22 @@ export class TrafficSim {
       return true;
     }
 
-    if (vehicle.control === 'ambient') {
+    if (vehicle.control === 'ambient' || vehicle.control === 'parked') {
       if (deltaV < LOOSE_TRIGGER) {
-        // Felt, not freed: spend it on the driver's own speed and let them
-        // carry on. Anything else turns a kerbside scrape into a recovery.
-        const fx = -Math.sin(vehicle.yaw);
-        const fz = -Math.cos(vehicle.yaw);
-        vehicle.speed = Math.max(0, vehicle.speed + (jx * fx + jz * fz) / mass);
+        if (vehicle.control === 'ambient') {
+          // Felt, not freed: spend it on the driver's own speed and let them
+          // carry on. Anything else turns a kerbside scrape into a recovery.
+          const fx = -Math.sin(vehicle.yaw);
+          const fz = -Math.cos(vehicle.yaw);
+          vehicle.speed = Math.max(0, vehicle.speed + (jx * fx + jz * fz) / mass);
+          return true;
+        }
+        // A parked car has no driver to absorb it. The shove goes into the
+        // body and `stepParked` bleeds it off against the road, which is what
+        // makes nudging an abandoned car rock it rather than nothing at all.
+        vehicle.vx += jx / mass;
+        vehicle.vz += jz / mass;
+        vehicle.parkedAtRest = false;
         return true;
       }
       this.goLoose(vehicle);
@@ -2280,11 +2477,18 @@ export class TrafficSim {
    *
    * Deliberately NOT subject to `IMPACT_COOLDOWN`: a rifle fires far faster
    * than the cooldown and every round has to count.
+   *
+   * The world point is where the round landed, and it is what makes damage
+   * LOCAL: rounds into a bonnet kill the engine, rounds into a wheel arch flat
+   * the tyre, rounds through a window take the glazing out. Omit it and the
+   * damage is spread evenly over the shell, which is what every caller that
+   * does not know where it hit gets.
    */
-  applyDamage(vehicleId: number, amount: number): boolean {
+  applyDamage(vehicleId: number, amount: number, x?: number, y?: number, z?: number): boolean {
     const vehicle = this.vehicles.find((v) => v.id === vehicleId && v.active);
     if (!vehicle || !(amount > 0)) return false;
-    this.damage(vehicle, amount);
+    const located = x !== undefined && y !== undefined && z !== undefined;
+    this.damage(vehicle, amount, x ?? 0, y ?? 0, z ?? 0, located);
     return true;
   }
 
@@ -2299,10 +2503,198 @@ export class TrafficSim {
     return pending;
   }
 
-  private damage(vehicle: Vehicle, amount: number): void {
+  /**
+   * Structural damage, optionally at a point on the body.
+   *
+   * TWO ACCOUNTS ARE KEPT, and they are not a partition of each other. The
+   * integrity total is the whole shell and decides when the car is a write-off.
+   * The regions are where the damage landed, and they decide what still works:
+   * an engine bay can be finished long before the car as a whole is, which is
+   * exactly what happens when somebody empties half a magazine into a bonnet.
+   *
+   * `located` is false for damage with no position - a scrape charged after
+   * the fact, a test - and the points are spread evenly over the four panels.
+   */
+  private damage(
+    vehicle: Vehicle,
+    amount: number,
+    x: number,
+    y: number,
+    z: number,
+    located: boolean,
+  ): void {
     if (!(amount > 0)) return;
+    const wasWreck = vehicle.integrity <= 0;
     vehicle.integrity = Math.max(0, vehicle.integrity - amount);
     vehicle.damage = 1 - vehicle.integrity / VEHICLE_INTEGRITY;
+
+    // One blow worth a quarter of the shell is a blast, not a bullet. See
+    // `BLAST_SHARE`: it is what puts every window out and shreds the tyres on
+    // the struck side, and it is the entire difference between being shot at
+    // and being on the receiving end of a warhead.
+    const blast = amount >= VEHICLE_INTEGRITY * BLAST_SHARE;
+    const points = vehicle.regionPoints;
+
+    let front = 0.25;
+    let rear = 0.25;
+    let left = 0.25;
+    let right = 0.25;
+    let glassShare = blast ? 1 : 0;
+    let tyre = -1;
+    let tyreShare = 0;
+
+    if (located) {
+      const fx = -Math.sin(vehicle.yaw);
+      const fz = -Math.cos(vehicle.yaw);
+      const rx = Math.cos(vehicle.yaw);
+      const rz = -Math.sin(vehicle.yaw);
+      const dx = x - vehicle.x;
+      const dz = z - vehicle.z;
+      const alongM = dx * fx + dz * fz;
+      const acrossM = dx * rx + dz * rz;
+      const halfLength = vehicle.blueprint.length * 0.5;
+      const halfWidth = vehicle.blueprint.width * 0.5;
+      const along = clamp(alongM / halfLength, -1, 1);
+      const across = clamp(acrossM / halfWidth, -1, 1);
+      // A blast wraps around the body and a bullet lands on one panel, so the
+      // only difference between them is the floor under every region.
+      const spread = blast ? 0.5 : 0.04;
+      front = Math.max(0, along) + spread;
+      rear = Math.max(0, -along) + spread;
+      right = Math.max(0, across) + spread;
+      left = Math.max(0, -across) + spread;
+
+      // `vehicle.y` is the ground contact plane, so this is height up the body
+      // and `beltY` is where the glazing starts on every shape in the fleet.
+      const height = y - vehicle.y;
+      const belt = vehicle.blueprint.beltY;
+      if (!blast) glassShare = smoothstep(belt - 0.12, belt + 0.12, height);
+
+      // Low, outboard and beside an axle is a tyre rather than a panel.
+      const wheel = vehicle.blueprint.wheelRadius;
+      if (!blast && height < wheel * 2 && Math.abs(across) > 0.45) {
+        const chassis = vehicle.blueprint.chassis;
+        const nearFront = Math.abs(alongM - chassis.frontAxle) < wheel * 2.2;
+        const nearRear = Math.abs(alongM - (chassis.frontAxle - chassis.wheelbase)) < wheel * 2.2;
+        if (nearFront || nearRear) {
+          tyre = (nearFront ? 0 : 2) + (acrossM > 0 ? 1 : 0);
+          tyreShare = 1;
+        }
+      } else if (blast) {
+        // A blast takes the tyres on the side it came from with it. At 0.18 a
+        // warhead's 190 points burst both near-side tyres outright and a
+        // hard side impact - about 110 points - leaves them half gone, which
+        // is the right ordering between the two.
+        const nearSide = acrossM > 0 ? 1 : 0;
+        points.tyres[nearSide] = (points.tyres[nearSide] as number) + amount * 0.18;
+        points.tyres[nearSide + 2] = (points.tyres[nearSide + 2] as number) + amount * 0.18;
+      }
+    }
+
+    // A round that went into a wheel did not also crumple the door beside it.
+    const panelScale = tyre >= 0 ? 0.3 : 1;
+    // NORMALISED BY THE PEAK, not by the sum, and only when the hit has a
+    // place. The panel the round actually went through takes the damage it
+    // actually did - four rifle rounds in a bonnet are four rounds' worth of
+    // bonnet - and the neighbours take the spread floor's share of it. Divide
+    // by the sum instead and a point hit loses a sixth of its effect to panels
+    // it never touched, which makes the numbers impossible to reason about
+    // from the outside. Damage with no location has no peak to speak of, so it
+    // really is divided four ways.
+    const peak = located
+      ? Math.max(front, rear, left, right)
+      : front + rear + left + right;
+    const share = (amount * panelScale) / peak;
+    points.front += front * share;
+    points.rear += rear * share;
+    points.left += left * share;
+    points.right += right * share;
+    if (glassShare > 0) points.glass += amount * glassShare;
+    if (tyre >= 0) points.tyres[tyre] = (points.tyres[tyre] as number) + amount * tyreShare;
+
+    if (!wasWreck && vehicle.integrity <= 0) this.writeOff(vehicle);
+    this.syncDamage(vehicle);
+  }
+
+  /**
+   * The moment a shell stops being a car.
+   *
+   * A write-off never drives again: an ambient one is cut loose so it coasts
+   * to a stop where it was rather than continuing down its lane with no
+   * engine, and every one of them is flagged `abandoned` so that when it does
+   * stop it becomes a wreck rather than rejoining traffic. The fire starts
+   * here, and `updateBurn` carries it.
+   */
+  private writeOff(vehicle: Vehicle): void {
+    vehicle.abandoned = true;
+    if (vehicle.burnTimer < 0) vehicle.burnTimer = 0;
+    if (vehicle.control === 'ambient') this.goLoose(vehicle);
+  }
+
+  /**
+   * Recomputes the published damage fractions and what they do to the driving.
+   *
+   * Called after every damage event rather than every frame: damage only ever
+   * changes when something hits the car, and the renderer and the driving
+   * layer both read the result once a frame.
+   */
+  private syncDamage(vehicle: Vehicle): void {
+    const points = vehicle.regionPoints;
+    const view = vehicle.view;
+    const regions = view.regions;
+    regions.front = Math.min(1, points.front / REGION_CAPACITY);
+    regions.rear = Math.min(1, points.rear / REGION_CAPACITY);
+    regions.left = Math.min(1, points.left / REGION_CAPACITY);
+    regions.right = Math.min(1, points.right / REGION_CAPACITY);
+    regions.glass = Math.min(1, points.glass / GLASS_CAPACITY);
+
+    let flats = 0;
+    let pull = 0;
+    for (let i = 0; i < 4; i += 1) {
+      const wear = Math.min(1, (points.tyres[i] as number) / TYRE_CAPACITY);
+      regions.tyres[i] = wear;
+      flats += wear;
+      // Even indexes are the near side. A flat on the left drags the car left,
+      // and positive yaw is left in this game's convention.
+      pull += (i % 2 === 0 ? 1 : -1) * wear;
+    }
+
+    const destroyed = vehicle.integrity <= 0;
+    const handling = view.handling;
+    handling.destroyed = destroyed;
+    handling.power = destroyed
+      ? 0
+      : clamp(1 - (regions.front - ENGINE_SOFT) / (ENGINE_DEAD - ENGINE_SOFT), 0, 1);
+    // A car on three tyres still steers, badly. The floor is what stops the
+    // grip limit collapsing to a straight line the model cannot follow.
+    handling.grip = Math.max(0.3, 1 - flats * TYRE_GRIP_LOSS);
+    handling.pull = pull * TYRE_PULL;
+    view.destroyed = destroyed;
+  }
+
+  /**
+   * Smoke and fire over time.
+   *
+   * An engine bay past `SMOKE_ONSET` steams; a write-off catches, burns for
+   * `FIRE_SECONDS` and then goes out, leaving a blackened shell that smoulders
+   * away to nothing. The shell itself stays: the fire is the only part of a
+   * destroyed car that is temporary.
+   */
+  private updateBurn(vehicle: Vehicle, dt: number): void {
+    const view = vehicle.view;
+    if (vehicle.burnTimer < 0) {
+      view.fire = 0;
+      view.smoke = clamp((view.regions.front - SMOKE_ONSET) / (1 - SMOKE_ONSET), 0, 1);
+      return;
+    }
+    vehicle.burnTimer += dt;
+    const t = vehicle.burnTimer;
+    view.fire =
+      t < IGNITION_SECONDS
+        ? t / IGNITION_SECONDS
+        : Math.max(0, 1 - (t - IGNITION_SECONDS) / FIRE_SECONDS);
+    const since = t - IGNITION_SECONDS - FIRE_SECONDS;
+    view.smoke = since < 0 ? 1 : Math.max(0, 1 - since / SMOULDER_SECONDS);
   }
 
   private report(
@@ -2318,12 +2710,20 @@ export class TrafficSim {
 
   /** Takes a vehicle out of the traffic AI without stopping it. */
   private goLoose(vehicle: Vehicle): void {
-    const fx = -Math.sin(vehicle.yaw);
-    const fz = -Math.cos(vehicle.yaw);
-    vehicle.vx = fx * vehicle.speed;
-    vehicle.vz = fz * vehicle.speed;
+    // A car on rails carries its velocity along its own axis, so that is where
+    // the free-body velocity comes from. A parked one is ALREADY a free body
+    // and may be sliding sideways; overwriting its velocity from its heading
+    // would throw away the sideways part of whatever just hit it.
+    if (vehicle.control !== 'parked') {
+      const fx = -Math.sin(vehicle.yaw);
+      const fz = -Math.cos(vehicle.yaw);
+      vehicle.vx = fx * vehicle.speed;
+      vehicle.vz = fz * vehicle.speed;
+    }
+    this.unpark(vehicle);
     vehicle.control = 'loose';
     vehicle.view.control = 'loose';
+    vehicle.view.state = 'loose';
     vehicle.looseTimer = 0;
     // A car already on its roof stays flagged; one on its wheels starts the
     // episode upright whatever happened to it in a previous life.
@@ -2355,7 +2755,22 @@ export class TrafficSim {
     vehicle.impactCooldown = 0;
     vehicle.integrity = VEHICLE_INTEGRITY;
     vehicle.damage = 0;
+    const points = vehicle.regionPoints;
+    points.front = 0;
+    points.rear = 0;
+    points.left = 0;
+    points.right = 0;
+    points.glass = 0;
+    points.tyres[0] = 0;
+    points.tyres[1] = 0;
+    points.tyres[2] = 0;
+    points.tyres[3] = 0;
+    vehicle.burnTimer = -1;
+    vehicle.abandoned = false;
+    vehicle.parkedAtRest = false;
+    this.unpark(vehicle);
     vehicle.view.overturned = false;
+    this.syncDamage(vehicle);
     this.pendingImpulses.delete(vehicle.id);
   }
 
@@ -2370,7 +2785,34 @@ export class TrafficSim {
    */
   private stepLoose(vehicle: Vehicle, dt: number, cameraDistance: number): void {
     vehicle.looseTimer += dt;
+    const resting = this.integrateFree(vehicle, dt, cameraDistance);
 
+    // At rest for long enough, or out of patience.
+    if (resting) {
+      vehicle.restTimer += dt;
+      if (vehicle.restTimer > SETTLE_SECONDS) this.settleLoose(vehicle);
+    } else vehicle.restTimer = 0;
+
+    this.syncView(vehicle);
+
+    if (vehicle.control === 'loose' && vehicle.looseTimer > LOOSE_LIMIT) {
+      // Same rule as `STUCK_LIMIT`: it waits, visibly, until the camera has
+      // moved on. Nothing is ever allowed to disappear in front of the player.
+      if (cameraDistance > RECYCLE_DISTANCE) this.recycle(vehicle);
+      else vehicle.looseTimer = LOOSE_LIMIT;
+    }
+  }
+
+  /**
+   * One step of a car that nothing is driving. Returns true once it is at rest.
+   *
+   * Shared by the two states that have no driver: a body still rolling after a
+   * crash, and one the player abandoned. They differ in what happens when the
+   * motion stops - one rejoins traffic or is written off, the other stays
+   * exactly where it is - and in nothing before that, so the physics lives
+   * here once.
+   */
+  private integrateFree(vehicle: Vehicle, dt: number, cameraDistance: number): boolean {
     const fx = -Math.sin(vehicle.yaw);
     const fz = -Math.cos(vehicle.yaw);
     const rx = Math.cos(vehicle.yaw);
@@ -2449,7 +2891,18 @@ export class TrafficSim {
       if (hitWall) {
         const lost = before - Math.hypot(vehicle.vx, vehicle.vz);
         vehicle.yawRate *= 0.5;
-        this.damage(vehicle, impactDamage(lost * vehicle.blueprint.chassis.mass));
+        // Charged to the end of the car that was leading. A body sliding
+        // sideways into a wall has no leading end, `Math.sign` returns zero,
+        // and the damage is spread over the shell - which is the honest answer.
+        const reach = vehicle.blueprint.length * 0.5 * Math.sign(wasAlong);
+        this.damage(
+          vehicle,
+          impactDamage(lost * vehicle.blueprint.chassis.mass),
+          vehicle.x + fx * reach,
+          vehicle.y + 0.6,
+          vehicle.z + fz * reach,
+          true,
+        );
         this.report(vehicle.x, vehicle.y + 0.6, vehicle.z, lost / 12, 'world');
       }
     } else {
@@ -2469,23 +2922,143 @@ export class TrafficSim {
 
     this.settleBody(vehicle, dt, cameraDistance);
 
-    // At rest for long enough, or out of patience.
-    if (
+    return (
       speed < REST_SPEED &&
       Math.abs(vehicle.yawRate) < REST_SPIN &&
       Math.abs(vehicle.rollRate) < REST_SPIN
-    ) {
+    );
+  }
+
+  // -- abandoned cars and wrecks ---------------------------------------------
+
+  /**
+   * Leaves a vehicle exactly where it is, with nobody in it.
+   *
+   * THIS IS WHAT HAPPENS WHEN THE PLAYER GETS OUT OF A CAR, and it is the
+   * whole reason the state exists. The old code handed the car back to the
+   * traffic AI, which found the nearest lane pointing roughly the right way,
+   * snapped the body onto its centreline, rotated it to the lane heading and
+   * drove it off - or, when no lane fitted, recycled it, so the car the player
+   * had just parked disappeared and reappeared somewhere across the city.
+   * Neither is what a parked car does.
+   *
+   * So: the transform is not touched. Not the position, not the heading, not
+   * the resting pitch and roll, not the damage. Whatever speed it still had
+   * becomes real velocity, which `stepParked` bleeds off against the road, so
+   * a car let go of at a walking pace rolls to a stop instead of stopping dead
+   * in mid-air. It is published as an obstacle the whole time, so traffic
+   * queues behind it and steers around it; it can be re-entered; and it is
+   * removed only by the bounded, out-of-view rule in `enforceParkedLimit`.
+   */
+  park(vehicle: Vehicle): void {
+    if (vehicle.control === 'parked') return;
+    if (vehicle.control !== 'loose') {
+      const fx = -Math.sin(vehicle.yaw);
+      const fz = -Math.cos(vehicle.yaw);
+      vehicle.vx = fx * vehicle.speed;
+      vehicle.vz = fz * vehicle.speed;
+    }
+    vehicle.control = 'parked';
+    vehicle.abandoned = true;
+    vehicle.parkedFrame = this.frame;
+    // Anything still rolling settles first; a car handed over at a standstill
+    // is at rest immediately and stops being integrated at all.
+    vehicle.parkedAtRest = false;
+    vehicle.braking = false;
+    vehicle.brakeHold = 0;
+    vehicle.stuck = 0;
+    vehicle.looseTimer = 0;
+    vehicle.restTimer = 0;
+    vehicle.accelLong = 0;
+    vehicle.accelLat = 0;
+    // No route: a parked car is not going anywhere, and leaving a stale
+    // continuation on it would give `advanceLane` something to act on if it
+    // were ever handed back to the AI.
+    vehicle.next = null;
+    vehicle.nextArc = null;
+    if (vehicle.claim) this.dropClaim(vehicle, vehicle.claim);
+    vehicle.claim = null;
+    const info = this.laneInfo.get(vehicle.laneId);
+    if (info) {
+      const index = info.occupants.indexOf(vehicle);
+      if (index >= 0) info.occupants.splice(index, 1);
+    }
+    if (!this.parked.includes(vehicle)) this.parked.push(vehicle);
+    this.syncView(vehicle);
+    this.enforceParkedLimit();
+  }
+
+  /** Takes a vehicle out of the abandoned pool without moving it. */
+  private unpark(vehicle: Vehicle): void {
+    if (vehicle.parkedFrame < 0) return;
+    const index = this.parked.indexOf(vehicle);
+    if (index >= 0) this.parked.splice(index, 1);
+    vehicle.parkedFrame = -1;
+    vehicle.parkedAtRest = false;
+  }
+
+  /**
+   * One step of an abandoned car or a wreck.
+   *
+   * Two regimes. While anything is still moving it is the same free body a
+   * crash produces, so a car shoved into a parked one rocks it, slides it and
+   * scrapes it along the wall behind it. Once it stops it is LATCHED: the pose
+   * is frozen and the only thing that still runs is the ground contact, which
+   * costs a height sample and is what keeps a wreck sitting on the road rather
+   * than hovering over the crown of it.
+   */
+  private stepParked(vehicle: Vehicle, dt: number, cameraDistance: number): void {
+    if (vehicle.parkedAtRest) {
+      vehicle.speed = 0;
+      vehicle.accelLong = 0;
+      vehicle.accelLat = 0;
+      this.settleBody(vehicle, dt, cameraDistance);
+      this.syncView(vehicle);
+      return;
+    }
+
+    if (this.integrateFree(vehicle, dt, cameraDistance)) {
       vehicle.restTimer += dt;
-      if (vehicle.restTimer > SETTLE_SECONDS) this.settleLoose(vehicle);
+      if (vehicle.restTimer > SETTLE_SECONDS) {
+        // Snap to the attitude the body is actually resting in - on its wheels
+        // or on its roof - exactly as `settleLoose` does, and then stop.
+        vehicle.crashRoll = vehicle.view.overturned
+          ? Math.sign(vehicle.crashRoll || 1) * Math.PI
+          : 0;
+        vehicle.rollRate = 0;
+        vehicle.yawRate = 0;
+        vehicle.vx = 0;
+        vehicle.vz = 0;
+        vehicle.speed = 0;
+        vehicle.parkedAtRest = true;
+      }
     } else vehicle.restTimer = 0;
 
     this.syncView(vehicle);
+  }
 
-    if (vehicle.control === 'loose' && vehicle.looseTimer > LOOSE_LIMIT) {
-      // Same rule as `STUCK_LIMIT`: it waits, visibly, until the camera has
-      // moved on. Nothing is ever allowed to disappear in front of the player.
-      if (cameraDistance > RECYCLE_DISTANCE) this.recycle(vehicle);
-      else vehicle.looseTimer = LOOSE_LIMIT;
+  /**
+   * Keeps the abandoned pool bounded, and never in front of the player.
+   *
+   * Oldest first, and only beyond `PARKED_REMOVE_MARGIN` past the render
+   * distance - which is to say only once the car has already stopped being
+   * drawn, so nothing ever vanishes on screen. See `PARKED_LIMIT` and
+   * `PARKED_HARD_LIMIT` for the two counts and why there are two.
+   */
+  private enforceParkedLimit(): void {
+    if (this.parked.length <= PARKED_LIMIT) return;
+    const removeAt = this.detailDistance + PARKED_REMOVE_MARGIN;
+    const limitSq = removeAt * removeAt;
+    let index = 0;
+    while (index < this.parked.length && this.parked.length > PARKED_LIMIT) {
+      const vehicle = this.parked[index] as Vehicle;
+      const dx = vehicle.x - this.cameraX;
+      const dz = vehicle.z - this.cameraZ;
+      if (dx * dx + dz * dz > limitSq || this.parked.length > PARKED_HARD_LIMIT) {
+        // `recycle` unparks it, which splices it out of this list, so the
+        // index deliberately does not advance.
+        this.recycle(vehicle);
+      } else index += 1;
     }
   }
 
@@ -2565,7 +3138,15 @@ export class TrafficSim {
     vehicle.vx = 0;
     vehicle.vz = 0;
     vehicle.speed = 0;
-    if (overturned || vehicle.integrity <= 0) return;
+    if (overturned || vehicle.integrity <= 0 || vehicle.abandoned) {
+      // Nothing here has a driver: a car on its roof, a write-off, or one the
+      // player got out of and left. It becomes a parked wreck, which is a
+      // BOUNDED, permanent state - it stays exactly where it stopped until the
+      // out-of-view rule in `enforceParkedLimit` takes it away - rather than
+      // sitting loose for `LOOSE_LIMIT` seconds and then vanishing.
+      this.park(vehicle);
+      return;
+    }
     const spot = this.findAttachLane(vehicle);
     if (!spot) return;
 
@@ -2829,7 +3410,12 @@ export class TrafficSim {
     view.roll = vehicle.groundRoll + vehicle.bodyRoll + vehicle.crashRoll;
     view.braking = vehicle.braking;
     view.accelLong = vehicle.accelLong;
-    view.control = vehicle.control;
+    // `control` answers "who is driving": for a parked car nobody is, which is
+    // exactly what `'loose'` has always meant. `state` carries the difference.
+    // See `VehicleState` for why the published union is deliberately narrower
+    // than the internal one.
+    view.control = vehicle.control === 'parked' ? 'loose' : vehicle.control;
+    view.state = vehicle.control;
     view.integrity = vehicle.integrity;
     view.damage = vehicle.damage;
   }
@@ -2838,8 +3424,14 @@ export class TrafficSim {
 
   /** Detaches a vehicle from the traffic AI. See `TrafficSystem.takeControl`. */
   detach(vehicle: Vehicle): void {
+    // Somebody has got into it, so it is no longer abandoned and no longer
+    // part of the parked pool - getting back into a car you parked has to take
+    // it out of the queue of things waiting to be tidied away.
+    this.unpark(vehicle);
+    vehicle.abandoned = false;
     vehicle.control = 'player';
     vehicle.view.control = 'player';
+    vehicle.view.state = 'player';
     if (vehicle.claim) this.dropClaim(vehicle, vehicle.claim);
     vehicle.claim = null;
     vehicle.speed = 0;
@@ -2854,17 +3446,22 @@ export class TrafficSim {
   /**
    * Returns a detached vehicle to ambient control on the nearest lane pointing
    * roughly the way it is facing, or recycles it when there is no such lane.
+   *
+   * NOT the path a car the player got out of takes - see `park`. This is for a
+   * body that still has a driver in it: a wreck that rolled to a stop beside a
+   * lane and is fit to be driven again, and nothing else.
    */
   attach(vehicle: Vehicle): void {
     const found = this.findAttachLane(vehicle);
     if (!found) {
       this.recycle(vehicle);
-      vehicle.control = 'ambient';
-      vehicle.view.control = 'ambient';
       return;
     }
+    this.unpark(vehicle);
+    vehicle.abandoned = false;
     vehicle.control = 'ambient';
     vehicle.view.control = 'ambient';
+    vehicle.view.state = 'ambient';
     vehicle.laneId = found.info.lane.id;
     vehicle.along = found.along;
     vehicle.stuck = 0;
@@ -3000,6 +3597,32 @@ export class TrafficSim {
     let count = 0;
     for (const vehicle of this.vehicles) if (vehicle.active) count += 1;
     return count;
+  }
+
+  /** Abandoned cars and wrecks currently held. Bounded by `PARKED_HARD_LIMIT`. */
+  get parkedCount(): number {
+    return this.parked.length;
+  }
+
+  /** How many of those are write-offs rather than cars somebody walked away from. */
+  get wreckCount(): number {
+    let count = 0;
+    for (const vehicle of this.parked) {
+      if (vehicle.integrity <= 0 || vehicle.view.overturned) count += 1;
+    }
+    return count;
+  }
+
+  /**
+   * The caps and the removal distance, so a test can assert against the real
+   * numbers rather than copies of them that could drift.
+   */
+  get parkedLimits(): { limit: number; hardLimit: number; removeDistance: number } {
+    return {
+      limit: PARKED_LIMIT,
+      hardLimit: PARKED_HARD_LIMIT,
+      removeDistance: this.detailDistance + PARKED_REMOVE_MARGIN,
+    };
   }
 }
 

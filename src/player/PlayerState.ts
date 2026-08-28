@@ -450,6 +450,12 @@ export class PlayerState {
    * Back to the start after dying or being arrested. Money and weapons are
    * kept - losing an hour of progress to one mistake is a punishment, not a
    * consequence - but the heat is gone and the player is whole again.
+   *
+   * THE INVARIANT, because it is the whole point of the method: this touches
+   * health, heat and the two recovery timers and NOTHING else. `ownedSet`,
+   * `equippedWeapon` and `ammoCounts` are deliberately absent from the body
+   * below, and a line that reset any of them would be the bug rather than the
+   * feature. `tests/weaponPersistence.test.ts` asserts exactly that.
    */
   respawn(): void {
     this.healthValue = MAX_HEALTH;

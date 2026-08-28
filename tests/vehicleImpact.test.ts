@@ -464,7 +464,9 @@ describe('an overturned car', () => {
     sim.applyImpact(car.id, tBone(car, 13000));
     run(sim, 6);
     expect(car.view.overturned).toBe(true);
-    expect(car.control, 'a car on its roof is not ambient traffic').toBe('loose');
+    expect(car.control, 'a car on its roof is not ambient traffic').toBe('parked');
+    expect(car.view.control, 'nobody is driving it').toBe('loose');
+    expect(car.view.state).toBe('parked');
     expect(Math.abs(car.crashRoll)).toBeCloseTo(Math.PI, 2);
     // The roll survives the distance culling that zeroes the road-slope angles.
     run(sim, 1, 1 / 60, 900, 900);
@@ -474,21 +476,30 @@ describe('an overturned car', () => {
     expect(car.bodyLift).toBeCloseTo(car.blueprint.height, 2);
   });
 
-  it('is recycled out of sight rather than lying in the road forever', () => {
+  it('stays on its roof where it stopped, watched or not', () => {
     const { sim, laneId } = makeSim();
     const car = seed(sim, laneId, 40, 0);
     sim.applyImpact(car.id, tBone(car, 13000));
     // Watched from close by, it stays: nothing may vanish in front of the
     // player who just caused it.
     run(sim, 25, 1 / 30, car.x, car.z);
-    expect(car.control).toBe('loose');
+    expect(car.control).toBe('parked');
     expect(car.view.overturned).toBe(true);
-    // Once the camera has moved on it goes, and the slot comes back as a fresh
-    // car with a fresh shell.
-    run(sim, 2, 1 / 30, car.x + 400, car.z + 400);
-    expect(car.view.overturned).toBe(false);
-    expect(car.integrity).toBe(VEHICLE_INTEGRITY);
-    expect(car.crashRoll).toBe(0);
+    const restX = car.x;
+    const restZ = car.z;
+    const restYaw = car.yaw;
+
+    // AND IT STILL STAYS once the camera has moved on. A wreck is part of the
+    // bounded abandoned pool now, not something on a countdown: one wreck is
+    // far below `PARKED_LIMIT`, so nothing is removed and the car the player
+    // rolled is still lying there when they come back. See the cleanup tests
+    // in `abandonedVehicle.test.ts` for the rule that eventually clears it.
+    run(sim, 30, 1 / 30, car.x + 400, car.z + 400);
+    expect(car.active).toBe(true);
+    expect(car.view.overturned).toBe(true);
+    expect(car.x).toBeCloseTo(restX, 6);
+    expect(car.z).toBeCloseTo(restZ, 6);
+    expect(car.yaw).toBeCloseTo(restYaw, 6);
   });
 
   it('cannot be taken over by a driving layer', () => {
@@ -572,7 +583,9 @@ describe('one damage model for every car', () => {
     sim.applyDamage(car.id, VEHICLE_INTEGRITY);
     run(sim, 6);
     expect(car.integrity).toBe(0);
-    expect(car.control, 'a write-off is a wreck, not traffic').toBe('loose');
+    expect(car.control, 'a write-off is a wreck, not traffic').toBe('parked');
+    expect(car.view.destroyed).toBe(true);
+    expect(car.view.handling.power, 'a write-off has no engine').toBe(0);
   });
 });
 

@@ -20,6 +20,9 @@
 
 import type { DistrictId } from '../world/CityPlan';
 import type { SurfaceId } from '../world/CityGround';
+// Type-only: the material table is erased at build time, so the audio layer
+// still imports nothing from the renderer at runtime.
+import type { MaterialKey } from '../render/materials';
 
 export type AudioAssetKind =
   | 'ambience'
@@ -83,12 +86,52 @@ export type VoiceAssetId = 'voice/harbour-pa-01';
  * sped up. `engine-far` carries tyre roll rather than exhaust, because a car
  * heard from across the street is mostly rubber on asphalt and because
  * mid-band content is what an HRTF panner can actually place.
+ *
+ * The original pair is the SALOON voice, and it stays exactly as it is. Five
+ * more idle/load pairs were rendered on 2026-08-28 so that a hatchback, a
+ * coupe, a van, a box truck and a police interceptor are five different
+ * engines rather than one engine at five playback rates. Band split of every
+ * layer, measured as the share of total power in each band with
+ * `ffmpeg -af lowpass/highpass,volumedetect` on the shipped file:
+ *
+ *   layer            <200 Hz   200-1500 Hz   >1500 Hz
+ *   engine-idle        70.8%      22.9%        6.3%
+ *   engine-load        53.6%      30.2%       16.2%
+ *   small-idle         47.6%      33.0%       19.4%
+ *   small-load         52.9%      37.5%        9.6%
+ *   sport-idle         80.4%      18.8%        0.8%
+ *   sport-load         14.7%      64.1%       21.2%
+ *   diesel-idle        37.6%      40.3%       22.1%
+ *   diesel-load        32.3%      34.6%       33.1%
+ *   truck-idle         79.3%      14.4%        6.3%
+ *   truck-load         64.7%      27.0%        8.3%
+ *   v8-idle            70.6%      20.3%        9.1%
+ *   v8-load            21.0%      53.9%       25.2%
+ *   tyre-roll           4.2%      74.4%       21.4%
+ *
+ * `tyre-roll` is a separate layer rather than part of the engine loops because
+ * tyre roar tracks ROAD SPEED and the engine note tracks REVS: those diverge on
+ * every gearchange, and baking them together makes an upshift sound like the
+ * whole car briefly slowing down.
  */
 export type VehicleAssetId =
   | 'veh/engine-idle'
   | 'veh/engine-load'
+  | 'veh/engine-small-idle'
+  | 'veh/engine-small-load'
+  | 'veh/engine-sport-idle'
+  | 'veh/engine-sport-load'
+  | 'veh/engine-diesel-idle'
+  | 'veh/engine-diesel-load'
+  | 'veh/engine-truck-idle'
+  | 'veh/engine-truck-load'
+  | 'veh/engine-v8-idle'
+  | 'veh/engine-v8-load'
   | 'veh/engine-far'
+  | 'veh/tyre-roll'
   | 'veh/tyre-scrub'
+  | 'veh/gear-shift'
+  | 'veh/brake-squeal'
   | 'veh/door-open'
   | 'veh/door-close'
   | 'veh/impact'
@@ -736,6 +779,64 @@ function vehicleGeneration(
   };
 }
 
+/**
+ * The 2026-08-28 per-class engine batch.
+ *
+ * A second date rather than a rewrite of `vehicleGeneration`, so the original
+ * saloon pair keeps its own provenance and these keep theirs.
+ */
+const ENGINE_CLASS_GENERATED_ON = '2026-08-28';
+
+function engineClassGeneration(
+  prompt: string,
+  seconds: number,
+  promptInfluence: number,
+  loop: boolean,
+): AudioGeneration {
+  return {
+    provider: 'elevenlabs',
+    modelId: SFX_MODEL,
+    prompt,
+    date: ENGINE_CLASS_GENERATED_ON,
+    credits: Number((seconds * CREDITS_PER_SECOND).toFixed(4)),
+    parameters: {
+      duration_seconds: seconds,
+      prompt_influence: promptInfluence,
+      loop,
+      output_format: 'mp3_44100_128',
+    },
+  };
+}
+
+/**
+ * One class engine layer.
+ *
+ * Every one of the ten is 6.000 s, 44100 Hz, 2 ch, 97,010 bytes, rendered at
+ * `duration_seconds: 6, prompt_influence: 0.6, loop: true` for 20 credits, so
+ * the only things that vary per entry are the id, the trim and the prompt.
+ * Spelling all ten out longhand would be 130 lines of the same six fields.
+ */
+function engineLayer(id: VehicleAssetId, trimDb: number, prompt: string): AudioAsset {
+  return {
+    id,
+    path: `/audio/${id}.mp3`,
+    kind: 'vehicle',
+    duration: 6.0,
+    loop: true,
+    sampleRate: 44100,
+    channels: 2,
+    bytes: 97010,
+    trimDb,
+    generation: engineClassGeneration(prompt, 6, 0.6, true),
+  };
+}
+
+/** Shared tail of every engine prompt; see the tool for why it is needed. */
+const STEADY_ENGINE =
+  'perfectly steady and even with no acceleration and no revving up or down, ' +
+  'continuous mechanical texture, close exterior recording, ' +
+  'no music, no speech, no tyres, no wind, no other sound';
+
 const VEHICLE: readonly AudioAsset[] = [
   {
     id: 'veh/engine-idle',
@@ -804,6 +905,117 @@ const VEHICLE: readonly AudioAsset[] = [
       'a car braking hard on dry asphalt, rubber tyres scrubbing and chirping against the road surface with brake pad squeal, ending as the car stops, close dry recording, no engine, no music, no speech',
       1.6,
       0.75,
+      false,
+    ),
+  },
+  /*
+   * The five class voices, levelled onto the saloon pair by LOUDNESS rather
+   * than by peak: every `-idle` layer sits at -21.2 dBFS mean after its trim
+   * and every `-load` layer at -18.2 dBFS, which is where the shipped saloon
+   * pair sits. Peak-normalising them instead put the coupe's idle 4.8 dB over
+   * the saloon's purely because that render came back hotter, and the class
+   * difference is supposed to come from `engineCurve.ts`.
+   */
+  engineLayer(
+    'veh/engine-small-idle',
+    6.9,
+    `a small 1.2 litre four cylinder petrol car engine ticking over at idle, light rattly four cylinder pulses and a thin exhaust note, ${STEADY_ENGINE}`,
+  ),
+  engineLayer(
+    'veh/engine-small-load',
+    -4.8,
+    `a small four cylinder petrol car engine held at mid revs under load, a hard buzzy exhaust drone with clearly audible four cylinder firing pulses and a low engine thrum underneath, recorded behind the car, no hiss, no whistle, no turbo whine, no wind noise, ${STEADY_ENGINE}`,
+  ),
+  engineLayer(
+    'veh/engine-sport-idle',
+    -4.8,
+    `a sports car engine idling with a hard uneven lumpy racing cam, an offbeat burble with a sharp metallic rasp on every pulse and audible valvetrain ticking over it, bright and hard edged, not a smooth low drone, no rumble bed, no wind noise, ${STEADY_ENGINE}`,
+  ),
+  engineLayer(
+    'veh/engine-sport-load',
+    -1.9,
+    `a high revving sports car engine held wide open at high revs, hard bright ripping exhaust howl with mechanical intake roar, ${STEADY_ENGINE}`,
+  ),
+  engineLayer(
+    'veh/engine-diesel-idle',
+    -3.3,
+    `a diesel delivery van engine idling cold, loud clattery diesel knock and a slow uneven low rumble, ${STEADY_ENGINE}`,
+  ),
+  engineLayer(
+    'veh/engine-diesel-load',
+    -5.3,
+    `a diesel delivery van engine pulling hard at mid revs under load, gruff clattering diesel roar with turbo whistle over it, ${STEADY_ENGINE}`,
+  ),
+  engineLayer(
+    'veh/engine-truck-idle',
+    -4.7,
+    `a large heavy goods truck diesel engine idling, very deep slow heavy rumble with a hard metallic diesel knock, ${STEADY_ENGINE}`,
+  ),
+  engineLayer(
+    'veh/engine-truck-load',
+    -2.9,
+    `a large heavy goods truck diesel engine labouring under full load at low revs, enormous deep bellowing diesel roar with a loud turbo whine, ${STEADY_ENGINE}`,
+  ),
+  engineLayer(
+    'veh/engine-v8-idle',
+    -4.0,
+    `a large american V8 police interceptor engine idling, deep loping V8 burble with a heavy offbeat thump, ${STEADY_ENGINE}`,
+  ),
+  engineLayer(
+    'veh/engine-v8-load',
+    -7.8,
+    `a large american V8 police interceptor engine accelerating hard and held at high revs, huge muscular V8 roar with a hard bark in it, ${STEADY_ENGINE}`,
+  ),
+  {
+    id: 'veh/tyre-roll',
+    path: '/audio/veh/tyre-roll.mp3',
+    kind: 'vehicle',
+    duration: 6.0,
+    loop: true,
+    sampleRate: 44100,
+    channels: 2,
+    bytes: 97010,
+    // Mean-normalised to -24 dBFS, six under the load layers, because this is
+    // a bed under the engine rather than a voice beside it.
+    trimDb: -6.7,
+    generation: engineClassGeneration(
+      'seamless looping tyre roar of car tyres rolling fast over coarse dry asphalt, a steady broadband rushing hiss with a low rumble under it, recorded from just above the wheel arch, absolutely even and continuous, no engine, no music, no speech, no wind gusts, no other sound',
+      6,
+      0.6,
+      true,
+    ),
+  },
+  {
+    id: 'veh/gear-shift',
+    path: '/audio/veh/gear-shift.mp3',
+    kind: 'vehicle',
+    duration: 0.680249,
+    loop: false,
+    sampleRate: 44100,
+    channels: 2,
+    bytes: 12164,
+    trimDb: -4.1,
+    generation: engineClassGeneration(
+      'one single automatic gearbox upshift inside a car, a soft mechanical clunk with a brief drop in engine tone, close dry recording, no music, no speech, no other sound',
+      0.7,
+      0.8,
+      false,
+    ),
+  },
+  {
+    id: 'veh/brake-squeal',
+    path: '/audio/veh/brake-squeal.mp3',
+    kind: 'vehicle',
+    duration: 1.2,
+    loop: false,
+    sampleRate: 44100,
+    channels: 2,
+    bytes: 20106,
+    trimDb: -1.0,
+    generation: engineClassGeneration(
+      'one single light brake disc squeal as a car slows to a stop, a short high metallic ringing whine from the brake pads that fades out, no tyre skid, no engine, close dry recording, no music, no speech, no other sound',
+      1.2,
+      0.8,
       false,
     ),
   },
@@ -1611,6 +1823,24 @@ export const LAZY_ASSET_IDS: ReadonlySet<AudioAssetId> = new Set<AudioAssetId>([
   MUSIC_ASSET_ID,
   ...AUDIO_ASSETS.filter((asset) => asset.kind === 'aircraft').map((asset) => asset.id),
   AIRPORT_BED,
+  // The five class engine pairs and the tyre bed. 1.07 MB between them, and a
+  // player who never gets into a box truck never needs the box truck. They are
+  // requested by `StreetAudio` on the frame the player takes control of a car,
+  // which is one quiet second on a first drive rather than a slower unlock for
+  // everybody. The SALOON pair is deliberately NOT here: it is the fallback
+  // voice for a class whose own layers have not arrived yet, so it has to be
+  // resident before the first door closes.
+  'veh/engine-small-idle',
+  'veh/engine-small-load',
+  'veh/engine-sport-idle',
+  'veh/engine-sport-load',
+  'veh/engine-diesel-idle',
+  'veh/engine-diesel-load',
+  'veh/engine-truck-idle',
+  'veh/engine-truck-load',
+  'veh/engine-v8-idle',
+  'veh/engine-v8-load',
+  'veh/tyre-roll',
 ]);
 
 /** Assets fetched eagerly once the context is unlocked. */
@@ -1623,55 +1853,155 @@ export const PRELOAD_ASSET_IDS: readonly AudioAssetId[] = AUDIO_ASSETS.filter(
 // ---------------------------------------------------------------------------
 
 /**
- * Two variants per surface so the runtime can alternate and avoid a metronome.
+ * The eight footstep MATERIALS the game owns recordings for.
  *
- * `plaza` and `sand` reuse a neighbouring surface rather than carrying their own
- * recordings: paving slabs read correctly for a paved plaza, and loose gravel is
- * the closest match for dry sand. `water` is mapped for completeness only — the
- * player controller stops them before they can wade — and takes the gravel pair
- * as the nearest wet-crunch.
+ * This is the vocabulary the mixer actually speaks. It is deliberately not
+ * `SurfaceId`: that type classifies TERRAIN, and a footstep is decided by what
+ * is under the sole, which is often a built floor the terrain knows nothing
+ * about. Two things map into it - the terrain surface (`SURFACE_STEP_FAMILY`)
+ * and, when the world tagged one, the collider's own material
+ * (`MATERIAL_STEP_FAMILY`) - and the collider wins, because it is the
+ * authoritative answer rather than a guess from the ground underneath.
  */
-export const STEP_SURFACES: Readonly<Record<SurfaceId, readonly [StepAssetId, StepAssetId]>> = {
+export type StepFamily =
+  | 'asphalt'
+  | 'pavement'
+  | 'boardwalk'
+  | 'gravel'
+  | 'grass'
+  | 'interior'
+  | 'concrete'
+  | 'terminal';
+
+/** Two variants per family so the runtime can alternate and avoid a metronome. */
+export const STEP_FAMILIES: Readonly<Record<StepFamily, readonly [StepAssetId, StepAssetId]>> = {
   asphalt: ['steps/asphalt-1', 'steps/asphalt-2'],
   pavement: ['steps/pavement-1', 'steps/pavement-2'],
   boardwalk: ['steps/boardwalk-1', 'steps/boardwalk-2'],
-  plaza: ['steps/pavement-1', 'steps/pavement-2'],
-  grass: ['steps/grass-1', 'steps/grass-2'],
-  sand: ['steps/gravel-1', 'steps/gravel-2'],
   gravel: ['steps/gravel-1', 'steps/gravel-2'],
-  water: ['steps/gravel-1', 'steps/gravel-2'],
+  grass: ['steps/grass-1', 'steps/grass-2'],
+  /** A domestic hard floor: a shop, a bar, a flat. Ceramic tile. */
   interior: ['steps/interior-1', 'steps/interior-2'],
-  // Airfield concrete. It takes the paving-slab pair rather than the asphalt
-  // one: a boot on a concrete apron is a hard flat slap, and asphalt is the
-  // grittier of the two recordings.
-  concrete: ['steps/pavement-1', 'steps/pavement-2'],
+  /** Bare poured apron, taxiway or hangar slab. A hard flat slap with grit. */
+  concrete: ['steps/concrete-1', 'steps/concrete-2'],
+  /** A polished public floor: the terminal, a marble lobby. A bright click. */
+  terminal: ['steps/terminal-1', 'steps/terminal-2'],
 };
 
 /**
- * The surface a carriageway is. `GroundSample.onRoad` is the world's
- * authoritative answer to "am I standing on a road", and the footstep mixer
- * uses it to override a sampled surface that disagrees.
+ * The terrain surface a foot lands on, when nothing built is under it.
+ *
+ * `plaza` and `sand` reuse a neighbouring family rather than carrying their own
+ * recordings: paving slabs read correctly for a paved plaza, and loose gravel is
+ * the closest match for dry sand. `water` is mapped for completeness only - the
+ * player controller stops them before they can wade - and takes the gravel pair
+ * as the nearest wet-crunch.
+ *
+ * `concrete` USED TO POINT AT THE PAVEMENT PAIR while the two concrete
+ * recordings sat in the manifest unreferenced, so every step on the runway, the
+ * taxiway, the apron and a hangar floor - 5,461 of the 6,276 built-floor points
+ * in the world - was a city paving slab. That was the whole reason
+ * `CONCRETE_STEPS` existed as a separate export.
  */
-export const ROAD_SURFACE: SurfaceId = 'asphalt';
+export const SURFACE_STEP_FAMILY: Readonly<Record<SurfaceId, StepFamily>> = {
+  asphalt: 'asphalt',
+  pavement: 'pavement',
+  boardwalk: 'boardwalk',
+  plaza: 'pavement',
+  grass: 'grass',
+  sand: 'gravel',
+  gravel: 'gravel',
+  water: 'gravel',
+  interior: 'interior',
+  concrete: 'concrete',
+};
 
 /**
- * The two airfield pairs, exported for whoever adds the surfaces that use them.
+ * The collider material a foot lands on, when the world tagged one.
  *
- * `STEP_SURFACES` is exhaustive over `SurfaceId`, so a new surface has to
- * appear there or the file stops compiling. These are the pairs to map it to:
- * `CONCRETE_STEPS` is a bare poured apron or taxiway, hard and flat with grit
- * under the sole, and audibly not the same as the `pavement` slab; `TERMINAL_STEPS`
- * is a polished hard floor with a bright leather click, and is not the same as
- * the domestic `interior` tile.
+ * `ColliderBox.surface` exists so that "a footstep on a hangar floor is not
+ * decided by guessing from the terrain underneath it" (`world/build/types.ts`),
+ * and until now nothing in audio read it: every built floor above the terrain
+ * was collapsed to the single literal `'interior'`, so a `tileFloor` terminal
+ * slab, a `timber` club floor and a `concrete` hangar floor were one sound.
+ *
+ * Partial on purpose. A material with no entry here is not walkable, or is not
+ * distinctive enough to be worth its own family, and the caller falls back to
+ * the terrain surface - which is the right answer for an untagged outdoor
+ * platform such as a shop plinth or a boardwalk deck.
+ *
+ * Two mappings are worth their reasons:
+ *
+ *   timber/timberDark -> boardwalk   The wood family IS the boardwalk pair,
+ *     which is hollow decking over a cavity. A club floor on joists is
+ *     acoustically the same thing, and it is the only wood in the manifest.
+ *   metal and corrugated -> terminal  A steel jetway or hangar walkway is a
+ *     bright, hard, short-tailed contact, which is the terminal recording
+ *     rather than the gritty concrete one.
  */
-export const CONCRETE_STEPS: readonly [StepAssetId, StepAssetId] = [
-  'steps/concrete-1',
-  'steps/concrete-2',
-];
-export const TERMINAL_STEPS: readonly [StepAssetId, StepAssetId] = [
-  'steps/terminal-1',
-  'steps/terminal-2',
-];
+export const MATERIAL_STEP_FAMILY: Readonly<Partial<Record<MaterialKey, StepFamily>>> = {
+  asphalt: 'asphalt',
+  asphaltWorn: 'asphalt',
+  roadPaint: 'asphalt',
+  roadPaintYellow: 'asphalt',
+  roofTar: 'asphalt',
+  kerb: 'pavement',
+  pavement: 'pavement',
+  pavementDark: 'pavement',
+  plazaStone: 'pavement',
+  roofTile: 'pavement',
+  brickRed: 'pavement',
+  brickBuff: 'pavement',
+  boardwalk: 'boardwalk',
+  timber: 'boardwalk',
+  timberDark: 'boardwalk',
+  gravel: 'gravel',
+  sand: 'gravel',
+  sandWet: 'gravel',
+  grass: 'grass',
+  foliage: 'grass',
+  foliageDark: 'grass',
+  concrete: 'concrete',
+  concreteBoard: 'concrete',
+  tileFloor: 'terminal',
+  stoneAshlar: 'terminal',
+  metalDark: 'terminal',
+  metalLight: 'terminal',
+  paintedMetal: 'terminal',
+  corrugated: 'terminal',
+};
+
+/** The family a tagged collider material sounds like, or null if it has none. */
+export function stepFamilyForMaterial(material: string | undefined): StepFamily | null {
+  if (material === undefined) return null;
+  return MATERIAL_STEP_FAMILY[material as MaterialKey] ?? null;
+}
+
+/** The two variants a family alternates between. */
+export function stepVariantsFor(family: StepFamily): readonly [StepAssetId, StepAssetId] {
+  return STEP_FAMILIES[family];
+}
+
+/**
+ * Terrain surface to variants, kept as the shape `StreetAudio` needs for the
+ * crowd - a pedestrian is placed on the ground and has no collider under them.
+ *
+ * Derived rather than authored, so `SURFACE_STEP_FAMILY` is the only table that
+ * has to stay exhaustive over `SurfaceId`.
+ */
+export const STEP_SURFACES: Readonly<Record<SurfaceId, readonly [StepAssetId, StepAssetId]>> =
+  Object.freeze(
+    Object.fromEntries(
+      (Object.keys(SURFACE_STEP_FAMILY) as SurfaceId[]).map((surface) => [
+        surface,
+        STEP_FAMILIES[SURFACE_STEP_FAMILY[surface]],
+      ]),
+    ) as Record<SurfaceId, readonly [StepAssetId, StepAssetId]>,
+  );
+
+/** The airfield pairs, kept as named exports for the tests that pin them. */
+export const CONCRETE_STEPS: readonly [StepAssetId, StepAssetId] = STEP_FAMILIES.concrete;
+export const TERMINAL_STEPS: readonly [StepAssetId, StepAssetId] = STEP_FAMILIES.terminal;
 
 /**
  * The sea layer.
@@ -1742,13 +2072,33 @@ export const VEHICLE_SOUNDS = {
   engineIdle: 'veh/engine-idle',
   engineLoad: 'veh/engine-load',
   engineFar: 'veh/engine-far',
+  tyreRoll: 'veh/tyre-roll',
   tyreScrub: 'veh/tyre-scrub',
+  gearShift: 'veh/gear-shift',
+  brakeSqueal: 'veh/brake-squeal',
   doorOpen: 'veh/door-open',
   doorClose: 'veh/door-close',
   impact: 'veh/impact',
   impactLight: 'veh/impact-light',
   impactHeavy: 'veh/impact-heavy',
 } as const satisfies Readonly<Record<string, VehicleAssetId>>;
+
+/**
+ * The idle/load pair each engine voice is built from.
+ *
+ * Keyed by `EngineVoice` from `engineCurve.ts`, which is where the mapping from
+ * a catalogue `VehicleKind` to a voice lives. Two tables rather than one so
+ * this file stays free of any import from `src/traffic`, and so adding a body
+ * shell is a one-line change over there rather than a manifest edit here.
+ */
+export const ENGINE_VOICE_LAYERS = {
+  small: { idle: 'veh/engine-small-idle', load: 'veh/engine-small-load' },
+  saloon: { idle: 'veh/engine-idle', load: 'veh/engine-load' },
+  sport: { idle: 'veh/engine-sport-idle', load: 'veh/engine-sport-load' },
+  diesel: { idle: 'veh/engine-diesel-idle', load: 'veh/engine-diesel-load' },
+  truck: { idle: 'veh/engine-truck-idle', load: 'veh/engine-truck-load' },
+  interceptor: { idle: 'veh/engine-v8-idle', load: 'veh/engine-v8-load' },
+} as const satisfies Readonly<Record<string, { idle: VehicleAssetId; load: VehicleAssetId }>>;
 
 /**
  * The pursuit pair. Both loops, both driven per unit by `PoliceAudio`.

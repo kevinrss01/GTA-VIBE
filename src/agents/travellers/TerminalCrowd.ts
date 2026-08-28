@@ -76,9 +76,13 @@ import { ModelLibrary, type LoadedModel } from '../../world/ModelLibrary';
 import type { ColliderBox } from '../../world/build/types';
 import { createPedestrianVatMesh, type PedestrianVatBundle } from '../PedestrianRig';
 import {
+  IDLE_MIN_PERIOD,
   loadPedestrianVat,
   PEDESTRIAN_VAT_BASE,
-  PEDESTRIAN_VAT_IDS,
+  TERMINAL_ROSTER_BUDGET,
+  TERMINAL_VAT_IDS,
+  VAT_FOOTPRINT,
+  VAT_STATURE,
   type PedestrianVatCharacter,
 } from '../PedestrianVat';
 import {
@@ -88,6 +92,7 @@ import {
   placeSeated,
   SEATED_MODELS,
   SEATED_SPECS,
+  type HandPoint,
   type LuggageKind,
   type PropPlacement,
   type SeatedModel,
@@ -107,22 +112,32 @@ export type TravellerQuality = 'low' | 'medium' | 'high';
 /**
  * Simulated travellers per quality level.
  *
- * The terminal is 62 by 190 metres. Fifty-two people in it is a quiet regional
- * field an hour before a departure, which is the read this is aiming for; two
- * hundred would be an international pier and would cost four times the vertex
- * work for a building the player passes through.
+ * RAISED from 52 at 'high', because the terminal was measured reading as
+ * deserted at exactly the moment the street outside was reading as a riot.
+ * Standing at (183, 470) looking north up the concourse in a production build,
+ * 43 travellers were drawn - over a hall 62 by 190 metres, most of them behind
+ * a check-in desk or a security partition, which left two people in shot.
+ *
+ * Seventy-eight walkers plus thirty-eight seated is a quiet regional field an
+ * hour before a departure, which is the read this is aiming for. Two hundred
+ * would be an international pier and would cost four times the vertex work for
+ * a building the player passes through.
+ *
+ * This population exists ONLY inside one building: `update` returns before it
+ * simulates or draws anything from more than `EXIT_RANGE` away, so none of it
+ * is ever added to the city's frame.
  */
 const POPULATION: Readonly<Record<TravellerQuality, number>> = {
-  low: 24,
-  medium: 38,
-  high: 52,
+  low: 34,
+  medium: 56,
+  high: 78,
 };
 
 /** Seats filled per quality level, capped by however many anchors exist. */
 const SEATED: Readonly<Record<TravellerQuality, number>> = {
-  low: 12,
-  medium: 22,
-  high: 32,
+  low: 16,
+  medium: 28,
+  high: 38,
 };
 
 /** Beyond this a traveller is not drawn. The concourse is long. */
@@ -140,8 +155,15 @@ const DRAW_RADIUS: Readonly<Record<TravellerQuality, number>> = {
 const ENTER_RANGE = 58;
 const EXIT_RANGE = 72;
 
-/** Share of the seat anchors that get somebody on them. */
-const SEAT_OCCUPANCY = 0.58;
+/**
+ * Share of the seat anchors that get somebody on them.
+ *
+ * Raised with the population: a gate lounge with two thirds of its seats taken
+ * reads as a flight about to board, which is what the rest of the terminal is
+ * dressed as. `planSeats` still refuses a seat whose neighbours leave no room
+ * for the pose, so this is an upper bound rather than a guarantee.
+ */
+const SEAT_OCCUPANCY = 0.74;
 
 /** Share of seated figures that use the wide leaning pose, where it fits. */
 const LEANING_SHARE = 0.34;
@@ -177,6 +199,16 @@ export interface TerminalCrowdOptions {
    * the whole reason to share in the first place.
    */
   readonly characters?: readonly PedestrianVatCharacter[] | undefined;
+  /**
+   * Which baked characters to draw from. Defaults to the terminal roster.
+   *
+   * EVERY ID COSTS ONE COLOUR DRAW CALL AND ONE SHADOW DRAW CALL, so this is a
+   * rendering budget as much as a cast list; it is truncated to
+   * `TERMINAL_ROSTER_BUDGET`. Kept separate from the street crowd's roster on
+   * purpose: eight airport characters must not add sixteen draw calls to
+   * downtown, where they would never be seen.
+   */
+  readonly roster?: readonly string[] | undefined;
 }
 
 /**
@@ -325,6 +357,11 @@ export class TerminalCrowd {
   /** Geometry cloned from a caller's characters; disposed with this object. */
   private readonly clonedGeometry: BufferGeometry[] = [];
   private readonly loadedBundles: PedestrianVatBundle[] = [];
+  /** The ids this crowd draws, already truncated to its draw-call budget. */
+  private readonly roster: readonly string[];
+  /** Scratch for the per-frame hand lookup. Reused, never allocated in a loop. */
+  private readonly handPoint = { x: 0, y: 0, z: 0 };
+  private readonly handPointB = { x: 0, y: 0, z: 0 };
   private readonly models = new ModelLibrary();
   private readonly luggage = new Map<LuggageKind, FittedModel>();
   private readonly luggageMeshes = new Map<LuggageKind, InstancedMesh>();
@@ -357,6 +394,7 @@ export class TerminalCrowd {
     this.drawRadius = DRAW_RADIUS[this.quality];
     this.seed = options.seed ?? 0x7a11e4;
     this.presetCharacters = options.characters ?? null;
+    this.roster = (options.roster ?? TERMINAL_VAT_IDS).slice(0, TERMINAL_ROSTER_BUDGET);
 
     // Who is sitting where is decided FIRST, because an occupied seat is an
     // obstacle. A seated figure is 0.8 m from its back to its toes and those
@@ -378,25 +416,30 @@ export class TerminalCrowd {
       graph: this.graph,
       queues: options.queues,
       population,
-      variants: PEDESTRIAN_VAT_IDS.length,
+      variants: this.roster.length,
+      // The roster's own body data, indexed the way the simulation indexes
+      // variants. Both default to "whatever the crowd drew" for an id with no
+      // entry, so a character list this file knows nothing about still works.
+      variantStature: this.roster.map((id) => VAT_STATURE[id]),
+      variantSpacing: this.roster.map((id) => VAT_FOOTPRINT[id] ?? 1),
       seed: this.seed,
     });
 
     this.group = new Group();
     this.group.name = 'terminal-travellers';
     this.group.visible = false;
-    this.counts = new Int32Array(PEDESTRIAN_VAT_IDS.length);
+    this.counts = new Int32Array(this.roster.length);
 
     // Every character's mesh joins the scene EMPTY, before its files exist, so
     // `main.ts`'s pre-compile pass behind the loading screen builds its
     // program. It shares `customProgramCacheKey` with the street crowd, so in
     // practice that pass finds the program already built and this costs
     // nothing at all.
-    for (let slot = 0; slot < PEDESTRIAN_VAT_IDS.length; slot += 1) {
+    for (let slot = 0; slot < this.roster.length; slot += 1) {
       // Slot 10 upward: the crowd owns 0-3 and the police 4. The number only
       // ever reaches a debug name.
       const bundle = createPedestrianVatMesh(Math.max(1, population), 10 + slot);
-      bundle.mesh.name = `traveller-${PEDESTRIAN_VAT_IDS[slot] ?? slot}`;
+      bundle.mesh.name = `traveller-${this.roster[slot] ?? slot}`;
       bundle.mesh.castShadow = this.castsShadows;
       bundle.mesh.receiveShadow = true;
       this.bundles.push(bundle);
@@ -481,13 +524,24 @@ export class TerminalCrowd {
   async load(): Promise<void> {
     if (this.disposed) return;
     const vatBase = `${this.baseUrl}${PEDESTRIAN_VAT_BASE}`;
-    const characters = this.presetCharacters
-      ? this.presetCharacters.slice(0, PEDESTRIAN_VAT_IDS.length).map((character) => {
-          const geometry = character.geometry.clone();
-          this.clonedGeometry.push(geometry);
-          return { ...character, geometry };
-        })
-      : await Promise.all(PEDESTRIAN_VAT_IDS.map((id) => loadPedestrianVat(id, vatBase)));
+    /*
+     * A caller's own characters are reused BY ID rather than by position: the
+     * two rosters overlap but are not the same list, so slot 0 of the crowd's
+     * cast is not slot 0 of this one. Anything the caller does not have is
+     * downloaded, which is the same code path a build with no shared
+     * characters at all takes.
+     */
+    const preset = new Map<string, PedestrianVatCharacter>();
+    for (const character of this.presetCharacters ?? []) preset.set(character.id, character);
+    const characters = await Promise.all(
+      this.roster.map(async (id) => {
+        const shared = preset.get(id);
+        if (!shared) return loadPedestrianVat(id, vatBase);
+        const geometry = shared.geometry.clone();
+        this.clonedGeometry.push(geometry);
+        return { ...shared, geometry };
+      }),
+    );
 
     if (this.disposed) {
       // Disposed while the download was in flight. Whatever arrived is ours to
@@ -505,13 +559,14 @@ export class TerminalCrowd {
       const character = characters[i];
       const bundle = this.bundles[i];
       if (!character || !bundle) {
-        if (!character) this.missing.push(PEDESTRIAN_VAT_IDS[i] ?? `character-${i}`);
+        if (!character) this.missing.push(this.roster[i] ?? `character-${i}`);
         continue;
       }
       bundle.install(character);
       this.characters.push(character);
       this.loadedBundles.push(bundle);
-      if (!this.presetCharacters) this.ownedCharacters.push(character);
+      // Only the ones this instance downloaded are ours to dispose.
+      if (!preset.has(character.id)) this.ownedCharacters.push(character);
     }
 
     await Promise.all([this.loadLuggage(), this.loadSeated()]);
@@ -813,16 +868,7 @@ export class TerminalCrowd {
       const anim = bundle.anim.array as Float32Array;
       const a = n * 4;
       anim[a] = character.walk.phaseFor(t.walked);
-      const idle = character.idle;
-      if (idle && idle.duration > 1e-3) {
-        // The idle has no travel to key off, so it runs on the clock at a
-        // per-person rate and offset. Two neighbours breathing in unison is
-        // the giveaway a queue makes most obvious.
-        const rate = (0.85 + 0.3 * hash2(look.preferredSpeed, look.cadence, 11)) / idle.duration;
-        anim[a + 1] = (hash2(look.height, look.girth, 23) + ctx.time * rate) % 1;
-      } else {
-        anim[a + 1] = 0;
-      }
+      anim[a + 1] = TerminalCrowd.idlePhase(t, character.idle?.duration ?? 0, ctx.time);
       anim[a + 2] = clamp(t.gait, 0, 1);
       // The civilian bakes carry no action clip, so the blend stays at zero
       // and the shader never fetches it.
@@ -871,7 +917,7 @@ export class TerminalCrowd {
       const n = this.luggageCounts.get(kind) ?? 0;
       if (n >= mesh.instanceMatrix.count) continue;
       this.luggageCounts.set(kind, n + 1);
-      this.placeFor(t, kind, fitted);
+      this.placeFor(t, kind, fitted, ctx);
       writeInstance(
         mesh.instanceMatrix.array as Float32Array,
         n,
@@ -893,15 +939,72 @@ export class TerminalCrowd {
     }
   }
 
-  /** Where one traveller's luggage goes, into the shared scratch placement. */
-  private placeFor(t: Traveller, kind: LuggageKind, fitted: FittedModel): void {
+  /**
+   * Where one traveller's luggage goes, into the shared scratch placement.
+   *
+   * A held bag follows the hand the bake measured, when this traveller's
+   * character carries a hand track and the piece is one that is actually held.
+   * The clip is chosen the same way the shader chooses it - walk above the gait
+   * threshold, idle below - so the bag is on the hand the player can see.
+   */
+  private placeFor(
+    t: Traveller,
+    kind: LuggageKind,
+    fitted: FittedModel,
+    ctx: TerminalCrowdContext,
+  ): void {
+    let hand: HandPoint | null = null;
+    const character = this.characters[t.variant % Math.max(1, this.characters.length)];
+    if (character) {
+      /*
+       * The SAME blend the shader does, so the bag is on the hand the player
+       * is actually looking at: walk and idle sampled at the phases
+       * `writeCharacters` wrote into `iAnim`, mixed by the same gait.
+       */
+      const gait = clamp(t.gait, 0, 1);
+      const walk = character.walk;
+      const idle = character.idle;
+      const gotWalk = walk.handAt(walk.phaseFor(t.walked), this.handPoint);
+      const gotIdle =
+        idle != null && idle.handAt(TerminalCrowd.idlePhase(t, idle.duration, ctx.time), this.handPointB);
+      if (gotWalk && gotIdle) {
+        this.handPoint.x += (this.handPointB.x - this.handPoint.x) * (1 - gait);
+        this.handPoint.y += (this.handPointB.y - this.handPoint.y) * (1 - gait);
+        this.handPoint.z += (this.handPointB.z - this.handPoint.z) * (1 - gait);
+        hand = this.handPoint;
+      } else if (gotWalk) {
+        hand = this.handPoint;
+      } else if (gotIdle) {
+        hand = this.handPointB;
+      }
+    }
     placeLuggage(
       LUGGAGE_SPECS[kind],
       { x: t.x, z: t.z, heading: t.heading, height: t.look.height, girth: t.look.girth },
       this.floorY,
       fitted.height,
       this.placement,
+      hand,
     );
+  }
+
+  /**
+   * Cycle position of the idle clip for one traveller.
+   *
+   * The idle has no travel to key off, so it runs on the clock at a per-person
+   * rate and offset - two neighbours breathing in unison is the giveaway a
+   * queue makes most obvious. Shared by the pose written into `iAnim` and by
+   * the hand a bag hangs from, so the two cannot drift apart.
+   */
+  private static idlePhase(t: Traveller, duration: number, time: number): number {
+    if (!(duration > 1e-3)) return 0;
+    const look = t.look;
+    // `IDLE_MIN_PERIOD` stretches a short clip rather than letting it fidget:
+    // one bake loops in 1.02 s where the rest are 1.6, which is invisible
+    // walking past and impossible to miss in a queue of people standing still.
+    const period = Math.max(duration, IDLE_MIN_PERIOD);
+    const rate = (0.85 + 0.3 * hash2(look.preferredSpeed, look.cadence, 11)) / period;
+    return (hash2(look.height, look.girth, 23) + time * rate) % 1;
   }
 
   /**

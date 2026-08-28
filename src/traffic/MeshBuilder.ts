@@ -679,23 +679,88 @@ export class VehicleMeshBuilder {
 
   build(): BufferGeometry {
     const geometry = new BufferGeometry();
+    const count = this.position.length / 3;
     geometry.setAttribute('position', new BufferAttribute(new Float32Array(this.position), 3));
     geometry.setAttribute('normal', new BufferAttribute(new Float32Array(this.normal), 3));
     geometry.setAttribute('aAlbedo', new BufferAttribute(new Float32Array(this.albedo), 3));
-    geometry.setAttribute('aSurf', new BufferAttribute(new Float32Array(this.surf), 2));
-    geometry.setAttribute('aPaint', new BufferAttribute(new Float32Array(this.paint), 1));
     geometry.setAttribute('aEmit', new BufferAttribute(new Float32Array(this.emit), 3));
-    geometry.setAttribute('aChan', new BufferAttribute(new Float32Array(this.chan), 1));
-    geometry.setAttribute('aTex', new BufferAttribute(new Float32Array(this.tex), 1));
-    // `uv` is only read where `aTex` is 1, but three requires the attribute to
-    // exist for the whole geometry as soon as the material carries a map.
+    /*
+     * FOUR ATTRIBUTES PACKED INTO TWO, and the reason is a hard limit.
+     *
+     * WebGL guarantees only 16 vertex attribute slots, and an attribute of one
+     * component costs a slot exactly as an attribute of four does. A vehicle
+     * spends four of them on `instanceMatrix` alone, plus position, normal, uv,
+     * the per-instance paint, the lamp channels and the two damage attributes -
+     * so `aPaint`, `aChan` and `aTex`, which are one number each, were three
+     * slots for three numbers and the shell ran out of room the moment
+     * localized damage needed any. Measured: eighteen attributes, and the
+     * driver refused the program with "Too many attributes", which draws no
+     * cars at all.
+     *
+     * So the three flags travel together in `aMask`, and `aSurf` grows from
+     * two components to four to carry where up the body each vertex sits. The
+     * shader unpacks both; nothing else costs anything.
+     */
+    const mask = new Float32Array(count * 3);
+    for (let i = 0; i < count; i += 1) {
+      mask[i * 3] = this.paint[i] as number;
+      mask[i * 3 + 1] = this.tex[i] as number;
+      mask[i * 3 + 2] = this.chan[i] as number;
+    }
+    geometry.setAttribute('aMask', new BufferAttribute(mask, 3));
+    geometry.setAttribute('aSurf', new BufferAttribute(this.buildSurf(count), 4));
+    // `uv` is only read where `aMask.y` is 1, but three requires the attribute
+    // to exist for the whole geometry as soon as the material carries a map.
     geometry.setAttribute('uv', new BufferAttribute(new Float32Array(this.uv), 2));
-    const count = this.position.length / 3;
     const index =
       count > 65535 ? new Uint32Array(this.index) : new Uint16Array(this.index);
     geometry.setIndex(new BufferAttribute(index, 1));
     geometry.computeBoundingBox();
     geometry.computeBoundingSphere();
     return geometry;
+  }
+
+  /**
+   * `aSurf`: roughness, metalness, and where on the body the vertex sits.
+   *
+   * The last two are the vertex's own position expressed as a fraction of the
+   * shell's half extents - `+1` at the nose, `-1` at the tail, `+1` at the
+   * driver's side - and they are the per-VERTEX half of localized damage. The
+   * per-INSTANCE half is how wrecked each region is; the shader turns the two
+   * into a single weight and that is what caves in a shot-out bonnet without
+   * touching the boot behind it.
+   *
+   * Taken from the shell's own bounding box rather than from the blueprint, so
+   * it is right for an authored shell and for a generated one whose real
+   * extents are whatever Tripo produced. The convention is this file's: nose
+   * at -Z, +X to the driver's right.
+   */
+  private buildSurf(count: number): Float32Array {
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minZ = Infinity;
+    let maxZ = -Infinity;
+    for (let i = 0; i < count; i += 1) {
+      const x = this.position[i * 3] as number;
+      const z = this.position[i * 3 + 2] as number;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (z < minZ) minZ = z;
+      if (z > maxZ) maxZ = z;
+    }
+    const midX = count > 0 ? (minX + maxX) * 0.5 : 0;
+    const midZ = count > 0 ? (minZ + maxZ) * 0.5 : 0;
+    const halfX = Math.max(0.25, (maxX - minX) * 0.5);
+    const halfZ = Math.max(0.25, (maxZ - minZ) * 0.5);
+
+    const surf = new Float32Array(count * 4);
+    for (let i = 0; i < count; i += 1) {
+      surf[i * 4] = this.surf[i * 2] as number;
+      surf[i * 4 + 1] = this.surf[i * 2 + 1] as number;
+      // Nose at -Z, so the sign is flipped to make +1 the front.
+      surf[i * 4 + 2] = -((this.position[i * 3 + 2] as number) - midZ) / halfZ;
+      surf[i * 4 + 3] = ((this.position[i * 3] as number) - midX) / halfX;
+    }
+    return surf;
   }
 }

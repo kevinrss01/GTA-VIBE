@@ -613,6 +613,15 @@ export function buildApronMarkings(sink: GeometrySink): void {
         m.leadInWidth,
       );
     }
+    /*
+     * The stand number, painted on the pavement clear of the wing-tip box.
+     *
+     * 4 m numerals, laid out with the same seven-segment machinery the runway
+     * designator uses, reading along z so a crew taxiing in from the east has
+     * them square on. An apron with lead-in lines and no stand numbers is a
+     * car park with yellow paint on it.
+     */
+    designator(buffer, stand.id.slice(-1), stand.x + 11, stand.z + 9, 4, 1);
   }
   buffer.flush(sink);
 }

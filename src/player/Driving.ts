@@ -239,11 +239,19 @@ export class Driving {
     };
   }
 
-  /** The car the player would get into from here, if any. */
+  /**
+   * The car the player would get into from here, if any.
+   *
+   * A write-off and a car on its roof are refused, because `takeControl`
+   * refuses them: offering a prompt that does nothing when pressed is worse
+   * than offering none. An abandoned one is not refused - getting back into
+   * the car you left at the kerb is the point of being able to leave it there.
+   */
   candidateAt(x: number, z: number): { id: number; kind: string } | null {
     if (this.handle) return null;
     const view = this.options.traffic.nearestVehicle(x, z, ENTER_RADIUS);
-    return view ? { id: view.id, kind: view.kind } : null;
+    if (!view || view.destroyed || view.overturned) return null;
+    return { id: view.id, kind: view.kind };
   }
 
   /**
@@ -355,6 +363,12 @@ export class Driving {
     // parked player shove them forward instead of stopping dead against them.
     this.absorbImpulse();
 
+    // What the bodywork has done to the car. One rule, shared with the traffic
+    // AI: see `VehicleHandling`. A wrecked engine bay takes the power away, a
+    // flat tyre drags the steering towards its own side and costs grip, and a
+    // write-off has nothing left at all.
+    const handling = handle.view.handling;
+
     // -- input ---------------------------------------------------------------
     const throttle = this.pressed('ArrowUp', 'KeyW') ? 1 : 0;
     const brake = this.pressed('ArrowDown', 'KeyS') ? 1 : 0;
@@ -378,10 +392,13 @@ export class Driving {
 
     // -- longitudinal --------------------------------------------------------
     let accel = 0;
-    if (throttle > 0) accel += chassis.accelMax * throttle;
+    // The brakes are hydraulic and the engine is not: a car with its bonnet
+    // shot off still stops, it just cannot pull away. That asymmetry is why
+    // `power` multiplies the two drive terms and never the brake.
+    if (throttle > 0) accel += chassis.accelMax * throttle * handling.power;
     if (brake > 0) {
       if (this.speed > CREEP_EPSILON) accel -= chassis.brakeMax;
-      else accel -= chassis.accelMax * 0.6; // roll back into reverse
+      else accel -= chassis.accelMax * 0.6 * handling.power; // roll back into reverse
     }
     if (throttle === 0 && brake === 0) accel -= this.speed * COAST_DRAG;
     if (handbrake) accel -= Math.sign(this.speed) * chassis.brakeMax * 1.15;
@@ -413,13 +430,20 @@ export class Driving {
     // has no way to resolve against buildings.
     const speedAbs = Math.abs(this.speed);
     if (speedAbs > 0.5) {
-      const maxTan = (chassis.gripLateral * chassis.wheelbase) / (speedAbs * speedAbs);
+      const maxTan =
+        (chassis.gripLateral * handling.grip * chassis.wheelbase) / (speedAbs * speedAbs);
       const maxAngle = Math.atan(Math.max(0.02, maxTan));
       this.steer = clamp(this.steer, -maxAngle, maxAngle);
     }
 
     // -- integrate -----------------------------------------------------------
-    const yawRate = (this.speed / chassis.wheelbase) * Math.tan(this.steer);
+    // The wheel the DRIVER is holding is `this.steer`, which is what the front
+    // wheels are drawn at; what the car actually does is that plus whatever a
+    // flat tyre is dragging it towards. Separating the two is what lets the
+    // player fight a blown near-side tyre by holding opposite lock - and never
+    // quite win, because the pull does not go away.
+    const steerNow = this.steer + handling.pull;
+    const yawRate = (this.speed / chassis.wheelbase) * Math.tan(steerNow);
     this.yaw += yawRate * dt;
 
     const fx = -Math.sin(this.yaw);
@@ -528,7 +552,18 @@ export class Driving {
         // that would write a car off on a kerb.
         const roadY = ground.sample(this.x, this.z).y;
         this.options.traffic.reportImpact(this.x, roadY + 0.6, this.z, shed / 12, 'world');
-        this.options.traffic.applyDamage(handle.id, impactDamage(shed * chassis.mass * 0.4));
+        // Charged to the end that was leading, so scraping a wall in reverse
+        // wrecks the boot and not the bonnet. Taken from the speed BEFORE the
+        // scrub: a hard enough hit reverses it, and charging the sign that
+        // came out of the bounce would put a head-on into the boot.
+        const lead = handle.view.halfLength * Math.sign(before || 1);
+        this.options.traffic.applyDamage(
+          handle.id,
+          impactDamage(shed * chassis.mass * 0.4),
+          this.x + fx * lead,
+          roadY + 0.6,
+          this.z + fz * lead,
+        );
         this.pitchLean -= Math.min(0.09, shed * 0.006);
       }
     }
@@ -668,7 +703,15 @@ export class Driving {
     this.speed = clamp(this.speed, -REVERSE_SPEED, TOP_SPEED);
     // The striker's own shell takes slightly less than the car it hit: the
     // front structure is what it was designed to crush.
-    traffic.applyDamage(handle.id, damage * 0.85);
+    // On the panel that made the contact: the hit point is out along the line
+    // from this car's centre, so it lands on the corner that struck.
+    traffic.applyDamage(
+      handle.id,
+      damage * 0.85,
+      this.x + nx * handle.view.halfLength,
+      contact.y,
+      this.z + nz * handle.view.halfLength,
+    );
     this.pitchLean -= Math.min(0.09, deltaV * 0.02);
     this.braking = true;
     return true;

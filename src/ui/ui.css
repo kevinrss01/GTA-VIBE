@@ -428,6 +428,31 @@
   opacity: 1;
 }
 
+/*
+ * The flight panel carries eight bindings where the walking hint carries five,
+ * and unlike the walking hint it is held on screen while the aeroplane is
+ * stopped - which is exactly when the airspeed prompt and the vitals bar are
+ * also up. Measured at 844x424 it was 200 px tall, ran straight through the
+ * vitals bar at y 300 and reached the prompt at x 368.
+ *
+ * So it is tighter than the walking hint and lifted clear above the vitals
+ * rather than drawn across them. 118 px is the bar's own offset plus its
+ * height plus a line of clearance; the narrower key column is what keeps the
+ * widest row short enough to stay left of the prompt.
+ */
+.mb-hud__hint--flight {
+  bottom: calc(var(--mb-edge-y) + 118px);
+  font-size: 10px;
+}
+
+.mb-hud__hint--flight p {
+  line-height: 1.35;
+}
+
+.mb-hud__hint--flight .mb-hud__keys {
+  min-width: 104px;
+}
+
 .mb-hud__hint p {
   display: flex;
   gap: 10px;

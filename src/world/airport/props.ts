@@ -18,7 +18,7 @@ import type { CityGround } from '../CityGround';
 import { PROP_SPECS } from '../build/PropLibrary';
 import type { GeometrySink, PropKey } from '../build/types';
 import { APRON, CAR_PARK, HANGARS, RUNWAY, STANDS, TAXIWAY, TERMINAL } from './layout';
-import { SOUTH_APRON } from './plan';
+import { SOUTH_APRON, STAND_ENVELOPE } from './plan';
 
 /** Placed equipment: what, where, and which way it points. */
 interface Placement {
@@ -33,8 +33,25 @@ interface Placement {
  *
  * A stand with nothing on it reads as a car park. Each one gets the set that
  * would actually be there between turnarounds - stairs at the door, a tug and
- * a cart at the tail, a ground power unit at the nose - and the two ends of the
+ * a cart at the tail, a ground power unit alongside - and the two ends of the
  * apron get the bowser and the spare carts that live there.
+ *
+ * ## Everything here is placed off the STAND ENVELOPE, and that is the fix
+ *
+ * The ground power unit used to be at a flat `stand.x + 9.5`. The stands face
+ * +X, so on stand 3 that put the cart's near face at x = 248.5 with the parked
+ * twin turboprop's nose at 247.9 - 0.6 m of clearance directly across the only
+ * way off the stand. Measured in a production build: the twin at full throttle
+ * for five seconds moved exactly 0.60 m and stopped at 0.000 m/s. The jet on
+ * stand 2 escaped only because its longer fuselage already contained the cart
+ * and a containment waiver let it through, which is not a fix, it is the same
+ * bug with a different outcome.
+ *
+ * So nothing is placed at a fixed offset any more. Every position is derived
+ * from `STAND_ENVELOPE`, and the two rules a real apron works to are the two
+ * rules here: equipment goes OUTSIDE the fuselage, and BEHIND the nose - never
+ * in the taxi-out corridor `standTaxiCorridor` describes.
+ * `tests/apronClearance.test.ts` asserts it against the real fleet.
  */
 function apronEquipment(): Placement[] {
   const out: Placement[] = [];
@@ -46,12 +63,21 @@ function apronEquipment(): Placement[] {
     // Only the first three stands are worked; the light stands at the south
     // end are left empty, which is what makes the busy ones read as busy.
     if (i > 2) continue;
-    out.push({ prop: 'airStairs', x: stand.x + 4.5, z: stand.z - 4.2, heading: east });
-    out.push({ prop: 'gpuCart', x: stand.x + 9.5, z: stand.z + 1.4, heading: west });
+    const env = STAND_ENVELOPE[stand.size];
+    // Port side is -z with the nose at +x, which is where an airstair and a
+    // ground power unit go on a real turnaround: at the forward door and at
+    // the nose receptacle, both clear of the fuselage and of the lead-in line.
+    const port = stand.z - env.halfFuselage;
+    const starboard = stand.z + env.halfFuselage;
+    out.push({ prop: 'airStairs', x: stand.x + env.halfLength * 0.45, z: port - 2.4, heading: east });
+    // Abeam the nose, not off it: 0.72 of the half-length leaves the unit and
+    // its 0.6 m half-depth a clear margin behind the nose on every class.
+    out.push({ prop: 'gpuCart', x: stand.x + env.halfLength * 0.72, z: port - 4.2, heading: west });
     if (i < 2) {
-      out.push({ prop: 'baggageTug', x: stand.x - 5.5, z: stand.z + 6.5, heading: east });
-      out.push({ prop: 'baggageCart', x: stand.x - 5.5, z: stand.z + 10.2, heading: east });
-      out.push({ prop: 'baggageCart', x: stand.x - 5.5, z: stand.z + 13.9, heading: east });
+      // Baggage train aft of the wing root, on the starboard side.
+      out.push({ prop: 'baggageTug', x: stand.x - env.halfLength * 0.5, z: starboard + 2.4, heading: east });
+      out.push({ prop: 'baggageCart', x: stand.x - env.halfLength * 0.5, z: starboard + 6.1, heading: east });
+      out.push({ prop: 'baggageCart', x: stand.x - env.halfLength * 0.5, z: starboard + 9.8, heading: east });
     }
   }
 

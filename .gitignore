@@ -27,3 +27,4 @@ tripo-avatar-test/
 
 # Generated 3D source artifacts (large; runtime copies live in public/models/)
 tripo-out/
+.vercel

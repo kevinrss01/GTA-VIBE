@@ -17,6 +17,8 @@ import { Euler, Vector3, type PerspectiveCamera } from 'three';
 
 import { clamp, damp } from '../core/mathx';
 import type { CityGround, SurfaceId } from '../world/CityGround';
+import type { ColliderBox } from '../world/build/types';
+import type { MaterialKey } from '../render/materials';
 import { CollisionWorld, STEP_HEIGHT } from './Collision';
 
 /** Eye height of an average adult, measured from the sole of the foot. */
@@ -131,6 +133,233 @@ export function resolveVerticalStep(
   return { y, verticalVelocity: vy, grounded, settled };
 }
 
+/**
+ * What one footfall was, as world facts rather than as a sound.
+ *
+ * The controller reports the MATERIAL under the sole, not a sample name: the
+ * audio layer owns the mapping from a material to a recording, and the player
+ * module owns knowing what is underfoot. `material` is the collider's own
+ * `ColliderBox.surface` when the world tagged one, which is the authoritative
+ * answer for a built floor - a terminal slab, a hangar apron, a club floor -
+ * and `null` where nothing built is underfoot, in which case `surface` is the
+ * terrain classification and is the authority instead.
+ */
+export interface FootstepEvent {
+  readonly surface: SurfaceId;
+  readonly material: MaterialKey | null;
+  readonly running: boolean;
+  /**
+   * Which foot landed. Alternates strictly, and is what lets the mixer place
+   * the step slightly left or right and give one foot of the pair a little
+   * more weight than the other, which is what a walk cycle actually sounds
+   * like. A metronome down the middle does not.
+   */
+  readonly foot: 'left' | 'right';
+  /** Ground speed at the moment of the footfall, m/s. */
+  readonly speed: number;
+}
+
+/**
+ * How long the material under the foot must hold still before it is heard.
+ *
+ * The problem this solves is not the same one a per-STEP hold solves, and it
+ * solves it in the right place. Surfaces are resolved per POINT, so a player
+ * walking a boundary - the lip of an apron, the edge of a park path, a kerb
+ * line - crosses it many times per second, and a hold counted in footsteps can
+ * only ever be prompt or stable, never both: holding for two steps is one step
+ * late on every genuine crossing, and holding for none flickers on every
+ * boundary.
+ *
+ * Debouncing the CONTINUOUS signal instead separates the two cases outright,
+ * because they differ in duration rather than in shape. A genuine crossing
+ * changes the material and leaves it changed, so it commits 0.1 s later - 0.28 m
+ * at a walk, 0.6 m at a run, both far inside the 1.45 m / 1.95 m stride, so the
+ * very next footstep is already the new material. Boundary chatter reverts
+ * before the timer expires and is never heard at all.
+ *
+ * Measured both ways in `tests/footsteps.test.ts`: promptness as "the first
+ * footfall after the crossing is the new family", stability as "an oscillation
+ * faster than the commit time changes the family zero times".
+ */
+export const SURFACE_COMMIT_TIME = 0.1;
+
+/** What the foot is on: the terrain classification and the built material. */
+export interface StepGround {
+  readonly surface: SurfaceId;
+  readonly material: MaterialKey | null;
+}
+
+/**
+ * THE FIX FOR THE WRONG-FOOTSTEP BUG, as a pure function.
+ *
+ * The line this replaces was, in `step()`,
+ *
+ *     this.surface = support.built && support.y > here.y + 0.05
+ *       ? 'interior' : here.surface;
+ *
+ * which collapses EVERY built platform standing more than 5 cm proud of the
+ * terrain into one bucket - the domestic ceramic-tile pair. Swept over the
+ * whole map at 1.5 m, 6,276 walkable points hit that branch and only 372 of
+ * them are indoors: the rest are shop plinths, boardwalk decks, apron edges and
+ * the terminal, so the game played a kitchen-tile footstep on the runway, on
+ * the harbour decking and on open gravel. `main.ts` compensated by passing
+ * `GroundSample.onRoad` down to the mixer as an override, which is a second
+ * re-derivation of something the world already knows - and a dead one: of the
+ * 28,875 carriageway points in the world, ZERO were misheard without it.
+ *
+ * The replacement asks the thing that actually knows. `ColliderBox.surface`
+ * exists precisely "so a footstep on a hangar floor is not decided by guessing
+ * from the terrain underneath it", so a built floor reports its own material; an
+ * untagged built floor reports `'interior'` only when the player is also under a
+ * roof, which is the one case where the terrain underneath is genuinely not
+ * what they are standing on; and everything else reports the terrain the ground
+ * sampler already resolved.
+ */
+export function resolveStepGround(input: {
+  readonly terrain: SurfaceId;
+  readonly built: boolean;
+  readonly supportY: number;
+  readonly terrainY: number;
+  readonly indoors: boolean;
+  readonly material: MaterialKey | null;
+}): StepGround {
+  const onBuiltFloor = input.built && input.supportY > input.terrainY + BUILT_FLOOR_RISE;
+  if (!onBuiltFloor) return { surface: input.terrain, material: null };
+  if (input.material !== null) return { surface: input.terrain, material: input.material };
+  return { surface: input.indoors ? 'interior' : input.terrain, material: null };
+}
+
+/** How far a built floor must stand proud of the terrain to be the thing underfoot. */
+const BUILT_FLOOR_RISE = 0.05;
+
+/**
+ * Debounces what is underfoot, in seconds rather than in footsteps.
+ *
+ * See `SURFACE_COMMIT_TIME` for why the hysteresis is here and not in the
+ * mixer. `sample` is called once per fixed step, `held` is what the next
+ * footfall reports, and the only state is the candidate and how long it has
+ * been the candidate.
+ *
+ * Exported and standalone so both properties can be measured directly: a
+ * crossing commits within `SURFACE_COMMIT_TIME` and is heard on the next
+ * footfall, and an oscillation faster than that never commits at all.
+ */
+export class SurfaceDebounce {
+  private heldSurface: SurfaceId;
+  private heldMaterial: MaterialKey | null = null;
+  private pendingSurface: SurfaceId;
+  private pendingMaterial: MaterialKey | null = null;
+  private pendingTime = 0;
+
+  constructor(surface: SurfaceId = 'pavement') {
+    this.heldSurface = surface;
+    this.pendingSurface = surface;
+  }
+
+  get held(): StepGround {
+    return { surface: this.heldSurface, material: this.heldMaterial };
+  }
+
+  sample(dt: number, ground: StepGround): StepGround {
+    if (ground.surface === this.heldSurface && ground.material === this.heldMaterial) {
+      this.pendingSurface = this.heldSurface;
+      this.pendingMaterial = this.heldMaterial;
+      this.pendingTime = 0;
+      return this.held;
+    }
+    if (ground.surface !== this.pendingSurface || ground.material !== this.pendingMaterial) {
+      this.pendingSurface = ground.surface;
+      this.pendingMaterial = ground.material;
+      this.pendingTime = 0;
+      return this.held;
+    }
+    this.pendingTime += dt;
+    if (this.pendingTime >= SURFACE_COMMIT_TIME) {
+      this.heldSurface = this.pendingSurface;
+      this.heldMaterial = this.pendingMaterial;
+      this.pendingTime = 0;
+    }
+    return this.held;
+  }
+}
+
+/**
+ * A spatial index over the colliders that carry a material.
+ *
+ * Separate from `CollisionWorld` on purpose. Collision indexes every box in the
+ * world - roughly 1,760 of them - and answers "how high can I stand here";
+ * this answers "what is the thing I am standing on made of", and only about 115
+ * boxes have an answer, so it is a tenth of a per cent of the memory and a
+ * fraction of the query cost to keep them in a grid of their own.
+ *
+ * Exported so the footstep tests can drive it against the real built world
+ * without a renderer.
+ */
+export class ColliderSurfaceIndex {
+  private static readonly CELL = 24;
+  private readonly grid = new Map<number, ColliderBox[]>();
+
+  constructor(colliders: readonly ColliderBox[]) {
+    for (const box of colliders) {
+      if (box.surface === undefined) continue;
+      const x0 = Math.floor(box.minX / ColliderSurfaceIndex.CELL);
+      const x1 = Math.floor(box.maxX / ColliderSurfaceIndex.CELL);
+      const z0 = Math.floor(box.minZ / ColliderSurfaceIndex.CELL);
+      const z1 = Math.floor(box.maxZ / ColliderSurfaceIndex.CELL);
+      for (let cx = x0; cx <= x1; cx += 1) {
+        for (let cz = z0; cz <= z1; cz += 1) {
+          const key = ColliderSurfaceIndex.key(cx, cz);
+          const bucket = this.grid.get(key);
+          if (bucket) bucket.push(box);
+          else this.grid.set(key, [box]);
+        }
+      }
+    }
+  }
+
+  private static key(cx: number, cz: number): number {
+    return (cx + 1024) * 8192 + (cz + 1024);
+  }
+
+  /**
+   * The material of the tagged box whose top is the surface at `supportY`.
+   *
+   * `supportY` comes from `CollisionWorld.supportAt`, i.e. it is the height the
+   * player is actually standing at. Matching on it rather than simply taking
+   * the highest tagged box is what stops a tagged plinth two metres below a
+   * mezzanine deciding what the mezzanine sounds like. `null` means the box
+   * that provided the support carries no material, which is most of them.
+   *
+   * Ties go to the LAST box emitted at that height, because the world is built
+   * shell first and fitout second: the terminal's `concrete` plinth and its
+   * `tileFloor` slab both top out at 14.66 m, and the floor you walk on is the
+   * one laid last.
+   */
+  materialAt(x: number, z: number, supportY: number): MaterialKey | null {
+    const bucket = this.grid.get(
+      ColliderSurfaceIndex.key(
+        Math.floor(x / ColliderSurfaceIndex.CELL),
+        Math.floor(z / ColliderSurfaceIndex.CELL),
+      ),
+    );
+    if (!bucket) return null;
+    let found: MaterialKey | null = null;
+    for (const box of bucket) {
+      if (x < box.minX || x > box.maxX || z < box.minZ || z > box.maxZ) continue;
+      if (Math.abs(box.top - supportY) > SUPPORT_MATCH) continue;
+      found = box.surface as MaterialKey;
+    }
+    return found;
+  }
+}
+
+/**
+ * How close a tagged box's top must be to the support height to be the thing
+ * being stood on. A kerb is 0.15 m and the thinnest floor decal in the world is
+ * 0.008 m, so 0.02 m separates a floor from the thing beside it.
+ */
+const SUPPORT_MATCH = 0.02;
+
 export interface ControllerState {
   readonly x: number;
   readonly y: number;
@@ -141,6 +370,13 @@ export interface ControllerState {
   readonly running: boolean;
   readonly grounded: boolean;
   readonly surface: SurfaceId;
+  /**
+   * Material of the built floor underfoot, or null on bare terrain.
+   *
+   * Exported on the state as well as on the footstep event so automated QA can
+   * assert what the player is standing on without waiting for a footfall.
+   */
+  readonly material: MaterialKey | null;
   readonly indoors: boolean;
   /** Recoil currently added to the look angles, radians. See `addRecoil`. */
   readonly recoilPitch: number;
@@ -164,6 +400,16 @@ export interface ControllerOptions {
   readonly camera: PerspectiveCamera;
   readonly domElement: HTMLElement;
   readonly spawn: { x: number; z: number; heading: number };
+  /**
+   * The world's collider list, so a footstep can read the material of the floor
+   * it actually landed on.
+   *
+   * The same array `CollisionWorld` is constructed from. Optional because it is
+   * only needed for sound: without it every built floor falls back to the
+   * terrain underneath it plus the indoor bucket, which is what the controller
+   * did before and is never wrong, only coarse.
+   */
+  readonly colliders?: readonly ColliderBox[] | undefined;
 }
 
 export class FirstPersonController {
@@ -205,6 +451,15 @@ export class FirstPersonController {
   private surface: SurfaceId = 'pavement';
   private indoors = false;
 
+  /** Material of the built floor underfoot, or null on bare terrain. */
+  private readonly surfaceIndex: ColliderSurfaceIndex | null;
+  private material: MaterialKey | null = null;
+  /** What the footsteps report; see SURFACE_COMMIT_TIME. */
+  private readonly debounce: SurfaceDebounce;
+  private heard: StepGround = { surface: 'pavement', material: null };
+  /** Strict left/right alternation, so the mixer can place a walk cycle. */
+  private nextFootLeft = true;
+
   private readonly keys = new Set<string>();
   private mouseSensitivity = 0.0022;
   /** Pointer lock drives mouse look, but must not be required to walk. */
@@ -214,8 +469,14 @@ export class FirstPersonController {
   private paused = false;
   private disposed = false;
 
-  /** Fires each time a foot lands, so the audio director can play a step. */
-  onFootstep: ((surface: SurfaceId, running: boolean) => void) | null = null;
+  /**
+   * Fires each time a foot lands, so the audio director can play a step.
+   *
+   * The event carries the AUTHORITATIVE material under the sole rather than a
+   * re-derived guess: the caller must not re-sample the ground to second-guess
+   * it, which is what `main.ts` used to do with `GroundSample.onRoad`.
+   */
+  onFootstep: ((step: FootstepEvent) => void) | null = null;
 
   private readonly euler = new Euler(0, 0, 0, 'YXZ');
   private readonly forward = new Vector3();
@@ -228,9 +489,14 @@ export class FirstPersonController {
     this.camera = options.camera;
     this.domElement = options.domElement;
     this.yaw = options.spawn.heading;
+    this.surfaceIndex = options.colliders ? new ColliderSurfaceIndex(options.colliders) : null;
 
     const groundY = this.ground.sample(options.spawn.x, options.spawn.z).y;
     this.position.set(options.spawn.x, groundY, options.spawn.z);
+    const spawnSample = this.ground.sample(options.spawn.x, options.spawn.z);
+    this.surface = spawnSample.surface;
+    this.debounce = new SurfaceDebounce(spawnSample.surface);
+    this.heard = this.debounce.held;
 
     window.addEventListener('keydown', this.onKeyDown);
     window.addEventListener('keyup', this.onKeyUp);
@@ -402,8 +668,8 @@ export class FirstPersonController {
       this.position.y,
       here.y,
     );
-    this.surface = support.built && support.y > here.y + 0.05 ? 'interior' : here.surface;
     this.indoors = this.ground.isBuilt(this.position.x, this.position.z, -0.2);
+    this.resolveSurface(here.surface, support.built, support.y, here.y);
 
     // Vertical: snap up onto support, fall onto it from above, then rescue a
     // body that is jammed into geometry. `resolveVerticalStep` owns all of it.
@@ -428,6 +694,36 @@ export class FirstPersonController {
     this.updateFootsteps(dt, input.running);
   }
 
+  /**
+   * What is under the foot, and what has been under it long enough to be heard.
+   *
+   * Both halves are pure functions above: `resolveStepGround` is the rule and
+   * `SurfaceDebounce` is the hysteresis, so both can be measured directly
+   * against the real built world without a renderer or a browser.
+   */
+  private resolveSurface(
+    terrain: SurfaceId,
+    built: boolean,
+    supportY: number,
+    terrainY: number,
+  ): void {
+    const material =
+      built && supportY > terrainY + BUILT_FLOOR_RISE
+        ? this.surfaceIndex?.materialAt(this.position.x, this.position.z, supportY) ?? null
+        : null;
+    const ground = resolveStepGround({
+      terrain,
+      built,
+      supportY,
+      terrainY,
+      indoors: this.indoors,
+      material,
+    });
+    this.surface = ground.surface;
+    this.material = ground.material;
+    this.heard = this.debounce.sample(FIXED_STEP, ground);
+  }
+
   private updateFootsteps(dt: number, running: boolean): void {
     const speed = Math.hypot(this.velocity.x, this.velocity.z);
     if (!this.grounded || speed < 0.35) {
@@ -440,7 +736,15 @@ export class FirstPersonController {
     const previous = this.bobPhase;
     this.bobPhase += (speed * dt * Math.PI) / strideLength;
     if (Math.floor(previous / Math.PI) !== Math.floor(this.bobPhase / Math.PI)) {
-      this.onFootstep?.(this.surface, running);
+      const foot = this.nextFootLeft ? 'left' : 'right';
+      this.nextFootLeft = !this.nextFootLeft;
+      this.onFootstep?.({
+        surface: this.heard.surface,
+        material: this.heard.material,
+        running,
+        foot,
+        speed,
+      });
     }
     if (this.bobPhase > Math.PI * 1e5) this.bobPhase %= Math.PI * 2;
   }
@@ -533,6 +837,7 @@ export class FirstPersonController {
       running: this.keys.has('ShiftLeft') || this.keys.has('ShiftRight'),
       grounded: this.grounded,
       surface: this.surface,
+      material: this.material,
       indoors: this.indoors,
       recoilPitch: this.recoilPitch,
       recoilYaw: this.recoilYaw,

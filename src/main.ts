@@ -382,6 +382,10 @@ async function boot(): Promise<void> {
     camera: engine.camera,
     domElement: canvas,
     spawn: plan.spawn,
+    // The same boxes `collision` was built from. The controller indexes the
+    // ones that carry a `surface` so a footstep on a terminal floor is decided
+    // by that floor rather than by the apron underneath the building.
+    colliders: sink.colliders,
   });
 
   const driving = new Driving({
@@ -665,6 +669,12 @@ async function boot(): Promise<void> {
       // falls forwards and one shot in the chest goes over backwards.
       pedestrians.downAt(x, y, z, undefined, dirX, dirZ);
     },
+    // Gunfire is an event the crowd hears, not just something that happens to
+    // one person. Raised once per trigger pull and once per detonation, and
+    // safe for a round that hit nothing at all.
+    alarmAt: (x: number, z: number, radius?: number) => {
+      pedestrians.alarmAt(x, z, radius);
+    },
   });
 
   const police = new PoliceSystem({
@@ -810,8 +820,21 @@ async function boot(): Promise<void> {
     player,
     spawn: plan.spawn,
     teleport: (x: number, z: number, heading?: number) => controller.teleport(x, z, heading),
-    isDriving: () => driving.driving,
-    exitVehicle: () => driving.exit(),
+    // EVERY seat the player can be in. A pilot killed in the air was left in
+    // the aeroplane, and `CombatSystem` hides the weapon and refuses the
+    // trigger for as long as it believes the player is in one - so the gun
+    // came back owned, equipped and unusable. `exit(true)` is the forced
+    // dismount: `Flying.exit()` refuses in the air, which is right for a
+    // living player pressing a key and wrong for a corpse.
+    mounts: [
+      { occupied: () => driving.driving, exit: () => driving.exit() },
+      {
+        occupied: () => flying.flying,
+        exit: () => {
+          flying.exit(true);
+        },
+      },
+    ],
     setPaused: (paused: boolean) => controller.setPaused(paused),
     onBanner: (title: string | null, detail: string) => hud.setBanner(title, detail),
     onBust: () => {
@@ -859,22 +882,20 @@ async function boot(): Promise<void> {
     window.setTimeout(() => audio.playOneShot('door-close'), 420);
   };
 
-  controller.onFootstep = (surface, running) => {
+  controller.onFootstep = (step) => {
     // A driver has no feet on the pavement, and neither does a pilot. The
     // controller is paused in both, but its velocity DAMPS to zero rather than
     // snapping there, so it can still cross the footstep threshold for a
     // moment after getting in - which is audible as walking while seated.
     if (driving.driving || flying.flying) return;
     /*
-     * `onRoad` is the AUTHORITATIVE answer to "is this a carriageway", and it
-     * is why the third argument exists. The surface alone is a classification
-     * of the ground; open ground beyond the street grid used to be decided by
-     * a hash that came up grass three times in five and re-rolled every four
-     * metres, so a player walking on visible tarmac at a junction apron heard
-     * grass. The mixer now takes the flag rather than re-deriving it.
+     * The event already carries the AUTHORITATIVE surface and, where the world
+     * tagged one, the material of the floor under the sole. Nothing here may
+     * re-derive it: the `onRoad` flag this used to sample and pass down was a
+     * second guess at something the world already knew, and a dead one - swept
+     * over the map, none of the 28,875 carriageway points needed it.
      */
-    const here = ground.sample(controller.state.x, controller.state.z);
-    audio.footstep(surface, running, here.onRoad);
+    audio.footstep(step);
   };
 
   // -- pause / pointer lock --------------------------------------------------
@@ -1019,6 +1040,12 @@ async function boot(): Promise<void> {
       z: state.z,
       time: elapsed,
       vehicles: syncCrowdCars(),
+      // Where the player is LOOKING, so people are spawned and retired behind
+      // them. Without it the crowd falls back to smoothed player drift, which
+      // is zero when somebody stands still - exactly when a pop is most
+      // visible.
+      forwardX: -Math.sin(state.yaw),
+      forwardZ: -Math.cos(state.yaw),
     });
 
     // Signals share `elapsed` with the traffic simulation - see above.
@@ -1177,6 +1204,11 @@ async function boot(): Promise<void> {
       });
     }
 
+    // The contextual flight controls: up on boarding, held while the aeroplane
+    // is stopped or jammed, faded once it is under way. `Flying` decides,
+    // because it is the only thing that knows which of those is true.
+    hud.setFlightHints(flying.hintState);
+
     // One place decides the prompt, so a door and a car can never fight over it.
     if (air.flying) {
       hud.setInteractionPrompt(
@@ -1196,8 +1228,9 @@ async function boot(): Promise<void> {
       if (car) {
         hud.setInteractionPrompt(`Press E to drive the ${car.kind}`);
       } else {
-        const plane = flying.candidateAt(state.x, state.z);
-        hud.setInteractionPrompt(plane ? `Press E to board the ${plane.label}` : null);
+        // `Flying` words this one, so the airliner says why it cannot be
+        // taken instead of showing nothing at all.
+        hud.setInteractionPrompt(flying.promptAt(state.x, state.z));
       }
     }
 
@@ -1486,9 +1519,20 @@ async function boot(): Promise<void> {
         return {
           combat: combat.stats,
           police: police.stats,
+          // What the combat layer can actually SEE of the crowd. Without this a
+          // shot that hits nobody is indistinguishable from a crowd the shot
+          // path cannot reach at all, which is a difference worth one line.
+          civilians: {
+            live: civilians.liveCount,
+            prone: civilians.proneCount,
+            tracked: civilians.trackedCount,
+          },
           shopOpen: shop.open,
           rockets: combat.rocketsLive,
           viewmodelReady: combat.viewmodelReady,
+          // Which weapon the viewmodel is actually holding, so a QA pass can
+          // tell "still downloading" from "the gun is gone".
+          viewmodelWeapon: combat.viewmodelWeapon,
           officerPoses: police.officerPoses,
         };
       },
@@ -1563,6 +1607,13 @@ async function boot(): Promise<void> {
             integrity: view.integrity,
             damage: view.damage,
             overturned: view.overturned,
+            // `control` still publishes the old three values so the audio and
+            // police layers read it unchanged; `state` is what distinguishes a
+            // car the player parked from one that is merely driverless.
+            state: view.state,
+            destroyed: view.destroyed,
+            regions: view.regions,
+            handling: view.handling,
           });
         });
         return found;
@@ -1570,6 +1621,27 @@ async function boot(): Promise<void> {
       /** Live crowd state, for automated QA. */
       get crowd(): unknown {
         return pedestrians.stats;
+      },
+      /**
+       * Civilians near a point AS COMBAT SEES THEM, which is not the same list
+       * as the crowd's own: this one is harvested from the drawn instance
+       * matrices. Allocates, so it is for verification only. The same shape as
+       * `vehiclesNear` and for the same reason - aiming at somebody is
+       * otherwise guesswork from a harness with no pointer.
+       */
+      civiliansNear(x: number, z: number, radius = 30): unknown[] {
+        const found: unknown[] = [];
+        civilians.forEachActor(x, z, radius, (target) => {
+          found.push({
+            id: target.id,
+            x: target.x,
+            y: target.y,
+            z: target.z,
+            radius: target.radius,
+            height: target.height,
+          });
+        });
+        return found;
       },
       /**
        * Aircraft and flight, for automated QA.

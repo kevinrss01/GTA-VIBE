@@ -19,6 +19,7 @@
 import './ui.css';
 import { formatMoney } from '../player/money';
 import { DISTRICT_LABELS } from './Minimap';
+import type { ControlHint } from './platform';
 import { CONTROL_HINTS, musicLabel, type QualityLevel } from './PauseMenu';
 
 export interface HudCallbacks {
@@ -45,6 +46,21 @@ export interface HudStats {
 /** How long the control hint stays up after the game starts. */
 const HINT_MS = 12_000;
 
+/**
+ * The contextual control panel shown while the player is flying.
+ *
+ * Whether it is up is decided by the caller - the flight model knows whether
+ * the aeroplane is stopped, rolling or jammed, and the HUD does not - so this
+ * is presentation only.
+ */
+export interface FlightHints {
+  readonly hints: readonly ControlHint[];
+  /** True while the panel should stay on screen. */
+  readonly hold: boolean;
+  /** A short line about why the aeroplane is not moving, or null. */
+  readonly warning: string | null;
+}
+
 function formatCount(value: number): string {
   if (!Number.isFinite(value)) return '—';
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
@@ -64,6 +80,12 @@ export class Hud {
   private readonly streetEl: HTMLElement;
   private readonly promptEl: HTMLElement;
   private readonly hintEl: HTMLElement;
+  private readonly flightHintEl: HTMLElement;
+  private readonly flightWarningEl: HTMLElement;
+  private readonly flightRowsEl: HTMLElement;
+  private flightHintKey = '';
+  private flightWarning: string | null = null;
+  private flightHintsVisible = false;
   private readonly crosshair: HTMLElement;
   private readonly statsEl: HTMLElement;
   private readonly statValues = new Map<string, HTMLElement>();
@@ -179,19 +201,48 @@ export class Hud {
     // Control hint, bottom left.
     this.hintEl = document.createElement('div');
     this.hintEl.className = 'mb-hud__hint is-visible';
-    for (const hint of CONTROL_HINTS) {
-      const row = document.createElement('p');
-      const keys = document.createElement('span');
-      keys.className = 'mb-hud__keys';
-      keys.textContent = hint.keys;
-      const action = document.createElement('span');
-      action.className = 'mb-hud__action';
-      action.textContent = hint.action;
-      row.append(keys, action);
-      this.hintEl.append(row);
-    }
+    this.hintEl.append(...CONTROL_HINTS.map(hintRow));
 
-    this.element.append(this.crosshair, readout, corner, this.promptEl, this.hintEl);
+    /*
+     * The contextual flight panel.
+     *
+     * Deliberately the SAME class, the same corner and the same key/action
+     * rows as the walking hint, and shown instead of it rather than beside it:
+     * two competing control lists in one corner is worse than either. The only
+     * additions are a panel backing, because it sits over a moving world
+     * rather than over the street, and a warning line for a jammed aeroplane.
+     *
+     * Styled from here rather than from `ui.css` because these are the only
+     * three declarations that differ, and a class in the stylesheet for three
+     * declarations used by one element is a worse trade than the inline set.
+     */
+    this.flightHintEl = document.createElement('div');
+    this.flightHintEl.className = 'mb-hud__hint mb-hud__hint--flight';
+    this.flightHintEl.style.padding = '8px 12px';
+    this.flightHintEl.style.borderRadius = 'var(--mb-radius)';
+    this.flightHintEl.style.background = 'rgba(12, 15, 19, 0.5)';
+    this.flightWarningEl = document.createElement('p');
+    this.flightWarningEl.className = 'mb-hud__flight-warning';
+    this.flightWarningEl.setAttribute('role', 'status');
+    this.flightWarningEl.style.margin = '0 0 4px';
+    this.flightWarningEl.style.color = '#f0b45e';
+    this.flightWarningEl.style.letterSpacing = '0.14em';
+    this.flightWarningEl.style.textTransform = 'uppercase';
+    this.flightWarningEl.style.fontSize = '10px';
+    this.flightWarningEl.hidden = true;
+    this.flightRowsEl = document.createElement('div');
+    this.flightRowsEl.style.display = 'grid';
+    this.flightRowsEl.style.gap = '3px';
+    this.flightHintEl.append(this.flightWarningEl, this.flightRowsEl);
+
+    this.element.append(
+      this.crosshair,
+      readout,
+      corner,
+      this.promptEl,
+      this.hintEl,
+      this.flightHintEl,
+    );
 
     // -- combat, wanted level and respawn (additive) -------------------------
     // Stars sit above the wallet in the top-right stack; health and the
@@ -272,6 +323,48 @@ export class Hud {
     this.promptText = text;
     this.promptEl.textContent = text ?? '';
     this.promptEl.classList.toggle('is-visible', text !== null && text.length > 0);
+  }
+
+  /**
+   * The contextual controls for the aircraft the player is in. `null` when
+   * they are not in one, which puts the walking hint back.
+   *
+   * Idempotent and cheap: the rows are rebuilt only when the list itself
+   * changes, so this can be called every frame.
+   */
+  setFlightHints(state: FlightHints | null): void {
+    if (!state) {
+      if (this.flightHintsVisible) {
+        this.flightHintsVisible = false;
+        this.flightHintEl.classList.remove('is-visible');
+      }
+      // Whatever the walking hint's own timer had decided still stands; it is
+      // shown again on the next pointer-lock change, exactly as before.
+      return;
+    }
+
+    const key = state.hints.map((hint) => `${hint.keys}|${hint.action}`).join('\n');
+    if (key !== this.flightHintKey) {
+      this.flightHintKey = key;
+      this.flightRowsEl.replaceChildren(...state.hints.map(hintRow));
+    }
+    if (state.warning !== this.flightWarning) {
+      this.flightWarning = state.warning;
+      this.flightWarningEl.textContent = state.warning ?? '';
+      this.flightWarningEl.hidden = state.warning === null;
+    }
+    // One control list at a time: the walking hint is not the one that applies.
+    this.hintEl.classList.remove('is-visible');
+    this.clearHintTimer();
+    if (state.hold !== this.flightHintsVisible) {
+      this.flightHintsVisible = state.hold;
+      this.flightHintEl.classList.toggle('is-visible', state.hold);
+    }
+  }
+
+  /** Whether the contextual flight panel is on screen. For automated QA. */
+  get flightHintsShown(): boolean {
+    return this.flightHintEl.classList.contains('is-visible');
   }
 
   setMusicEnabled(enabled: boolean): void {
@@ -493,6 +586,9 @@ export class Hud {
   };
 
   private showHint(): void {
+    // Never over the flight panel: whichever list is on screen has to be the
+    // one that describes the controls the player is actually holding.
+    if (this.flightHintsVisible) return;
     this.hintEl.classList.add('is-visible');
   }
 
@@ -514,4 +610,17 @@ export class Hud {
 
 function stopEvent(event: Event): void {
   event.stopPropagation();
+}
+
+/** One `keys / action` line, in the shape both control lists use. */
+function hintRow(hint: ControlHint): HTMLElement {
+  const row = document.createElement('p');
+  const keys = document.createElement('span');
+  keys.className = 'mb-hud__keys';
+  keys.textContent = hint.keys;
+  const action = document.createElement('span');
+  action.className = 'mb-hud__action';
+  action.textContent = hint.action;
+  row.append(keys, action);
+  return row;
 }

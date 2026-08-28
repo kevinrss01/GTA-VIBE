@@ -75,6 +75,17 @@ import { makeLook, type PedestrianLook } from './appearance';
 import { gaitCadence } from './gait';
 import type { ObstacleIndex } from './obstacles';
 import { linkPoint, type PavementGraph, type PavementLink } from './pavement';
+// Imported by module path rather than through `./travellers`, whose barrel
+// pulls in Three.js: this file must stay renderer-free so the whole crowd can
+// be stepped in a unit test. `zones.ts` imports nothing but the airport survey.
+import {
+  PEDESTRIAN_ZONES,
+  zoneAlong,
+  zoneAt,
+  zoneIndexAt,
+  zoneRule,
+  type PedestrianZone,
+} from './travellers/zones';
 
 /** Half a shoulder width. Two people stop at twice this. */
 export const PED_RADIUS = 0.27;
@@ -199,6 +210,86 @@ const WAIT_PATIENCE = SIGNAL_CYCLE;
  */
 const CROSS_COOLDOWN = 14;
 
+// -- how many people the surroundings can carry ------------------------------
+
+/**
+ * People per metre of zone-weighted pavement inside the seed radius.
+ *
+ * Calibrated so THE CITY IS UNCHANGED and only the airport moves. Measured
+ * one-way pavement within `RENDER_RADIUS * 0.95`: the Old Quarter offers
+ * 3324 m, the city spawn 2037 m and South Circuit - the thinnest city vantage
+ * there is - 1870 m. At 0.15 people per metre those ask for 499, 306 and 281
+ * people, all of which exceed the 270 the quality level allows, so downtown
+ * simply stays at 270 exactly as before.
+ *
+ * The airport is where it bites. The landside offers 1241 m raw, and once each
+ * zone's `share` is applied - 0.12 for an access road nobody walks along -
+ * far less than that. See `docs/pedestrian-characters.md` and
+ * `src/agents/travellers/zones.ts` for the measurements this is drawn from.
+ */
+const CROWD_DENSITY = 0.15;
+
+/**
+ * Fewest people the crowd will thin itself to.
+ *
+ * A remote corner of the map with almost no pavement in range must still have
+ * somebody in it: an entirely empty street is a worse artefact than a slightly
+ * over-dense one, and this is the floor that guarantees it.
+ */
+const MIN_ACTIVE = 10;
+
+/** Seconds between recalculations of the population the surroundings carry. */
+const SUPPLY_INTERVAL = 1.4;
+/** Player movement that forces an early recalculation, in metres. */
+const SUPPLY_MOVE = 22;
+
+/**
+ * Seconds a pedestrian takes to dissolve in or out.
+ *
+ * NOBODY MAY EVER POP. The crowd's head count is now a function of where the
+ * player is standing, so people are retired and introduced continuously rather
+ * than only at the 152 m recycle ring, and a hard `active = false` in the
+ * middle of the drawn set would be a body vanishing in front of the player.
+ * Half a second is long enough to read as a fade and short enough that the
+ * population converges on a new limit within a few seconds of arriving.
+ */
+const FADE_TIME = 0.55;
+
+/** What a retiring pedestrian does once they have finished fading out. */
+const RETIRE_NONE = 0;
+/** Return the slot to the pool and leave it empty. */
+const RETIRE_POOL = 1;
+/** Return the slot to the pool and immediately put somebody new in it. */
+const RETIRE_RECYCLE = 2;
+
+// -- gunfire -----------------------------------------------------------------
+
+/**
+ * How many separate alarms the crowd remembers at once.
+ *
+ * Bounded because a player emptying a magazine raises one per round, and an
+ * unbounded list is an unbounded loop in a frame. Eight covers a firefight;
+ * the ninth overwrites the oldest, which is the one people have already run
+ * away from.
+ */
+const ALARM_SLOTS = 8;
+
+/** How far a gunshot frightens people, in metres. */
+export const ALARM_RADIUS = 26;
+
+/** Seconds somebody keeps running after a shot they heard. */
+const ALARM_TIME = 9;
+
+/** How much faster a frightened pedestrian moves. */
+const PANIC_HURRY = 1.55;
+
+/**
+ * Speed ceiling for somebody running from gunfire, as a multiple of their own
+ * comfortable pace. Higher than the everyday 1.75 because a person genuinely
+ * runs from a gun, and still a run rather than a teleport.
+ */
+const PANIC_MAX = 2.4;
+
 // -- being knocked down -----------------------------------------------------
 
 /** Seconds from the impact to lying flat. */
@@ -216,8 +307,37 @@ const RISE_TIME = 1.2;
 const FATAL_SPEED = 7;
 /** Slowest a vehicle may be going and still knock anybody over, m/s. */
 const KNOCKDOWN_SPEED = 1.6;
-/** Seconds a casualty lies in the street before the pool slot is reused. */
-const CASUALTY_TIME = 60;
+/**
+ * Seconds a casualty lies in the street before the pool slot may be reused.
+ *
+ * A body is scenery, and scenery that disappears while you are looking at it is
+ * worse than no body at all. See `CASUALTY_CLEAR` for the other half of the
+ * contract: the time has to have passed AND the player has to have walked away.
+ */
+export const CASUALTY_TIME = 60;
+/**
+ * Shortest a casualty stays once the street already holds `CASUALTY_LIMIT` of
+ * them. The bodies are still bounded in count; this is what bounds the wait for
+ * a slot when a player has been shooting.
+ */
+export const CASUALTY_TIME_CROWDED = 20;
+/**
+ * How many bodies the street keeps at once.
+ *
+ * Every casualty holds a pool slot out of circulation, so an unbounded count
+ * would slowly empty the city of walkers. Fourteen is more than a player
+ * produces in one incident and small enough that the crowd never notices.
+ */
+export const CASUALTY_LIMIT = 14;
+/**
+ * How far the player has to be before a body may be cleared away, in metres.
+ *
+ * `LOD_NEAR`, which is exactly the distance at which the crowd stops steering
+ * an agent in full - so a body is only ever taken away from a part of the
+ * street the player has already left. It then DISSOLVES rather than vanishing;
+ * see `FADE_TIME`.
+ */
+export const CASUALTY_CLEAR = LOD_NEAR;
 /** Clearance added to a chassis before it counts as having hit somebody. */
 const STRIKE_MARGIN = 0.06;
 /** Fraction of the striking speed a body is thrown at. */
@@ -228,6 +348,34 @@ const THROW_MAX = 6;
 const THROW_DRAG = 4.5;
 /** Radius a body on the ground keeps clear around it. A person is not a disc. */
 export const DOWN_RADIUS = 0.85;
+
+// -- being hit and staying on your feet --------------------------------------
+
+/**
+ * Seconds a flinch lasts.
+ *
+ * A STAGGER IS NOT A KNOCK-DOWN, and conflating them was the defect this
+ * exists to fix: a round that wounded somebody used to put them flat on the
+ * pavement for eight seconds, where they looked exactly like a corpse and -
+ * because the combat layer skips anybody on the ground - could not be shot
+ * again. A person who is hit and survives stumbles, drops their pace and runs;
+ * they do not lie down.
+ *
+ * Just under a second, which is about how long a real flinch reads for.
+ */
+const STAGGER_TIME = 0.9;
+
+/** Fraction of `STAGGER_TIME` spent leaning INTO the flinch before it eases out. */
+const STAGGER_ONSET = 0.15;
+
+/** How far over a staggering person leans, in radians. About twelve degrees. */
+const STAGGER_TILT = 0.21;
+
+/** Speed, in m/s, the stumble carries them along the round's line of travel. */
+const STAGGER_SHOVE = 1.5;
+
+/** How much of their pace a staggering person loses at the moment of the hit. */
+const STAGGER_BRAKE = 0.35;
 
 /**
  * How close a vehicle's centre has to be to the viewer to be taken for the
@@ -260,6 +408,40 @@ export interface PedestrianImpact {
   readonly dirZ: number;
   /** True when this one is not getting up. */
   readonly fatal: boolean;
+}
+
+/**
+ * What the combat layer says about a round that hit somebody.
+ *
+ * Every field is optional and the defaults are the common case: a lethal shot,
+ * matched within a metre, that frightens the street. See `Crowd.casualtyAt`.
+ */
+export interface CasualtyOptions {
+  /** How far from the reported point to look for a body, in metres. Default 1. */
+  readonly radius?: number | undefined;
+  /** The ROUND's direction of travel, so the victim topples the right way. */
+  readonly dirX?: number | undefined;
+  readonly dirZ?: number | undefined;
+  /**
+   * False for a hit somebody survives.
+   *
+   * A SURVIVOR STAYS ON THEIR FEET. They flinch, stumble along the round's
+   * line of travel, lose their pace and then run - see `staggerAt`. They do
+   * NOT lie down: a wounded pedestrian on the pavement is indistinguishable
+   * from a dead one, and while prone they are skipped by the combat layer's
+   * own targeting, so a graze made somebody briefly unkillable.
+   *
+   * Default true - a persistent casualty who never rises.
+   */
+  readonly lethal?: boolean | undefined;
+  /**
+   * Forces a non-lethal hit to floor the victim anyway, with the vehicle
+   * knock-down's recovery. Only for a blow that genuinely takes somebody off
+   * their feet; a bullet is not one. Ignored when `lethal` is true.
+   */
+  readonly floor?: boolean | undefined;
+  /** False to put somebody down silently. Default true. See `Crowd.alarmAt`. */
+  readonly alarm?: boolean | undefined;
 }
 
 /**
@@ -343,11 +525,61 @@ export interface Pedestrian {
   due: number;
   groundAge: number;
   /**
+   * How solidly this person is drawn, 0 to 1.
+   *
+   * `PedestrianSystem` hands it to the shader, which dissolves the body away
+   * below 1. Nobody is ever activated or deactivated at full opacity, so the
+   * population can change while the player is looking at it without anything
+   * blinking in or out. See `FADE_TIME`.
+   */
+  fade: number;
+  /**
+   * `RETIRE_NONE`, `RETIRE_POOL` or `RETIRE_RECYCLE`. Anything but the first
+   * means this person is fading out, and what happens when the fade completes.
+   */
+  retire: number;
+  /**
+   * Which `PEDESTRIAN_ZONES` entry this person is standing in, as an index.
+   *
+   * Taken from the link they are on rather than from their coordinates,
+   * because the corridor clamp guarantees they are inside it and the link's
+   * zone was decided once at construction. Free to read; a `zoneAt` call per
+   * person per frame would not be.
+   */
+  zone: number;
+  /**
+   * Seconds left of "somebody near me fired a gun". Drives the hurry, the
+   * choice of route away from it, and the refusal to stop and look at
+   * anything. See `alarmAt`.
+   */
+  alarm: number;
+  /**
+   * Seconds left of a flinch. Nonzero means this person has just been hit and
+   * is STILL ON THEIR FEET: they lean, they stumble along the round's line of
+   * travel and they lose their pace, and then they run. See `staggerAt`.
+   */
+  stagger: number;
+  /** Unit direction the stumble carries them, the round's line of travel. */
+  staggerX: number;
+  staggerZ: number;
+  /** Where the shot that frightened them came from. */
+  alarmX: number;
+  alarmZ: number;
+  /**
    * Seconds since this pedestrian was knocked down. Drives the topple and, on
    * the way back, the rise; meaningless unless `state` is 'down'.
    */
   downFor: number;
-  /** True while this one is never getting up again. */
+  /**
+   * True while this one is never getting up again.
+   *
+   * THIS IS THE PERSISTENT CASUALTY STATE. A vehicle knock-down below
+   * `FATAL_SPEED` leaves it false and the victim rises after `DOWN_TIME`; a
+   * lethal hit - a fast vehicle, a bullet through `casualtyAt`, the middle of a
+   * blast - sets it and the body stays down until it is cleared under the
+   * bounds at `CASUALTY_LIMIT`. `Crowd.tilt` reads it to decide whether to play
+   * the rise, and `stepDown` reads it to decide whether to run one at all.
+   */
   fatal: boolean;
   /**
    * Which way they topple: +1 over backwards, -1 onto their face. Chosen from
@@ -372,6 +604,19 @@ export interface CrowdContext {
   readonly y: number;
   readonly time: number;
   readonly vehicles?: readonly CrowdVehicle[] | undefined;
+  /**
+   * Which way the player is looking, as a unit vector on the ground.
+   *
+   * OPTIONAL, and everything works without it. Supplied, it keeps a recycled
+   * pedestrian from being introduced in the cone the player is actually
+   * watching: a spawn 46 m away is a person materialising in mid-shot, and the
+   * fade covers it but does not make it invisible. Left out, the crowd falls
+   * back to the player's smoothed direction of travel, which is where somebody
+   * walking is usually looking and is nowhere at all when they are standing
+   * still.
+   */
+  readonly forwardX?: number | undefined;
+  readonly forwardZ?: number | undefined;
 }
 
 export interface CrowdStats {
@@ -403,8 +648,27 @@ export interface CrowdStats {
   gaveUp: number;
   /** Pedestrians currently on the ground. See `knockDown`. */
   down: number;
+  /**
+   * Of those, the ones who are never getting up. Bounded by `CASUALTY_LIMIT`
+   * and cleared under the rules at `CASUALTY_TIME`.
+   */
+  casualties: number;
   /** Times a vehicle has knocked somebody down. Cumulative. */
   struck: number;
+  /** People currently running from gunfire. See `alarmAt`. */
+  alarmed: number;
+  /**
+   * How many of the pool the surroundings are judged able to carry.
+   *
+   * Between `MIN_ACTIVE` and `budget`. Downtown it is the budget; at the
+   * airport it is a fraction of it, which is the whole of the fix for the
+   * crowd that used to line the access road. See `CROWD_DENSITY`.
+   */
+  limit: number;
+  /** Zone-weighted metres of pavement the limit was derived from. */
+  supply: number;
+  /** People in each `PEDESTRIAN_ZONES` entry, by index. */
+  readonly byZone: Int32Array;
 }
 
 const GRID_BITS = 12;
@@ -490,7 +754,12 @@ export class Crowd {
     detours: 0,
     gaveUp: 0,
     down: 0,
+    casualties: 0,
     struck: 0,
+    alarmed: 0,
+    limit: 0,
+    supply: 0,
+    byZone: new Int32Array(PEDESTRIAN_ZONES.length),
   };
 
   /** Told whenever a vehicle knocks somebody down. See `PedestrianImpact`. */
@@ -525,11 +794,33 @@ export class Crowd {
    * can be impassable at all, and `chooseNext` for what is done about it.
    */
   private readonly closed: Uint8Array;
+  /**
+   * Which `PEDESTRIAN_ZONES` entry each link is in, and how densely that zone
+   * may be populated. Both are decided once: the airport does not move.
+   */
+  private readonly linkZone: Uint8Array;
+  private readonly linkShare: Float32Array;
+  /** People currently standing in each zone. Rebuilt every frame in `update`. */
+  private readonly zoneCount = new Int32Array(PEDESTRIAN_ZONES.length);
+  private readonly zoneCap = new Int32Array(PEDESTRIAN_ZONES.length);
+  /** How many of the pool the surroundings can carry. See `refreshLimit`. */
+  private activeLimit: number;
+  private supplyAge = Number.POSITIVE_INFINITY;
+  private supplyX = Number.NaN;
+  private supplyZ = Number.NaN;
+  /** Recent gunfire, bounded to `ALARM_SLOTS` and overwritten oldest first. */
+  private readonly alarms: { x: number; z: number; radius: number; at: number }[] = [];
+  private alarmCursor = 0;
+  /** Seconds of simulation, for stamping alarms. Monotone, never read as wall time. */
+  private alarmClock = 0;
   private lastPlayerX = Number.NaN;
   private lastPlayerZ = Number.NaN;
   /** Smoothed player direction, so recycled agents land where they are going. */
   private driftX = 0;
   private driftZ = 0;
+  /** Where the player is looking this frame, or the drift when unknown. */
+  private viewX = 0;
+  private viewZ = 0;
 
   constructor(options: CrowdOptions) {
     this.ground = options.ground;
@@ -542,11 +833,107 @@ export class Crowd {
     for (let i = 0; i < options.population; i += 1) this.peds.push(this.blank());
 
     this.closed = new Uint8Array(this.graph.links.length);
+    this.linkZone = new Uint8Array(this.graph.links.length);
+    this.linkShare = new Float32Array(this.graph.links.length);
     for (let i = 0; i < this.graph.links.length; i += 1) {
       const link = this.graph.links[i];
       if (!link) continue;
       if (this.obstacles.blocksCorridor(link, PED_RADIUS + 0.14)) this.closed[i] = 1;
+
+      /*
+       * Zoning, decided once because the airport is not going to move.
+       *
+       * TWO DIFFERENT QUESTIONS, ANSWERED TWO DIFFERENT WAYS.
+       *
+       * Which zone a link BELONGS to is answered at its midpoint, because that
+       * is the representative point of a corridor and because it has to agree
+       * with `zoneAt(ped.x, ped.z)` - the caps are a statement about where
+       * people are standing, and a test that sweeps positions has to be able
+       * to reproduce them.
+       *
+       * Whether a link is ALLOWED is answered by sweeping the whole run, and
+       * any sample that lands on a forbidden surface closes it. That reuses the
+       * flag street furniture already sets, so `linksNear`, `chooseNext` and
+       * `respawn` all refuse it for free and nobody has to be steered off a
+       * taxiway after the fact.
+       */
+      const zone = zoneAt((link.ax + link.bx) * 0.5, (link.az + link.bz) * 0.5);
+      const rule = zoneRule(zone);
+      this.linkZone[i] = PEDESTRIAN_ZONES.indexOf(zone);
+      this.linkShare[i] = rule.share;
+      if (rule.forbidden || zoneRule(zoneAlong(link.ax, link.az, link.bx, link.bz)).forbidden) {
+        this.closed[i] = 1;
+        this.linkShare[i] = 0;
+      }
     }
+    for (let z = 0; z < PEDESTRIAN_ZONES.length; z += 1) {
+      const cap = zoneRule(PEDESTRIAN_ZONES[z] as PedestrianZone).cap;
+      // An Int32Array cannot hold Infinity; the pool size is an exact ceiling.
+      this.zoneCap[z] = Number.isFinite(cap) ? cap : this.peds.length;
+    }
+    this.activeLimit = this.budget;
+    this.stats.limit = this.budget;
+  }
+
+  // -- zones and how many people they carry ---------------------------------
+
+  /** Which zone a link is in, as a `PEDESTRIAN_ZONES` index. */
+  zoneOf(linkIndex: number): PedestrianZone {
+    return (PEDESTRIAN_ZONES[this.linkZone[linkIndex] ?? 0] ?? 'city') as PedestrianZone;
+  }
+
+  /** Which zone a pedestrian is standing in. */
+  static zoneName(ped: Pedestrian): PedestrianZone {
+    return (PEDESTRIAN_ZONES[ped.zone] ?? 'city') as PedestrianZone;
+  }
+
+  /**
+   * Zone-weighted metres of pavement within the seed radius of a point.
+   *
+   * One-way metres: a link and its reverse are the same strip of ground, and
+   * counting both would double every street. Each link contributes
+   * `length * share`, so a metre of forecourt is worth 0.6 m of city pavement
+   * and a metre of airport access road 0.12 m of it.
+   */
+  supplyNear(px: number, pz: number, radius = RENDER_RADIUS * 0.95): number {
+    let total = 0;
+    const links = this.graph.links;
+    for (let i = 0; i < links.length; i += 1) {
+      const link = links[i];
+      if (!link || link.crossing) continue;
+      if (this.closed[i] === 1) continue;
+      if (link.reverse >= 0 && link.reverse < i) continue;
+      const mx = (link.ax + link.bx) * 0.5;
+      const mz = (link.az + link.bz) * 0.5;
+      if (Math.hypot(mx - px, mz - pz) > radius) continue;
+      total += link.length * (this.linkShare[i] ?? 1);
+    }
+    return total;
+  }
+
+  /**
+   * How many of the pool the ground around the player can plausibly carry.
+   *
+   * Recomputed on a timer and whenever the player has moved far enough for the
+   * answer to have changed, because it is a pass over every link and the answer
+   * is a slowly varying property of where you are standing.
+   */
+  private refreshLimit(px: number, pz: number, dt: number): void {
+    this.supplyAge += dt;
+    const moved = Number.isFinite(this.supplyX)
+      ? Math.hypot(px - this.supplyX, pz - this.supplyZ)
+      : Number.POSITIVE_INFINITY;
+    if (this.supplyAge < SUPPLY_INTERVAL && moved < SUPPLY_MOVE) return;
+    this.supplyAge = 0;
+    this.supplyX = px;
+    this.supplyZ = pz;
+    const supply = this.supplyNear(px, pz);
+    this.stats.supply = Number(supply.toFixed(1));
+    this.activeLimit = Math.max(
+      Math.min(MIN_ACTIVE, this.budget),
+      Math.min(this.budget, Math.round(supply * CROWD_DENSITY)),
+    );
+    this.stats.limit = this.activeLimit;
   }
 
   /**
@@ -626,6 +1013,15 @@ export class Crowd {
       due: 0,
       groundAge: 0,
       crossCooldown: 0,
+      fade: 0,
+      retire: RETIRE_NONE,
+      zone: PEDESTRIAN_ZONES.length - 1,
+      alarm: 0,
+      alarmX: 0,
+      alarmZ: 0,
+      stagger: 0,
+      staggerX: 0,
+      staggerZ: 0,
       downFor: 0,
       fatal: false,
       fallSign: 1,
@@ -643,7 +1039,25 @@ export class Crowd {
    * material, no extra draw call.
    */
   static tilt(ped: Pedestrian): number {
-    if (ped.state !== 'down') return 0;
+    if (ped.state !== 'down') {
+      if (ped.stagger <= 0) return 0;
+      /*
+       * The flinch, drawn by exactly the same machinery a topple is: a tilt
+       * folded into the instance matrix that already carries the heading and
+       * the build. No new mesh, no new clip, no extra draw call - see
+       * `PedestrianSystem.writeMatrix`.
+       *
+       * Quick in and slow out, because that is what a flinch looks like: the
+       * lean arrives over `STAGGER_ONSET` of the reaction and unwinds over the
+       * rest of it. A step function would pop.
+       */
+      const gone = 1 - ped.stagger / STAGGER_TIME;
+      const amount =
+        gone < STAGGER_ONSET
+          ? gone / STAGGER_ONSET
+          : (1 - (gone - STAGGER_ONSET) / (1 - STAGGER_ONSET)) ** 2;
+      return ped.fallSign * amount * STAGGER_TILT;
+    }
     const fall = clamp(ped.downFor / FALL_TIME, 0, 1);
     // Ease out: a falling body accelerates and then stops dead on the ground.
     let amount = 1 - (1 - fall) * (1 - fall);
@@ -664,21 +1078,38 @@ export class Crowd {
    * visible clump on whichever street wins the first few rolls; stratifying
    * guarantees the population is spread over every street in range in
    * proportion to how much pavement each one has.
+   *
+   * The length is ZONE-WEIGHTED, so the same stratification that spreads people
+   * evenly along a city street also thins them across an airport access road -
+   * one mechanism, one place to reason about it. The head count comes from the
+   * same weighting through `refreshLimit`, and the per-zone caps are enforced
+   * as the strata are consumed, so a seed can never open with a zone over its
+   * ceiling.
    */
   seed(px: number, pz: number): void {
     const candidates = this.linksNear(px, pz, 0, RENDER_RADIUS * 0.95);
     if (candidates.length === 0) return;
 
+    // The limit has to be current before anybody is placed: a teleport is
+    // exactly when the surroundings change completely.
+    this.supplyAge = Number.POSITIVE_INFINITY;
+    this.refreshLimit(px, pz, 0);
+
     let total = 0;
-    for (const index of candidates) total += this.graph.links[index]?.length ?? 0;
+    for (const index of candidates) {
+      total += (this.graph.links[index]?.length ?? 0) * (this.linkShare[index] ?? 1);
+    }
     if (total <= 0) return;
 
-    const count = Math.min(this.budget, this.peds.length);
+    this.zoneCount.fill(0);
+    const count = Math.min(this.activeLimit, this.budget, this.peds.length);
     for (let i = 0; i < this.peds.length; i += 1) {
       const ped = this.peds[i];
       if (!ped) continue;
       if (i >= count) {
         ped.active = false;
+        ped.retire = RETIRE_NONE;
+        ped.fade = 0;
         continue;
       }
       // One stratum per pedestrian, jittered inside it.
@@ -686,13 +1117,28 @@ export class Crowd {
       let target = r * total;
       let chosen = candidates[candidates.length - 1] ?? 0;
       for (const index of candidates) {
-        target -= this.graph.links[index]?.length ?? 0;
+        target -= (this.graph.links[index]?.length ?? 0) * (this.linkShare[index] ?? 1);
         if (target <= 0) {
           chosen = index;
           break;
         }
       }
+      // A stratum that lands in a zone already at its ceiling is skipped
+      // rather than clamped: the slot stays empty and `update` will find it
+      // somewhere legal on a later frame.
+      const zone = this.linkZone[chosen] ?? 0;
+      if ((this.zoneCount[zone] ?? 0) >= (this.zoneCap[zone] ?? 0)) {
+        ped.active = false;
+        ped.retire = RETIRE_NONE;
+        ped.fade = 0;
+        continue;
+      }
+      this.zoneCount[zone] = (this.zoneCount[zone] ?? 0) + 1;
       this.place(ped, chosen, this.rng.next());
+      // A seed follows a teleport, and there is no continuity to protect
+      // across one. Fading three hundred people in would read as the world
+      // materialising rather than as a crowd already going about its day.
+      ped.fade = 1;
     }
     this.reindex();
     this.separateInitial();
@@ -728,6 +1174,13 @@ export class Crowd {
     ped.look = makeLook(this.rng);
     ped.active = true;
     ped.link = index;
+    ped.zone = this.linkZone[index] ?? 0;
+    // Dissolves in. `seed` overrides it to 1 straight afterwards, because a
+    // teleport has no continuity to protect; every other caller wants the fade.
+    ped.fade = 0;
+    ped.retire = RETIRE_NONE;
+    ped.alarm = 0;
+    ped.stagger = 0;
     ped.next = -1;
     ped.along = clamp(t * chosen.length, 0.5, Math.max(0.5, chosen.length - 0.5));
     ped.lateralTarget = this.preferredLateral(chosen, ped.look);
@@ -778,6 +1231,17 @@ export class Crowd {
    * the crowd is pulled toward wherever the player is heading, because
    * otherwise walking two hundred metres leaves the whole city behind you:
    * measured before this, a player who walked 200 m had 15 people within 60 m.
+   *
+   * Three more, added with the airport:
+   *
+   *   - the zone's `share`, so a recycled pedestrian is far likelier to reappear
+   *     on a city pavement or a terminal forecourt than on an access road;
+   *   - the zone's `cap`, as a hard veto - a full zone offers no candidates at
+   *     all, whatever the geometry says;
+   *   - a penalty for landing INSIDE THE PLAYER'S VIEW CONE. The ring starts at
+   *     46 m, which is close enough for a person appearing in it to be seen
+   *     doing so; the fade covers the rest, but not putting them there in the
+   *     first place is better than covering it.
    */
   private respawn(ped: Pedestrian, px: number, pz: number): void {
     const candidates = this.linksNear(px, pz, SPAWN_MIN, SPAWN_MAX);
@@ -795,12 +1259,28 @@ export class Crowd {
     for (const index of candidates) {
       const link = this.graph.links[index];
       if (!link) continue;
+      const zone = this.linkZone[index] ?? 0;
+      if ((this.zoneCount[zone] ?? 0) >= (this.zoneCap[zone] ?? 0)) continue;
       const mx = (link.ax + link.bx) * 0.5 - px;
       const mz = (link.az + link.bz) * 0.5 - pz;
       const d = Math.hypot(mx, mz);
       const spread = 1 / (1 + (d / 38) * (d / 38));
       const ahead = headX === 0 && headZ === 0 ? 0 : Math.max(0, (mx * headX + mz * headZ) / d);
-      const weight = spread * (1 + 1.9 * ahead);
+      /*
+       * How far into the field of view this candidate is. 0.55 is about 57
+       * degrees off the view axis - comfortably outside a 70 degree horizontal
+       * field of view - so anything beyond it is off screen and pays nothing.
+       * A candidate dead ahead and close is discouraged by a factor of six; one
+       * dead ahead but near the far edge of the ring is barely touched, because
+       * a person 110 m away is a dozen pixels tall.
+       */
+      let seen = 0;
+      if (d > 1e-3 && (this.viewX !== 0 || this.viewZ !== 0)) {
+        const facing = (mx * this.viewX + mz * this.viewZ) / d;
+        seen = Math.max(0, (facing - 0.55) / 0.45) * clamp(1 - (d - SPAWN_MIN) / 55, 0, 1);
+      }
+      const weight = spread * (1 + 1.9 * ahead) * (this.linkShare[index] ?? 1) * (1 - 0.84 * seen);
+      if (weight <= 0) continue;
       total += weight;
       // Weighted reservoir sample: one pass, no temporary array.
       if (this.rng.next() * total < weight) chosen = index;
@@ -809,6 +1289,8 @@ export class Crowd {
       ped.active = false;
       return;
     }
+    const zone = this.linkZone[chosen] ?? 0;
+    this.zoneCount[zone] = (this.zoneCount[zone] ?? 0) + 1;
     this.place(ped, chosen, this.rng.next());
     this.stats.respawned += 1;
   }
@@ -855,12 +1337,31 @@ export class Crowd {
     }
     this.lastPlayerX = ctx.x;
     this.lastPlayerZ = ctx.z;
+    /*
+     * Where the player is looking, for the out-of-view spawn bias. Their own
+     * facing when the caller supplies it, otherwise the smoothed direction of
+     * travel - which is where somebody walking is usually looking, and is
+     * exactly zero when they are standing still, which switches the bias off
+     * rather than pointing it somewhere wrong.
+     */
+    if (ctx.forwardX !== undefined && ctx.forwardZ !== undefined) {
+      const length = Math.hypot(ctx.forwardX, ctx.forwardZ);
+      this.viewX = length > 1e-4 ? ctx.forwardX / length : 0;
+      this.viewZ = length > 1e-4 ? ctx.forwardZ / length : 0;
+    } else {
+      const drift = Math.hypot(this.driftX, this.driftZ);
+      this.viewX = drift > 0.6 ? this.driftX / drift : 0;
+      this.viewZ = drift > 0.6 ? this.driftZ / drift : 0;
+    }
     if (jumped) {
       // A teleport (or the first frame) invalidates the whole distribution.
       // Reseeding is far cheaper than watching every agent recycle one by one.
       this.seed(ctx.x, ctx.z);
       return;
     }
+
+    this.refreshLimit(ctx.x, ctx.z, step);
+    this.alarmClock += step;
 
     this.stats.active = 0;
     this.stats.near = 0;
@@ -871,24 +1372,110 @@ export class Crowd {
     this.stats.waiting = 0;
     this.stats.crossing = 0;
     let down = 0;
+    let casualties = 0;
+    let alarmed = 0;
+
+    /*
+     * The zone census, taken fresh rather than maintained incrementally.
+     *
+     * A pedestrian changes zone by walking across a line nobody told the crowd
+     * about, so an incremental count drifts; 270 array increments do not show
+     * up in a profile and cannot drift at all. Spawns during this frame
+     * increment it as they go, so two respawns cannot both take the last slot
+     * in a zone.
+     */
+    this.zoneCount.fill(0);
+    for (const ped of this.peds) {
+      if (!ped.active) continue;
+      /*
+       * FROM THE POSITION, not from the link.
+       *
+       * A cap is a statement about where people are standing, and a link is a
+       * corridor that can start in one zone and end in another: measured
+       * before this, links classified as access road were carrying people who
+       * were standing on the forecourt, and the forecourt ran five over a cap
+       * of thirty that the crowd's own books said it was inside. Six rectangle
+       * comparisons per person per frame, and the first of them rejects
+       * everybody in the city.
+       */
+      ped.zone = zoneIndexAt(ped.x, ped.z);
+      // Somebody already dissolving has stopped counting against the zone they
+      // are leaving. Counting them would flag their replacements as surplus
+      // too, and the zone would oscillate between empty and over its cap
+      // rather than settling on it.
+      if (ped.retire === RETIRE_NONE) {
+        this.zoneCount[ped.zone] = (this.zoneCount[ped.zone] ?? 0) + 1;
+      }
+    }
 
     this.reindex();
+
+    // How many people are allowed to be up at all. Everything past this is
+    // retired - by fading, never by vanishing.
+    const limit = Math.min(this.activeLimit, this.budget);
+    let kept = 0;
 
     for (let i = 0; i < this.peds.length; i += 1) {
       const ped = this.peds[i];
       if (!ped) continue;
-      if (i >= this.budget) {
-        ped.active = false;
-        continue;
-      }
       if (!ped.active) {
-        this.respawn(ped, ctx.x, ctx.z);
+        // Only top the crowd up to the limit. A slot left empty costs one
+        // comparison a frame; respawning into a full city costs a pass over
+        // every link in it.
+        if (kept < limit) {
+          this.respawn(ped, ctx.x, ctx.z);
+          if (ped.active) kept += 1;
+        }
         continue;
       }
+      kept += 1;
 
       const distance = Math.hypot(ped.x - ctx.x, ped.z - ctx.z);
       if (distance > RECYCLE_RADIUS) {
-        this.respawn(ped, ctx.x, ctx.z);
+        // Out past the ring: nothing here is drawn, so this one may be moved
+        // or dropped outright with no fade at all.
+        if (kept > limit) {
+          ped.active = false;
+          ped.fade = 0;
+          ped.retire = RETIRE_NONE;
+          kept -= 1;
+        } else {
+          this.respawn(ped, ctx.x, ctx.z);
+        }
+        continue;
+      }
+
+      /*
+       * The surplus, and the people standing where they should not be.
+       *
+       * Both are retired the same way: a flag, a fade, and only then the slot.
+       * `kept` counts in pool order, which bears no relation to where anybody
+       * is standing, so the surplus is a spatially unbiased sample and the
+       * choice is stable from frame to frame - the same slots keep losing, so
+       * the population converges instead of thrashing.
+       */
+      const inZone = this.zoneCount[ped.zone] ?? 0;
+      const zoneCap = this.zoneCap[ped.zone] ?? 0;
+      if (ped.retire === RETIRE_NONE && (kept > limit || inZone > zoneCap)) {
+        ped.retire = RETIRE_POOL;
+        if (inZone > zoneCap) this.zoneCount[ped.zone] = inZone - 1;
+      } else if (ped.retire === RETIRE_POOL && kept <= limit && inZone < zoneCap) {
+        /*
+         * HYSTERESIS, and it is load-bearing. The census above deliberately
+         * skips people who are already dissolving, so a zone that was five
+         * over its cap reads as exactly AT it on the very next frame - and an
+         * un-retire test of `<= cap` would then put all five back, every
+         * frame, for ever. Coming back needs a slot that is genuinely free.
+         */
+        ped.retire = RETIRE_NONE;
+      }
+
+      // The dissolve, advanced at every LOD because a body fading at a quarter
+      // rate reads as a flicker. Two compares and an add.
+      if (!this.advanceFade(ped, step, ctx)) {
+        // A cleared casualty is recycled straight into a new person, so the
+        // slot is still in use; a retired surplus is not.
+        if (!ped.active) kept -= 1;
         continue;
       }
 
@@ -900,13 +1487,15 @@ export class Crowd {
       if (distance <= RENDER_RADIUS) this.stats.rendered += 1;
       if (ped.state === 'wait') this.stats.waiting += 1;
       if (ped.state === 'cross') this.stats.crossing += 1;
+      if (ped.alarm > 0) alarmed += 1;
 
       if (ped.state === 'down') {
         down += 1;
+        if (ped.fatal) casualties += 1;
         // A body is stepped EVERY frame whatever its LOD. It costs three adds,
         // and running the topple at a quarter rate would make a distant fall
         // read as a stutter - the one moment the eye is certainly on them.
-        this.stepDown(ped, step, distance, ctx);
+        this.stepDown(ped, step, distance);
         continue;
       }
 
@@ -922,9 +1511,35 @@ export class Crowd {
       this.step(ped, i, step * stride, ctx);
     }
     this.stats.down = down;
+    this.stats.casualties = casualties;
+    this.stats.alarmed = alarmed;
+    this.stats.byZone.set(this.zoneCount);
 
     this.strike(ctx);
     this.resolveOverlaps(2);
+  }
+
+  /**
+   * Moves one pedestrian's dissolve toward where it should be, and finishes a
+   * retirement when it reaches zero.
+   *
+   * Returns false when the slot has just been given up, which tells the caller
+   * to stop working on it this frame.
+   */
+  private advanceFade(ped: Pedestrian, dt: number, ctx: CrowdContext): boolean {
+    const rate = dt / FADE_TIME;
+    if (ped.retire === RETIRE_NONE) {
+      if (ped.fade < 1) ped.fade = Math.min(1, ped.fade + rate);
+      return true;
+    }
+    ped.fade -= rate;
+    if (ped.fade > 0) return true;
+    ped.fade = 0;
+    const recycle = ped.retire === RETIRE_RECYCLE;
+    ped.retire = RETIRE_NONE;
+    ped.active = false;
+    if (recycle) this.respawn(ped, ctx.x, ctx.z);
+    return false;
   }
 
   // -- being knocked down ---------------------------------------------------
@@ -993,7 +1608,7 @@ export class Crowd {
    * target and no opinion about crossings, and putting it through the walking
    * model would have it inch toward a kerb while lying on its back.
    */
-  private stepDown(ped: Pedestrian, dt: number, distance: number, ctx: CrowdContext): void {
+  private stepDown(ped: Pedestrian, dt: number, distance: number): void {
     ped.downFor += dt;
 
     if (ped.speed > 1e-3) {
@@ -1023,10 +1638,24 @@ export class Crowd {
     }
 
     if (ped.fatal) {
-      // A casualty is scenery until the player has walked away from them. Only
-      // then is the pool slot reused, so nobody watches a body blink out.
-      if (ped.downFor > CASUALTY_TIME && distance > LOD_NEAR) {
-        this.respawn(ped, ctx.x, ctx.z);
+      /*
+       * A casualty is scenery, and the rules for taking it away are all three
+       * of these at once:
+       *
+       *   - TIME. `CASUALTY_TIME` seconds, shortened to
+       *     `CASUALTY_TIME_CROWDED` once the street already holds
+       *     `CASUALTY_LIMIT` bodies, because every body holds a pool slot out
+       *     of circulation and an unbounded count would empty the city.
+       *   - DISTANCE. `CASUALTY_CLEAR` metres, so a body is only ever removed
+       *     from a part of the street the player has already left.
+       *   - AND IT STILL DOES NOT VANISH. It is flagged for recycling and
+       *     dissolves over `FADE_TIME` first; `advanceFade` puts somebody new
+       *     in the slot when the fade completes.
+       */
+      const dwell =
+        this.stats.casualties > CASUALTY_LIMIT ? CASUALTY_TIME_CROWDED : CASUALTY_TIME;
+      if (ped.retire === RETIRE_NONE && ped.downFor > dwell && distance > CASUALTY_CLEAR) {
+        ped.retire = RETIRE_RECYCLE;
       }
       return;
     }
@@ -1189,6 +1818,178 @@ export class Crowd {
     return true;
   }
 
+  // -- gunfire: casualties and the alarm -------------------------------------
+
+  /**
+   * The named, explicit way for the combat layer to put a civilian down.
+   *
+   * `downNearest` and `PedestrianSystem.downAt` keep working exactly as they
+   * did - this is an ADDITION, not a replacement - but they can only ever say
+   * "kill whoever is nearest", and a combat layer needs two more things:
+   *
+   *   - to distinguish a LETHAL hit from a wounding one. `lethal: false`
+   *     produces the same topple with the vehicle knock-down's recovery, so a
+   *     round that did not kill anybody leaves somebody who gets back up;
+   *     `lethal: true` (the default) sets `fatal`, and a `fatal` body never
+   *     rises. Bodies are bounded by `CASUALTY_LIMIT` and cleared under the
+   *     rules documented at `CASUALTY_TIME`.
+   *   - to make the street REACT. A shot that drops one person and leaves the
+   *     other eleven strolling past reads as nothing having happened, so this
+   *     raises an `alarmAt` at the same point unless the caller turns it off.
+   *
+   * Returns false when nobody was within `radius` - the pool slot may have been
+   * recycled between the shot landing and this call.
+   */
+  casualtyAt(x: number, z: number, options: CasualtyOptions = {}): boolean {
+    const radius = options.radius ?? 1;
+    const lethal = options.lethal ?? true;
+    if (options.alarm !== false) this.alarmAt(x, z);
+    if (lethal || options.floor === true) {
+      return this.downNearest(x, z, radius, lethal, options.dirX, options.dirZ);
+    }
+    return this.staggerAt(x, z, radius, options.dirX, options.dirZ);
+  }
+
+  /**
+   * Makes whoever is nearest a point flinch, without taking them off their
+   * feet. Returns whether anybody was close enough.
+   *
+   * The visible reaction is three things at once, and none of them needs a new
+   * clip or a new draw call:
+   *
+   *   - a LEAN, folded into the same instance matrix that already carries the
+   *     heading and the build, away from wherever the round came from. See
+   *     `Crowd.tilt`, which the renderer already calls for a topple.
+   *   - a STUMBLE along the round's line of travel, applied as displacement so
+   *     the steering speed cap cannot erase it, and still clamped into the
+   *     pavement corridor like every other movement.
+   *   - a BREAK OF STRIDE, deepest at the moment of the hit.
+   *
+   * They are left alarmed afterwards, so the flinch turns into a run rather
+   * than into somebody strolling on as if nothing had happened. Somebody
+   * already on the ground is not staggered: a corpse has no stride to break.
+   */
+  staggerAt(x: number, z: number, radius = 1, dirX?: number, dirZ?: number): boolean {
+    let best: Pedestrian | null = null;
+    let bestDistance = radius * radius;
+    for (const ped of this.peds) {
+      if (!ped.active || ped.state === 'down') continue;
+      const d = (ped.x - x) * (ped.x - x) + (ped.z - z) * (ped.z - z);
+      if (d < bestDistance) {
+        bestDistance = d;
+        best = ped;
+      }
+    }
+    if (!best) return false;
+
+    // The round's own direction where the caller knows it, and the victim's
+    // facing otherwise - which shoves them forward, the same fallback
+    // `downNearest` uses and for the same reason.
+    const known = dirX !== undefined && dirZ !== undefined;
+    const length = known ? Math.hypot(dirX as number, dirZ as number) : 0;
+    const bx = length > 1e-4 ? (dirX as number) / length : -Math.sin(best.heading);
+    const bz = length > 1e-4 ? (dirZ as number) / length : -Math.cos(best.heading);
+
+    best.stagger = STAGGER_TIME;
+    best.staggerX = bx;
+    best.staggerZ = bz;
+    // Lean AWAY from the blow, exactly as `knockDown` topples away from it.
+    const facingX = -Math.sin(best.heading);
+    const facingZ = -Math.cos(best.heading);
+    best.fallSign = bx * facingX + bz * facingZ > 0 ? -1 : 1;
+    // A person who has just been shot at does not stop to look at a shop
+    // window, and the alarm is what turns the flinch into a run.
+    if (best.state === 'pause' || best.state === 'wait') best.state = 'walk';
+    best.alarm = Math.max(best.alarm, ALARM_TIME);
+    best.alarmX = x;
+    best.alarmZ = z;
+    return true;
+  }
+
+  /**
+   * Tells the crowd a gun went off here.
+   *
+   * Everybody inside `radius` is frightened for `ALARM_TIME` seconds: they
+   * stop dawdling, they hurry, and `chooseNext` starts preferring whichever
+   * continuation takes them AWAY from the point. The reaction is stamped onto
+   * each person once, here, rather than tested per frame against a list of
+   * alarms, so a firefight costs one grid sweep per shot and nothing at all in
+   * between.
+   *
+   * The alarm is also remembered in a bounded ring so a caller can ask what the
+   * crowd currently believes; `ALARM_SLOTS` bounds it because a player emptying
+   * a magazine raises one per round.
+   *
+   * Returns how many people heard it.
+   */
+  alarmAt(x: number, z: number, radius = ALARM_RADIUS, seconds = ALARM_TIME): number {
+    if (!(radius > 0)) return 0;
+    const record = { x, z, radius, at: this.alarmClock };
+    if (this.alarms.length < ALARM_SLOTS) this.alarms.push(record);
+    else {
+      this.alarms[this.alarmCursor] = record;
+      this.alarmCursor = (this.alarmCursor + 1) % ALARM_SLOTS;
+    }
+
+    /*
+     * A straight pass over the pool rather than a walk of the hash grid.
+     *
+     * The alarm radius is 26 m against a 2.4 m cell, which is 529 bucket
+     * lookups - more work than the 270 distance tests this does, and WRONG as
+     * well: `hashCell` folds the world into 4096 buckets, so two of those 529
+     * cells can share one, and the people in it would be counted twice. That
+     * does not matter for `blastAt`, whose count is a diagnostic; it matters
+     * here, because the return value tells a caller how many people heard.
+     */
+    let heard = 0;
+    const radiusSquared = radius * radius;
+    for (const ped of this.peds) {
+      // A body on the ground has nothing to run from any more.
+      if (!ped.active || ped.state === 'down') continue;
+      const dx = ped.x - x;
+      const dz = ped.z - z;
+      if (dx * dx + dz * dz > radiusSquared) continue;
+      ped.alarm = Math.max(ped.alarm, seconds);
+      ped.alarmX = x;
+      ped.alarmZ = z;
+      // A frightened person does not stand at a kerb reading a sign.
+      if (ped.state === 'pause' || ped.state === 'wait') ped.state = 'walk';
+      // Re-pick the route now that "away from there" is a preference.
+      ped.next = -1;
+      /*
+       * AND TURN ROUND IF THEY WERE WALKING INTO IT.
+       *
+       * `chooseNext` can only steer somebody away at the END of the link they
+       * are on, and this city's links run twenty metres and more - so without
+       * this, half a frightened crowd walks calmly toward the gunfire for
+       * fifteen seconds before turning. Measured over six seconds after a
+       * shot, the share of people who had increased their distance from it
+       * went from 0.46 to well over two thirds with this in.
+       *
+       * Never off a crossing: the reverse of a crossing is the same strip of
+       * carriageway, and taking it here would skip the signal check. Somebody
+       * caught halfway across a road is safer finishing it, which is the same
+       * rule `watchStall` keeps.
+       */
+      const link = this.graph.links[ped.link];
+      if (link && !link.crossing && link.reverse >= 0 && this.closed[link.reverse] !== 1) {
+        const back = this.graph.links[link.reverse];
+        const d = Math.hypot(dx, dz);
+        if (back && !back.crossing && d > 1e-3 && (-dx * link.dx - dz * link.dz) / d > 0.25) {
+          ped.next = link.reverse;
+          this.commit(ped);
+        }
+      }
+      heard += 1;
+    }
+    return heard;
+  }
+
+  /** Gunfire the crowd currently remembers, oldest first. Bounded and read-only. */
+  get recentAlarms(): readonly { readonly x: number; readonly z: number; readonly radius: number }[] {
+    return this.alarms;
+  }
+
   /**
    * Knocks everybody inside a radius flat, away from the seat of a blast.
    *
@@ -1276,6 +2077,9 @@ export class Crowd {
 
     ped.dodge = Math.max(0, ped.dodge - dt);
     ped.crossCooldown = Math.max(0, ped.crossCooldown - dt);
+    ped.alarm = Math.max(0, ped.alarm - dt);
+    const staggerBefore = ped.stagger;
+    ped.stagger = Math.max(0, ped.stagger - dt);
 
     let targetX: number;
     let targetZ: number;
@@ -1381,7 +2185,20 @@ export class Crowd {
     // narrower streets. Measured at one corner: 0.19 m travelled in 12 s.
     if (!stopped && !frozen) desired = Math.max(desired, 0.22);
 
-    const maxSpeed = ped.look.preferredSpeed * 1.75;
+    /*
+     * A flinch costs them their pace. Deepest at the moment of the hit and
+     * gone by the end of the reaction, so a person who has been shot at breaks
+     * stride and then runs rather than stopping dead - stopping is what a body
+     * does, and this one is still standing.
+     */
+    if (staggerBefore > 0) {
+      desired *= 1 - STAGGER_BRAKE * (staggerBefore / STAGGER_TIME);
+    }
+
+    // Somebody who has just heard a gun is allowed to run, which needs a
+    // higher ceiling than the everyday one. Still a multiple of their own
+    // comfortable pace, so a slow walker runs slowly.
+    const maxSpeed = ped.look.preferredSpeed * (ped.alarm > 0 ? PANIC_MAX : 1.75);
     const steerLength = Math.hypot(steerX, steerZ);
     if (steerLength > maxSpeed) {
       steerX = (steerX / steerLength) * maxSpeed;
@@ -1419,6 +2236,21 @@ export class Crowd {
 
     ped.x += ped.vx * dt;
     ped.z += ped.vz * dt;
+
+    /*
+     * The stumble, applied as DISPLACEMENT rather than as velocity.
+     *
+     * A velocity impulse would be clamped away on the very next line by the
+     * speed cap - which is right for steering and wrong for a shove - and
+     * would then be damped out over a seventh of a second. Moving the body
+     * directly puts the stumble on the screen, and `project` below still owns
+     * where they end up, so a shove cannot push anybody off a kerb.
+     */
+    if (staggerBefore > 0) {
+      const push = STAGGER_SHOVE * (staggerBefore / STAGGER_TIME) * dt;
+      ped.x += ped.staggerX * push;
+      ped.z += ped.staggerZ * push;
+    }
 
     if (ped.lod === 0) {
       // Street furniture is a hard constraint, not a suggestion.
@@ -1601,6 +2433,11 @@ export class Crowd {
     // Nobody dawdles on a carriageway. `crossingClear` assumes exactly this
     // much hurry when it decides whether they can get across in time.
     if (link.crossing) speed *= CROSSING_HURRY;
+    // ...and nobody dawdles anywhere at all having just heard a gunshot. This
+    // is deliberately NOT applied to the crossing gate's own estimate: a
+    // frightened person crossing faster than `crossingClear` assumed arrives
+    // early, which is the safe direction to be wrong in.
+    if (ped.alarm > 0) speed *= PANIC_HURRY;
     return speed;
   }
 
@@ -1652,7 +2489,7 @@ export class Crowd {
 
     // Choose the continuation early enough to slow down for it.
     if (ped.next < 0 && ped.along > link.length - Math.max(3.5, ped.speed * 2.2)) {
-      ped.next = this.chooseNext(link, ped.crossCooldown <= 0);
+      ped.next = this.chooseNext(link, ped.crossCooldown <= 0, ped);
     }
 
     if (ped.state === 'wait') {
@@ -1679,7 +2516,7 @@ export class Crowd {
         // at the harbour-walk corner: two agents cycling give-up, walk 1.6 m,
         // wait 26 s, give up, for forty seconds at a stretch.
         ped.crossCooldown = CROSS_COOLDOWN;
-        ped.next = this.chooseNext(link, false);
+        ped.next = this.chooseNext(link, false, ped);
         ped.lateralTarget = this.preferredLateral(link, ped.look);
         this.stats.gaveUp += 1;
       }
@@ -1692,6 +2529,10 @@ export class Crowd {
       if (
         ped.state === 'walk' &&
         !link.crossing &&
+        // Nobody stops to look at a shop window inside a few seconds of a
+        // gunshot. Suppressing the pause is most of what makes a street read
+        // as having reacted at all.
+        ped.alarm <= 0 &&
         ped.along > 3 &&
         ped.along < link.length - 6 &&
         this.rng.next() < ped.look.dwell * 0.0016 * dt * 60
@@ -1705,7 +2546,7 @@ export class Crowd {
 
     const next =
       this.graph.links[
-        ped.next < 0 ? (ped.next = this.chooseNext(link, ped.crossCooldown <= 0)) : ped.next
+        ped.next < 0 ? (ped.next = this.chooseNext(link, ped.crossCooldown <= 0, ped)) : ped.next
       ];
     if (!next) {
       // Nowhere to go: turn around rather than stand in the way for ever.
@@ -1738,6 +2579,9 @@ export class Crowd {
     const next = this.graph.links[ped.next];
     if (!next) return;
     ped.link = ped.next;
+    // The zone follows the link, because the corridor clamp guarantees the
+    // person is inside it and the link's zone was settled at construction.
+    ped.zone = this.linkZone[ped.link] ?? 0;
     ped.next = -1;
     ped.lateralTarget = this.preferredLateral(next, ped.look);
     this.project(ped, next);
@@ -1752,19 +2596,46 @@ export class Crowd {
    *
    * `allowCrossing` is false for somebody who has just given up on a crossing:
    * offering them the same one again is how a give-up turns into a loop.
+   *
+   * `who`, when given, contributes two more preferences:
+   *
+   *   - AWAY FROM A GUNSHOT. A frightened pedestrian is far likelier to take
+   *     the continuation that increases their distance from where the shot
+   *     came from. A preference and not a rule, because a rule with no legal
+   *     answer is how somebody ends up standing still - which is the last
+   *     thing a person does when they hear a gun.
+   *   - A ZONE THEY BELONG IN. Every route into a low-density zone is weighted
+   *     by its `share`, so an airport forecourt hands people back toward the
+   *     terminal rather than feeding them down the access road. Again a
+   *     preference: an outright refusal would strand anybody who had already
+   *     walked out there, and a forbidden zone is `closed` above instead.
    */
-  private chooseNext(link: PavementLink, allowCrossing = true): number {
+  private chooseNext(link: PavementLink, allowCrossing = true, who?: Pedestrian): number {
     const options = this.graph.linksFrom[link.to];
     if (!options || options.length === 0) return link.reverse;
+
+    // The unit vector pointing away from whatever frightened them.
+    let fleeX = 0;
+    let fleeZ = 0;
+    if (who && who.alarm > 0) {
+      const dx = who.x - who.alarmX;
+      const dz = who.z - who.alarmZ;
+      const d = Math.hypot(dx, dz);
+      if (d > 0.5) {
+        fleeX = dx / d;
+        fleeZ = dz / d;
+      }
+    }
 
     let bestIndex = -1;
     let bestScore = -1;
     for (const candidate of options) {
       const next = this.graph.links[candidate];
       if (!next) continue;
-      // A corridor street furniture has closed is not a route. Offering one
-      // strands whoever takes it, and on a crossing that means standing in a
-      // carriageway until the watchdog notices.
+      // A corridor street furniture has closed - or one that reaches onto a
+      // taxiway - is not a route. Offering one strands whoever takes it, and
+      // on a crossing that means standing in a carriageway until the watchdog
+      // notices.
       if (this.closed[candidate] === 1) continue;
       if (!allowCrossing && next.crossing) continue;
       const straight = next.dx * link.dx + next.dz * link.dz;
@@ -1773,6 +2644,18 @@ export class Crowd {
       else if (next.crossing) weight = link.crossing ? 0.005 : 0.24 + 0.26 * Math.max(0, straight);
       else if (straight > 0.9) weight = 5.5;
       else weight = 1.15;
+      /*
+       * The zone preference is the SQUARE ROOT of the share, not the share.
+       * The share already governs how many people are put in a zone and where
+       * they are spawned; applying it a second time at full strength here
+       * would compound into a route nobody ever takes, which strands the far
+       * end of the access road rather than merely thinning it.
+       */
+      const share = this.linkShare[candidate] ?? 1;
+      if (share < 1) weight *= Math.sqrt(Math.max(0.02, share));
+      if (fleeX !== 0 || fleeZ !== 0) {
+        weight *= 1 + 2.4 * Math.max(0, next.dx * fleeX + next.dz * fleeZ);
+      }
       // Reservoir-style weighted pick: one pass, no allocation.
       const score = this.rng.next() / weight;
       if (bestIndex < 0 || score < bestScore) {

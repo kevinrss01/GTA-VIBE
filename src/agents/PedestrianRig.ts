@@ -41,8 +41,26 @@
  * never reached the screen. See `docs/pedestrian-characters.md`.
  *
  * PER-INSTANCE ATTRIBUTES (all `InstancedBufferAttribute`):
- *   iAnim = (walk cycle 0..1, idle cycle 0..1, gait 0..1, spare)
- *   iTint = (r, g, b, spare) multiplied into the albedo
+ *   iAnim = (walk cycle 0..1, idle cycle 0..1, gait 0..1, action blend 0..1)
+ *   iTint = (r, g, b, dissolve 0..1); rgb multiply the albedo
+ *
+ * THE DISSOLVE. The crowd's head count is a function of where the player is
+ * standing - dense downtown, thin at the airport, see `crowd.ts`'s
+ * `CROWD_DENSITY` - so people are introduced and retired continuously rather
+ * than only out past the recycle ring, and a body switched off in the middle
+ * of the drawn set is a person vanishing in front of the player.
+ *
+ * A SCREEN-SPACE STIPPLE, NOT ALPHA BLENDING. Blending would need the crowd
+ * sorted back to front against itself and against the city, and would not work
+ * in the shadow pass at all. A `discard` against interleaved gradient noise is
+ * order-independent, works unchanged in the depth material - so a fading
+ * person's shadow fades with them - and costs one compare per fragment for
+ * everybody who is not currently fading, which is essentially everybody.
+ *
+ * The cost it does carry is that a `discard` anywhere in a fragment shader
+ * disables early-Z for that draw. Measured in a production build at 1280x720,
+ * over 60 forced-sync frames per vantage, with `renderer.info` for the whole
+ * scene: see the table in the workstream report. It did not move the frame.
  */
 
 import {
@@ -115,6 +133,25 @@ vec2 mbVatUv(vec4 clip, float phase) {
 `;
 
 /**
+ * The dissolve, in the fragment stage. Shared by the colour and depth
+ * materials so a person's shadow fades exactly as they do.
+ *
+ * Interleaved gradient noise (Jimenez, SIGGRAPH 2014). It is fixed in screen
+ * space, so a figure crossing the threshold stipples away smoothly instead of
+ * shimmering, and it is four instructions rather than a texture fetch.
+ */
+const FADE_FRAGMENT_GLSL = /* glsl */ `
+varying float vPedFade;
+float mbFadeNoise(vec2 c) {
+  return fract(52.9829189 * fract(dot(c, vec2(0.06711056, 0.00583715))));
+}
+`;
+
+const FADE_TEST_GLSL = /* glsl */ `
+  if (vPedFade < 0.996 && mbFadeNoise(gl_FragCoord.xy) > vPedFade) discard;
+`;
+
+/**
  * Reads the pose. Written into a `mbPose`/`mbNormal` pair so the depth
  * material, whose shader has no normal stage at all, can use the same code.
  *
@@ -154,20 +191,29 @@ const READ_GLSL = /* glsl */ `
 
 function injectColorVertex(source: string): string {
   return source
-    .replace('#include <common>', `#include <common>\n${SAMPLE_GLSL}\nvarying vec3 vPedTint;`)
+    .replace(
+      '#include <common>',
+      `#include <common>\n${SAMPLE_GLSL}\nvarying vec3 vPedTint;\nvarying float vPedFade;`,
+    )
     .replace(
       '#include <beginnormal_vertex>',
       `${READ_GLSL}\n#include <beginnormal_vertex>\nobjectNormal = mbNormal;`,
     )
-    .replace('#include <begin_vertex>', '#include <begin_vertex>\ntransformed = mbPose;\nvPedTint = iTint.rgb;');
+    .replace(
+      '#include <begin_vertex>',
+      '#include <begin_vertex>\ntransformed = mbPose;\nvPedTint = iTint.rgb;\nvPedFade = iTint.w;',
+    );
 }
 
 function injectDepthVertex(source: string): string {
   // The depth shader only includes `beginnormal_vertex` behind a displacement
   // map, so the read has to hang off `begin_vertex` instead.
   return source
-    .replace('#include <common>', `#include <common>\n${SAMPLE_GLSL}`)
-    .replace('#include <begin_vertex>', `${READ_GLSL}\n#include <begin_vertex>\ntransformed = mbPose;`);
+    .replace('#include <common>', `#include <common>\n${SAMPLE_GLSL}\nvarying float vPedFade;`)
+    .replace(
+      '#include <begin_vertex>',
+      `${READ_GLSL}\n#include <begin_vertex>\ntransformed = mbPose;\nvPedFade = iTint.w;`,
+    );
 }
 
 /** A 1x1 stand-in so the material compiles before the real texture arrives. */
@@ -243,10 +289,19 @@ export function createPedestrianVatMesh(capacity: number, slot: number): Pedestr
     Object.assign(shader.uniforms, uniforms);
     shader.vertexShader = injectColorVertex(shader.vertexShader);
     shader.fragmentShader = shader.fragmentShader
-      .replace('#include <common>', '#include <common>\nvarying vec3 vPedTint;')
+      .replace(
+        '#include <common>',
+        `#include <common>\nvarying vec3 vPedTint;\n${FADE_FRAGMENT_GLSL}`,
+      )
+      // First statement in `main`, so a dissolved fragment costs nothing but
+      // the compare that rejected it.
+      .replace(
+        '#include <clipping_planes_fragment>',
+        `#include <clipping_planes_fragment>${FADE_TEST_GLSL}`,
+      )
       .replace('#include <map_fragment>', '#include <map_fragment>\ndiffuseColor.rgb *= vPedTint;');
   };
-  material.customProgramCacheKey = (): string => 'meridian-pedestrian-vat-v1';
+  material.customProgramCacheKey = (): string => 'meridian-pedestrian-vat-v2';
 
   // The shadow pass runs its own program. Without the same lookup here the
   // crowd would cast the shadow of an unanimated rest pose, which is the most
@@ -256,8 +311,14 @@ export function createPedestrianVatMesh(capacity: number, slot: number): Pedestr
   depth.onBeforeCompile = (shader): void => {
     Object.assign(shader.uniforms, uniforms);
     shader.vertexShader = injectDepthVertex(shader.vertexShader);
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>\n${FADE_FRAGMENT_GLSL}`)
+      .replace(
+        '#include <clipping_planes_fragment>',
+        `#include <clipping_planes_fragment>${FADE_TEST_GLSL}`,
+      );
   };
-  depth.customProgramCacheKey = (): string => 'meridian-pedestrian-vat-depth-v1';
+  depth.customProgramCacheKey = (): string => 'meridian-pedestrian-vat-depth-v2';
 
   const anim = new InstancedBufferAttribute(new Float32Array(capacity * 4), 4);
   const tint = new InstancedBufferAttribute(new Float32Array(capacity * 4), 4);
@@ -281,6 +342,11 @@ export function createPedestrianVatMesh(capacity: number, slot: number): Pedestr
   // the constant ones are set once here rather than every frame.
   const matrices = mesh.instanceMatrix.array as Float32Array;
   for (let i = 0; i < capacity; i += 1) matrices[i * 16 + 15] = 1;
+  // `iTint.w` is the dissolve, and a zero-filled buffer means INVISIBLE. Every
+  // caller writes it, but a caller that forgets should get a solid person
+  // rather than a mesh that silently draws nothing, so the default is 1.
+  const tints = tint.array as Float32Array;
+  for (let i = 0; i < capacity; i += 1) tints[i * 4 + 3] = 1;
 
   let placeholder: BufferGeometry | null = geometry;
 

@@ -428,6 +428,14 @@ export class AircraftSystem {
    * fighting over one slot is a bug waiting for a frame where the car layer
    * happens to run second. Five aircraft is a linear scan, which at this size
    * is faster than any structure that could replace it.
+   *
+   * `fromX`/`fromZ` is the same CONTAINMENT WAIVER `CollisionWorld.blockedBox`
+   * takes, and it has to be here for the same reason. Without it an aeroplane
+   * whose footprint already overlaps another one - two spawned on one stand, a
+   * wingtip resting over a neighbour's tail - is refused every direction at
+   * once and is pinned for ever with no velocity, no impact and no message.
+   * Waiving only the aircraft it is ALREADY inside, rather than switching the
+   * test off, is what keeps the rest of the fleet solid meanwhile.
    */
   blockedBy(
     x: number,
@@ -438,6 +446,8 @@ export class AircraftSystem {
     bottom: number,
     top: number,
     exclude = -1,
+    fromX?: number,
+    fromZ?: number,
   ): boolean {
     const fx = -Math.sin(yaw);
     const fz = -Math.cos(yaw);
@@ -449,7 +459,7 @@ export class AircraftSystem {
       const ofx = -Math.sin(craft.yaw);
       const ofz = -Math.cos(craft.yaw);
       if (
-        obbOverlap(
+        !obbOverlap(
           x,
           z,
           fx,
@@ -464,8 +474,29 @@ export class AircraftSystem {
           craft.spec.halfWidth,
         )
       ) {
-        return true;
+        continue;
       }
+      if (
+        fromX !== undefined &&
+        fromZ !== undefined &&
+        obbOverlap(
+          fromX,
+          fromZ,
+          fx,
+          fz,
+          halfLength,
+          halfWidth,
+          craft.x,
+          craft.z,
+          ofx,
+          ofz,
+          craft.spec.halfLength,
+          craft.spec.halfWidth,
+        )
+      ) {
+        continue;
+      }
+      return true;
     }
     return false;
   }

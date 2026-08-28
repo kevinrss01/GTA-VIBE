@@ -8,9 +8,10 @@ and `ffmpeg -af volumedetect`, not copied from the generation request.
 - Generated: 2026-08-17.
 - Runtime manifest: [`src/audio/manifest.ts`](../src/audio/manifest.ts) — the
   same data in typed form, which the engine and the tests both read.
-- **Total charged: 1,386.34 credits (USD 27.73)** — 1,062.67 for the original
-  manifest plus 323.67 for the 2026-08-27 pursuit/airfield batch. The airport
-  dialogue is charged per character and is recorded with those lines.
+- **Total charged: 1,666.00 credits (USD 33.32)** — 1,062.67 for the original
+  manifest, 323.67 for the 2026-08-27 pursuit/airfield batch and 279.66 for the
+  2026-08-28 vehicle-class batch. The airport dialogue is charged per character
+  and is recorded with those lines.
 
 No API key, signed URL or other secret appears in this file, in the runtime
 manifest, or in any committed asset. `tests/audio.test.ts` asserts this.
@@ -206,23 +207,141 @@ apron concrete is not the same as a pavement slab, and a polished terminal floor
 is not the same as a domestic interior tile, so whoever adds those `SurfaceId`
 members should point them at these rather than at the nearest existing pair.
 
-### Hysteresis, and `onRoad`
+### Surface classification, and the death of `onRoad`
 
-`GroundSample.onRoad` has always been documented as existing "so the footstep
-mixer can pick the right variant" and was read by nothing in audio. It is now
-the authoritative carriageway signal: when it is true the step is asphalt
-whatever the sampler returned, and when it flips the held surface is abandoned
-immediately, because stepping off a kerb is a real transition.
+**Rewritten on 2026-08-28.** The two mechanisms this section used to describe -
+`GroundSample.onRoad` as an override, and a two-footstep hold - are both gone,
+and the numbers below are why.
 
-Everything else is held for two consecutive footsteps before it is heard. A
-player walking a boundary — the edge of a path, the lip of an apron — is given a
-different material on alternate steps by a per-point sampler, and without the
-hold that is heard as the ground flickering underfoot. The cost is at most one
-step of the old material on a genuine crossing.
+**The bug was not on roads.** `FirstPersonController` derived the surface as
 
-Separately, the player's own footsteps are capped at three voices in flight. The
-0.32 s cut means two should never genuinely overlap, but a frame-rate collapse
-or a debug time step can stack them and there is no per-source limiter.
+```ts
+this.surface = support.built && support.y > here.y + 0.05 ? 'interior' : here.surface;
+```
+
+which collapses EVERY built platform standing more than 5 cm proud of the
+terrain into one bucket: the domestic ceramic-tile pair. Swept over the whole
+map at 1.5 m, **6,276 walkable points hit that branch and only 372 of them are
+indoors.** The rest are shop plinths, boardwalk decks, apron edges and the whole
+terminal, so the game played a kitchen-tile footstep on the runway, on the
+harbour decking and on open gravel. Meanwhile `STEP_SURFACES.concrete` pointed
+at the pavement pair while `steps/concrete-*` sat in the manifest unreferenced,
+so the runway, the taxiway, the apron and every hangar floor were a city paving
+slab.
+
+**`onRoad` was dead weight.** It was passed from `main.ts` as a third argument
+"because the surface classification alone was wrong on roads". Swept over the
+same map: of **28,875 carriageway points, zero** were misclassified without it.
+It was a fossil of an already-fixed bug in `openGroundSurface`, which is now
+value noise on a 34 m lattice rather than a hash that re-rolled every half
+millimetre. `tests/footsteps.test.ts` runs both sweeps.
+
+**What replaced them.** `ColliderBox.surface` already existed, documented as
+being there "so a footstep on a hangar floor is not decided by guessing from the
+terrain underneath it", and nothing in audio read it. It is now the authority:
+
+| Underfoot | Heard |
+| --- | --- |
+| bare terrain | the ground sampler's `SurfaceId` |
+| a built floor the world tagged | that collider's `MaterialKey` |
+| an untagged built floor, indoors | `interior` (domestic tile) |
+| an untagged built floor, outdoors | the terrain it stands on |
+
+`MATERIAL_STEP_FAMILY` maps 28 materials onto the eight recorded families.
+`timber`/`timberDark` map to the boardwalk pair, which is the only wood in the
+manifest and is acoustically what a club floor on joists is; the metals and
+`tileFloor`/`stoneAshlar` map to the polished terminal pair. 115 of the world's
+1,762 colliders carry a material, so the controller keeps them in an index of
+their own rather than paying for the other 1,647.
+
+**Hysteresis is now measured in seconds, not footsteps.** A hold counted in
+footsteps cannot be prompt and stable at once: two steps is one step late on
+every genuine crossing, one step flickers on every boundary. The controller
+samples the ground 120 times a second, so it debounces the CONTINUOUS signal
+instead - `SURFACE_COMMIT_TIME` is 0.1 s, which is 0.28 m at a walk and 0.6 m at
+a run, both far inside the 1.45 m / 1.95 m stride. A genuine crossing therefore
+commits before the next footfall (prompt), and chatter reverts before the timer
+expires and is never heard (stable). `tests/footsteps.test.ts` asserts both:
+the first footfall after a kerb is the new material, and a boundary weaving at
+60 Hz changes the family **zero** times in 10 s.
+
+### Integration note: the two lines `main.ts` owes this
+
+The footstep path was changed from "a surface plus a re-derived road flag" to
+"one authoritative event", and `src/main.ts` is owned by another workstream, so
+the two edits it needs are recorded here rather than applied. Until they land,
+`tsc` reports four errors in the one block below and every footstep resolves to
+the pavement pair.
+
+1. Give the controller the collider list, so a built floor can report its own
+   material (`src/main.ts`, the `new FirstPersonController({...})` call):
+
+```ts
+    spawn: plan.spawn,
+    // The same boxes `collision` was built from. The controller indexes the
+    // ~115 of them that carry a `surface` so a footstep on a terminal floor is
+    // decided by that floor rather than by the apron underneath the building.
+    colliders: sink.colliders,
+  });
+```
+
+2. Stop re-deriving the surface at the call site (`controller.onFootstep`):
+
+```ts
+  controller.onFootstep = (step) => {
+    // A driver has no feet on the pavement, and neither does a pilot. The
+    // controller is paused in both, but its velocity DAMPS to zero rather than
+    // snapping there, so it can still cross the footstep threshold for a
+    // moment after getting in - which is audible as walking while seated.
+    if (driving.driving || flying.flying) return;
+    /*
+     * The event already carries the AUTHORITATIVE surface and, where the world
+     * tagged one, the material of the floor under the sole. Nothing here may
+     * re-derive it: the `onRoad` flag this used to sample and pass down was a
+     * second guess at something the world already knew, and a dead one - swept
+     * over the map, none of the 28,875 carriageway points needed it.
+     */
+    audio.footstep(step);
+  };
+```
+
+Both were applied temporarily to run the browser verification recorded below,
+then reverted so the file stays with its owner.
+
+### Player footstep level
+
+The report was that footsteps are too loud, and they were: every step played at
+its full authored level, which is the level a CLOSE microphone at the shoe was
+normalised to. What the player hears is their own feet from eye height. They now
+carry `PLAYER_STEP_DB` = **-8 dB**, with `PLAYER_STEP_CEILING_DB` = -2 dB as a
+guard on the mixer's OFFSET.
+
+The offset/total distinction is load-bearing, and getting it wrong the first
+time quietly undid the 2026-08-27 rebalance. A step asset's `trimDb` is a
+per-file CORRECTION towards a -22 dBFS mean, not a level, and those corrections
+run from -4.2 dB to +9.4 dB. Clamping `trimDb + offset` therefore attenuates
+exactly the files whose correction is largest: measured in the browser before it
+was caught, grass lost 3.4 dB and boardwalk 2.6 dB while terminal and concrete
+lost nothing - which is the 15.5 dB spread the rebalance existed to remove,
+coming back through the mixer. The ceiling now applies to the offset alone, and
+`tests/audio.test.ts` asserts the invariant `gainDb - offsetDb === trimDb` for
+every family in both walking and running.
+
+Three other changes to the same path:
+
+- **Running lands heavier, not higher.** The old constants raised the playback
+  rate 5 per cent, which is what a LIGHTER contact sounds like. A run is now
+  +3.5 dB and rate 0.94, and the "faster" comes from the controller's stride
+  length as it always did.
+- **Left and right.** The controller alternates `foot`, and the mixer places the
+  step at a stereo pan of -+0.28 with the trailing foot 1.1 dB down and 3.5 per
+  cent lower. One `StereoPannerNode` per step, and it is what turns two samples
+  into a gait rather than a metronome.
+- **A QA field.** `AudioDirector.debug` reports the last footstep's family,
+  asset, gain, rate and pan, and a count per family. It is published on
+  `window.__meridianAudio` once the context is unlocked, for the same reason
+  `main.ts` publishes `window.__meridian`: so "the runway sounds like concrete"
+  can be proven from a browser rather than asserted from a screenshot.
 
 ## Interaction and UI
 
@@ -540,12 +659,212 @@ came back at -38.8 dBFS peak, far past the trim's +10 dB cap.
 | Collisions | 17.00 |
 | **Total** | **323.67 credits (USD 6.47)** |
 
+## Verified in the browser, 2026-08-28
+
+Production build (`vite build`), served by the running preview on port 4183,
+driven through `window.__meridian` and read back from `window.__meridianAudio`.
+Eight footfalls were walked at each location with real time between bursts, so
+the three-voice cap did not swallow them.
+
+| Walked on | `position.surface` | Footstep family heard | Asset |
+| --- | --- | --- | --- |
+| harbour carriageway (-158, 12) | `asphalt` | asphalt x6 | `steps/asphalt-1` |
+| Harbour Walk (-151, 18) | `boardwalk` | boardwalk x5 | `steps/boardwalk-1` |
+| terminal concourse (180, 450) | `concrete`, indoors | **terminal x4** | `steps/terminal-2` |
+| apron (240, 450) | `concrete` | **concrete x6** | `steps/concrete-1` |
+| runway centreline (340, 450) | `concrete` | **concrete x5** | `steps/concrete-2` |
+| airfield verge (300, 450) | `grass` | grass x5 | `steps/grass-1` |
+| city pavement (-126, 12) | `pavement` | pavement x4 | `steps/pavement-2` |
+
+No family ever bled into another, and `interior` never fired outdoors. The three
+bold rows are the ones that were wrong before: the concourse played domestic
+kitchen tile and the whole airfield played a city paving slab.
+
+Walking west off Harbour Walk onto the carriageway and back, one footfall per
+reading:
+
+```
+boardwalk boardwalk boardwalk | boardwalk asphalt asphalt asphalt asphalt
+asphalt asphalt asphalt | boardwalk boardwalk boardwalk boardwalk
+```
+
+One footfall of the old material at the crossing, none after it, and no flicker
+in either direction.
+
+Vehicle classes, read from the network log while driving three different shells:
+
+| Driven | `driving.kind` | Fetched |
+| --- | --- | --- |
+| pickup | `pickup` | `engine-diesel-idle`, `engine-diesel-load`, `tyre-roll` |
+| hatchback | `compact` | `engine-small-idle`, `engine-small-load` |
+| coupe | `coupe` | `engine-sport-idle`, `engine-sport-load` |
+
+Nothing else was fetched: the truck and interceptor pairs stayed on disk, which
+is the deferral working. All 86 audio requests in the session succeeded at
+exactly the byte sizes this manifest records. No audio-related console error.
+
+## Vehicle classes, 2026-08-28
+
+Thirteen clips so that a hatchback, a coupe, a van, a box truck and a police
+interceptor are five different engines rather than one engine at five playback
+rates, plus the Foley the driving mix had no asset for at all. Rendered by
+[`tools/generate-vehicle-sfx.mjs`](../tools/generate-vehicle-sfx.mjs), which is
+the runnable form of every prompt and parameter below. All
+`eleven_text_to_sound_v2`, `mp3_44100_128`, 44100 Hz, 2 ch. Every number is an
+ffprobe/volumedetect measurement of the shipped file.
+
+### Why the REST API and not an MCP
+
+Checked in this session, not assumed from the last one. There is **no
+`elevenlabs` MCP server configured here** - `.mcp.json` declares only `tripo` -
+and the ElevenCreative server that IS reachable exposes sound effects only
+through `creative_generate_in_flow` with `node_type: 'sfx'`, which builds
+variation sets on a shared editing canvas and returns node and session ids
+rather than a file at a fixed path. That is the wrong shape for thirteen
+deterministic renders that must land at fixed paths with recorded parameters,
+and it is the same boundary the 2026-08-27 batch recorded.
+
+### The probe
+
+One 4 s looping truck idle was rendered first and measured before any batch:
+4.000 s, 65,245 B, 44100 Hz, 2 ch, -1.7 dBFS peak, -14.0 dBFS mean, 2.1 dB seam,
+no leading or trailing silence. 13.33 credits. It was deleted rather than
+shipped.
+
+### The engine layers
+
+All ten: 6.000 s, 97,010 B, `duration_seconds: 6, prompt_influence: 0.6,
+loop: true`, 20 credits each.
+
+| Asset | Peak | Mean | Trim | Post-trim mean | Post-trim peak | Seam |
+| --- | --- | --- | --- | --- | --- | --- |
+| `veh/engine-small-idle` | -10.2 dB | -28.1 dB | +6.9 dB | -21.2 dB | -3.3 dB | 1.2 dB |
+| `veh/engine-small-load` | -0.2 dB | -13.4 dB | -4.8 dB | -18.2 dB | -5.0 dB | 1.7 dB |
+| `veh/engine-sport-idle` | -2.6 dB | -16.4 dB | -4.8 dB | -21.2 dB | -7.4 dB | 0.6 dB |
+| `veh/engine-sport-load` | -0.5 dB | -16.3 dB | -1.9 dB | -18.2 dB | -2.4 dB | 0.0 dB |
+| `veh/engine-diesel-idle` | -3.7 dB | -17.9 dB | -3.3 dB | -21.2 dB | -7.0 dB | 1.3 dB |
+| `veh/engine-diesel-load` | 0.0 dB | -12.9 dB | -5.3 dB | -18.2 dB | -5.3 dB | 0.8 dB |
+| `veh/engine-truck-idle` | -4.5 dB | -16.5 dB | -4.7 dB | -21.2 dB | -9.2 dB | 0.2 dB |
+| `veh/engine-truck-load` | -1.4 dB | -15.3 dB | -2.9 dB | -18.2 dB | -4.3 dB | 1.7 dB |
+| `veh/engine-v8-idle` | -2.5 dB | -17.2 dB | -4.0 dB | -21.2 dB | -6.5 dB | 2.8 dB |
+| `veh/engine-v8-load` | 0.0 dB | -10.4 dB | -7.8 dB | -18.2 dB | -7.8 dB | 0.5 dB |
+
+The three renders at 0.0 dBFS were checked for real clipping with
+`astats`: `Flat factor 0`, `Peak count 2` on each, i.e. two isolated samples at
+the peak and no flat-topped plateau. That is MP3 decode overshoot, and the trim
+takes all three to -5.3 dBFS or below.
+
+**Levelled by loudness, not by peak.** Every `-idle` layer is brought to
+-21.2 dBFS mean and every `-load` layer to -18.2 dBFS, which is exactly where the
+shipped saloon pair sits (`veh/engine-idle` measures -21.0 at -0.2 dB trim,
+`veh/engine-load` -14.3 at -3.9 dB). Peak-normalising instead - which is what the
+one-shots get - put the coupe's idle 4.8 dB over the saloon's purely because that
+render came back hotter, and the class difference is supposed to come from
+`engineCurve.ts`. Same lesson the footstep set learned, applied to loops. A
+-1.5 dBFS peak guard sits under the loudness target so a transient is never
+pushed into clipping to hit it.
+
+### The Foley
+
+| Asset | Duration | Size | Credits | Peak | Mean | Trim | Seam |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `veh/tyre-roll` | 6.000 s | 97,010 B | 20.00 | -1.5 dB | -17.3 dB | -6.7 dB | 3.5 dB |
+| `veh/gear-shift` | 0.680249 s | 12,164 B | 2.33 | -1.9 dB | -20.8 dB | -4.1 dB | n/a |
+| `veh/brake-squeal` | 1.200 s | 20,106 B | 4.00 | -5.0 dB | -21.4 dB | -1.0 dB | n/a |
+
+`veh/tyre-roll` is mean-normalised to -24 dBFS, six under the load layers,
+because it is a bed under the engine rather than a voice beside it. Its 3.5 dB
+seam is the worst in the batch; it sits at -8.2 dBFS post-trim under a
+continuously sounding engine, where a 3.5 dB step at the wrap is inaudible, so
+it was shipped rather than rebuilt. Every other loop is inside 3 dB.
+
+No asset has any leading or trailing silence (`silencedetect` at -50 dBFS over
+50 ms found none on any of the thirteen).
+
+### Two re-renders, and why
+
+Band split, measured as the share of total power in each band with
+`ffmpeg -af lowpass/highpass,volumedetect`, is what caught them.
+
+- **`veh/engine-small-load`** came back **1.8 % below 200 Hz and 78.1 % above
+  1.5 kHz** - an induction hiss with no engine under it. The rewritten prompt
+  names the exhaust, the firing pulses and the four-cylinder thrum and rules out
+  the whistle; the shipped render is 52.9 / 37.5 / 9.6 %.
+- **`veh/engine-sport-idle`** came back 82.2 % below 200 Hz and 0.2 % above
+  1.5 kHz - a low drone, indistinguishable in band terms from the truck idle.
+  The rewrite asked for the valvetrain and the rasp and moved it to
+  80.4 / 18.8 / 0.8 %, which is **still bass-dominant**. It was accepted rather
+  than chased further: the separation at idle is carried by the filter corner
+  (900 Hz for the coupe against 380 Hz for the truck) and the playback rate, and
+  the coupe is unmistakable the moment it is on load (14.7 / 64.1 / 21.2 %). The
+  full table for all thirteen is in `src/audio/manifest.ts`.
+
+### Cost and weight
+
+| Group | Credits |
+| --- | --- |
+| Probe | 13.33 |
+| Ten engine layers | 200.00 |
+| Foley (tyre roll, upshift, brake squeal) | 26.33 |
+| Two re-renders | 40.00 |
+| **Total** | **279.66 credits (USD 5.59)** |
+
+**Added weight: 1,099,380 bytes (1.048 MiB).** Eleven of the thirteen are
+deferred - the ten class layers and the tyre bed, 1.07 MB - and are requested on
+the frame the player takes control of a car. The saloon pair stays eager because
+it is the fallback voice while a class's own layers are still in flight.
+
+### How the mix uses them
+
+`src/audio/engineCurve.ts` carries an `EngineProfile` per voice, and two of its
+fields do most of the identity work:
+
+| Voice | Gears top out at (m/s) | Idle cutoff | Weight | Kinds |
+| --- | --- | --- | --- | --- |
+| `small` | 6, 11, 18, 27 | 760 Hz | 0.82 | compact |
+| `saloon` | 7, 13, 21, 32 | 700 Hz | 1.00 | sedan, wagon, crossover, taxi |
+| `sport` | 10, 18, 28, 40, 52 | 900 Hz | 1.06 | coupe |
+| `diesel` | 6, 11, 17, 25, 33 | 480 Hz | 1.04 | van, pickup |
+| `truck` | 4, 7, 10.5, 15, 20, 26 | 380 Hz | 1.18 | boxTruck |
+| `interceptor` | 9, 17, 27, 38 | 640 Hz | 1.12 | patrolSedan, patrolSuv |
+
+A truck runs out of gear at 4 m/s and shifts six times before a coupe has left
+first, which is most of what makes the two audibly different things under
+acceleration. `tests/vehicleAudio.test.ts` pins the mapping against the
+catalogue itself, so a body shell added to `VehicleCatalogue.ts` without a voice
+fails the suite rather than silently becoming a saloon.
+
+Three things were added to the graph beside the class swap:
+
+- **The tyre layer** sums AFTER the engine's lowpass, not through it: the filter
+  is the throttle's colour, and routing the tyres through it would duck them
+  every time the driver lifted off. It tracks road speed rather than revs, so it
+  holds steady across an upshift while the engine note drops - which is the
+  whole reason it is a separate layer.
+- **The upshift** fires `veh/gear-shift` on the rising edge of the gear number,
+  under power and above walking pace, and dips the level 32 % and the filter
+  40 % for 0.2 s. A car rolling to a stop drops through every gear it owns and
+  must not clunk on the way down.
+- **Brake pad squeal** covers ordinary stopping, which had no sound at all: the
+  layer's only braking asset was an emergency skid, so everything short of one
+  was silent. It is gated on rolling to a stop (under 5.5 m/s, over 1.6 m/s²)
+  and is mutually exclusive with the skid.
+
+**Ambient traffic keeps one recording and gets its class from a filter.** The
+pool is five sources and an `AudioBufferSourceNode` cannot change its buffer, so
+each voice now owns a lowpass whose corner comes from the class and a playback
+rate scaled by it. That is 5 nodes, and it is the only thing separating a box
+truck from a hatchback across a junction.
+
 ## The node budget, measured
 
-`tests/streetAudio.test.ts` asserts `stats.liveNodes <= 65` for the street layer
+`tests/streetAudio.test.ts` asserts `stats.liveNodes <= 72` for the street layer
 over a 3600-frame busy run, and the comment there records a regression where 420
-nodes existed when only rate limiters were in place. **That number did not have
-to move.** The two new layers hold their own pools and report their own
+nodes existed when only rate limiters were in place. **The ceiling moved from 65
+to 72 on 2026-08-28**, for seven persistent nodes that each buy something: the
+tyre layer (1 source, 1 gain) and one class filter per ambient voice (5). The
+measured peak over that run, with every catalogue class in the fleet and the
+deferred layers resident, is **58**. The two new layers hold their own pools and report their own
 `stats.liveNodes`, each asserted in `tests/policeAudio.test.ts`.
 
 Measured over 3600 frames with all four layers running at once — 40 cars (four
@@ -555,7 +874,7 @@ landing on top:
 
 | Layer | Peak live nodes | Ceiling |
 | --- | --- | --- |
-| `StreetAudio` | 57 | 65 (unchanged) |
+| `StreetAudio` | 58 | 72 (was 65 before the vehicle batch) |
 | `PoliceAudio` | 12 | 12 = 2 units x 6 |
 | `AircraftAudio` | 29 | 29 = 20 persistent + 3 one-shots x 3 |
 | **Combined** | **98** | **106** |
@@ -567,7 +886,7 @@ buses, up to two land beds and the sea layer.
 The police layer is capped at two units on purpose. A pursuit is one or two cars
 on you and the rest converging from streets away; a third siren adds level and
 no information, and six nodes each is not free against a graph the street layer
-already holds 23 persistent nodes in.
+already holds 30 persistent nodes in.
 
 ## The output limiter
 

@@ -183,6 +183,8 @@ interface Harness {
   gains: number;
   panners: number;
   filters: number;
+  /** Every biquad made, so a test can read the class colour off the last one. */
+  filterNodes: Array<{ type: string; frequency: FakeParam; Q: FakeParam }>;
   connected: number;
   disconnected: number;
 }
@@ -197,6 +199,7 @@ function installMocks(): void {
     gains: 0,
     panners: 0,
     filters: 0,
+    filterNodes: [],
     connected: 0,
     disconnected: 0,
   };
@@ -276,7 +279,7 @@ function installMocks(): void {
 
   const makeFilter = (): unknown => {
     h.filters += 1;
-    return {
+    const filter = {
       type: '',
       frequency: new FakeParam(),
       Q: new FakeParam(),
@@ -287,6 +290,8 @@ function installMocks(): void {
         h.disconnected += 1;
       },
     };
+    h.filterNodes.push(filter);
+    return filter;
   };
 
   class FakeAudioContext {
@@ -393,6 +398,18 @@ function advance(dt: number): void {
   }
 }
 
+/**
+ * Lets the deferred assets finish loading.
+ *
+ * The class engine pairs and the tyre bed are in `LAZY_ASSET_IDS`, so the
+ * frame that asks for them only starts a fetch. In the game a handful of
+ * frames pass before they arrive; here the promise chain has to be drained
+ * explicitly or the test is asserting on the first frame of a first drive.
+ */
+async function settle(): Promise<void> {
+  for (let i = 0; i < 8; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 function sourcesFor(id: string): FakeSource[] {
   return h.sources.filter((s) => s.buffer?.url.includes(id) === true);
 }
@@ -478,6 +495,108 @@ describe('player engine', () => {
 
     expect(pulling.gain).toBeGreaterThan(coasting.gain);
     expect(pulling.cutoff).toBeGreaterThan(coasting.cutoff);
+  });
+
+  it('speaks in the voice of the class the player is actually driving', async () => {
+    const { audio, street } = await makeStreet();
+    const truck = car({ id: 1, kind: 'boxTruck', control: 'player', x: 0, z: 0, speed: 8 });
+    street.update(1 / 60, { ...BASE, driving: true, driveSpeed: 8, vehicles: [truck] });
+    await settle();
+    for (let i = 0; i < 10; i += 1) {
+      street.update(1 / 60, { ...BASE, driving: true, driveSpeed: 8, vehicles: [truck] });
+    }
+    expect(street.stats.engineVoice).toBe('truck');
+    expect(sourcesFor('engine-truck-idle')).toHaveLength(1);
+    expect(sourcesFor('engine-truck-load')).toHaveLength(1);
+    audio.dispose();
+    street.dispose();
+  });
+
+  it('swaps the pair when the player changes car, without growing the graph', async () => {
+    const { audio, street } = await makeStreet();
+    const drive = async (kind: string): Promise<void> => {
+      const vehicle = car({ id: 1, kind, control: 'player', x: 0, z: 0, speed: 8 });
+      street.update(1 / 60, { ...BASE, driving: true, driveSpeed: 8, vehicles: [vehicle] });
+      await settle();
+      for (let i = 0; i < 10; i += 1) {
+        street.update(1 / 60, { ...BASE, driving: true, driveSpeed: 8, vehicles: [vehicle] });
+      }
+    };
+    await drive('boxTruck');
+    const afterTruck = street.stats.liveNodes;
+    await drive('coupe');
+    expect(street.stats.engineVoice).toBe('sport');
+    expect(sourcesFor('engine-sport-idle')).toHaveLength(1);
+    // The old pair is stopped, not left running underneath the new one.
+    expect(sourcesFor('engine-truck-idle')[0]?.stopped).toBe(true);
+    expect(street.stats.liveNodes).toBe(afterTruck);
+    audio.dispose();
+    street.dispose();
+  });
+
+  it('starts on the saloon pair when the class layers have not arrived', async () => {
+    // The class engines are deferred; the saloon pair is not, which is the
+    // whole reason it is not in LAZY_ASSET_IDS.
+    const { audio, street } = await makeStreet();
+    street.update(1 / 60, { ...BASE, driving: true, driveSpeed: 5 });
+    expect(street.stats.engineVoice).toBe('saloon');
+    expect(sourcesFor('engine-idle')).toHaveLength(1);
+    audio.dispose();
+    street.dispose();
+  });
+
+  it('carries a tyre layer that follows road speed rather than revs', async () => {
+    const { audio, street } = await makeStreet();
+    street.update(1 / 60, { ...BASE, driving: true, driveSpeed: 2 });
+    await settle();
+    for (let i = 0; i < 5; i += 1) {
+      street.update(1 / 60, { ...BASE, driving: true, driveSpeed: 2 });
+    }
+    const slow = street.stats.tyreLevel;
+    for (let i = 0; i < 30; i += 1) {
+      street.update(1 / 60, { ...BASE, driving: true, driveSpeed: 22 });
+    }
+    expect(sourcesFor('tyre-roll')).toHaveLength(1);
+    expect(sourcesFor('tyre-roll')[0]?.loop).toBe(true);
+    expect(street.stats.tyreLevel).toBeGreaterThan(slow);
+    audio.dispose();
+    street.dispose();
+  });
+
+  it('clunks on an upshift under power and stays silent coasting down', async () => {
+    const { audio, street } = await makeStreet();
+    // Pull away hard: a saloon tops first at 7 m/s, so this crosses two shifts.
+    for (let i = 0; i < 120; i += 1) {
+      street.update(1 / 60, { ...BASE, driving: true, driveSpeed: (i / 119) * 16 });
+      advance(1 / 60);
+    }
+    const up = sourcesFor('gear-shift').length;
+    expect(up).toBeGreaterThanOrEqual(1);
+    expect(street.stats.gear).toBeGreaterThan(0);
+
+    // Now roll back down through the same gears off the throttle.
+    for (let i = 0; i < 120; i += 1) {
+      street.update(1 / 60, { ...BASE, driving: true, driveSpeed: 16 - (i / 119) * 16 });
+      advance(1 / 60);
+    }
+    expect(sourcesFor('gear-shift')).toHaveLength(up);
+    audio.dispose();
+    street.dispose();
+  });
+
+  it('squeals the pads rolling to a stop but not standing on the brakes', async () => {
+    const { audio, street } = await makeStreet();
+    // Ordinary stop: 4 m/s losing 2 m/s per second.
+    let speed = 4;
+    for (let i = 0; i < 60; i += 1) {
+      speed = Math.max(0.7, speed - 2 / 60);
+      street.update(1 / 60, { ...BASE, driving: true, driveSpeed: speed });
+      advance(1 / 60);
+    }
+    expect(sourcesFor('brake-squeal').length).toBeGreaterThanOrEqual(1);
+    expect(sourcesFor('tyre-scrub')).toHaveLength(0);
+    audio.dispose();
+    street.dispose();
   });
 
   it('fades the engine out when the player gets out', async () => {
@@ -734,6 +853,40 @@ describe('ambient traffic voices', () => {
   });
 });
 
+describe('ambient traffic classes', () => {
+  it('colours a box truck differently from a hatchback across the street', async () => {
+    const { audio, street } = await makeStreet();
+    const at = (kind: string): { rate: number; cutoff: number } => {
+      const vehicle = car({ id: 1, kind, x: 18, z: 0, speed: 10 });
+      for (let i = 0; i < 30; i += 1) {
+        street.update(1 / 60, { ...BASE, vehicles: [vehicle] });
+      }
+      const source = sourcesFor('engine-far')[0];
+      const filter = h.filterNodes[h.filterNodes.length - 1];
+      return { rate: source?.playbackRate.value ?? 0, cutoff: filter?.frequency.value ?? 0 };
+    };
+    const truck = at('boxTruck');
+    const hatch = at('compact');
+    expect(truck.rate).toBeLessThan(hatch.rate);
+    expect(truck.cutoff).toBeLessThan(hatch.cutoff);
+    audio.dispose();
+    street.dispose();
+  });
+
+  it('allocates one filter per voice and no more', async () => {
+    const { audio, street } = await makeStreet();
+    const vehicles = Array.from({ length: 30 }, (_, i) =>
+      car({ id: i, kind: i % 2 === 0 ? 'boxTruck' : 'coupe', x: i, z: 0, speed: 9 }),
+    );
+    for (let i = 0; i < 200; i += 1) street.update(1 / 60, { ...BASE, vehicles });
+    // Five ambient voices; the engine's own filter is not built here because
+    // the player is on foot.
+    expect(h.filters).toBeLessThanOrEqual(5);
+    audio.dispose();
+    street.dispose();
+  });
+});
+
 describe('distant traffic hum', () => {
   it('rises with moving traffic and stays silent on an empty street', async () => {
     const empty = await makeStreet();
@@ -896,17 +1049,45 @@ describe('crowd footsteps', () => {
 // Budgets, lifecycle and the music contract
 // ---------------------------------------------------------------------------
 
+const KINDS = [
+  'compact',
+  'sedan',
+  'coupe',
+  'wagon',
+  'crossover',
+  'pickup',
+  'van',
+  'boxTruck',
+  'taxi',
+  'patrolSedan',
+  'patrolSuv',
+];
+
 describe('budgets and lifecycle', () => {
   it('holds a bounded node count over a long busy run', async () => {
     const { audio, street } = await makeStreet();
     const dt = 1 / 60;
     let peak = 0;
 
+    // Get the deferred layers resident first, so the ceiling is measured with
+    // the tyre bed and a class engine actually in the graph rather than with
+    // the fetches still in flight.
+    street.update(dt, {
+      ...BASE,
+      driving: true,
+      driveSpeed: 8,
+      vehicles: [car({ id: 999, kind: 'boxTruck', control: 'player' })],
+    });
+    await settle();
+
     for (let f = 0; f < 3600; f += 1) {
       const t = f * dt;
       const vehicles = Array.from({ length: 40 }, (_, i) =>
         car({
           id: i,
+          // Every class in the catalogue, so the voice pool is reassigned
+          // between classes as well as between cars.
+          kind: KINDS[i % KINDS.length] as string,
           x: Math.sin(i * 1.7 + t) * 40,
           z: Math.cos(i * 2.3 + t) * 40,
           speed: 4 + (i % 7),
@@ -928,8 +1109,12 @@ describe('budgets and lifecycle', () => {
       peak = Math.max(peak, street.stats.liveNodes);
     }
 
-    // 6 engine + 15 traffic + 2 hum, plus whatever one-shots are mid-flight.
-    expect(peak).toBeLessThanOrEqual(65);
+    // 8 engine (2 layers, tyres, 4 gains, filter) + 20 traffic (5 voices of
+    // source, gain, filter, panner) + 2 hum = 30 persistent, plus whatever
+    // one-shots are mid-flight: MAX_STEP_VOICES * 3 + MAX_OTHER_VOICES * 3.
+    // Measured peak over this run is 58; the ceiling is the arithmetic one.
+    expect(peak).toBeLessThanOrEqual(72);
+    expect(peak).toBeGreaterThan(30); // the persistent set really was built
     expect(street.stats.crowdTracks).toBeLessThanOrEqual(20);
     audio.dispose();
     street.dispose();

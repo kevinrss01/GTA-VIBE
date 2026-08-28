@@ -11,6 +11,8 @@
  * objects where the game supplies three hundred instanced pedestrians.
  */
 
+import type { HitZone } from './ballistics';
+
 export type Faction = 'civilian' | 'police';
 
 /**
@@ -59,6 +61,29 @@ export interface Blow {
   readonly dirX: number;
   readonly dirZ: number;
   readonly speed: number;
+  /**
+   * WHERE THE BLOW MET THE BODY, in world space.
+   *
+   * The contact point the ray test found, not the body's centre and not its
+   * feet. A source that forwards a casualty to somebody else - `CrowdTargets`
+   * hands one to the crowd - has to report where the round actually arrived,
+   * or a shoulder hit is filed at the victim's shoes and the wrong person is
+   * matched when two people are standing together.
+   *
+   * Optional because a blast has no contact point worth the name: it arrives
+   * everywhere at once, and the receiver should fall back to the body itself.
+   */
+  readonly x?: number | undefined;
+  readonly y?: number | undefined;
+  readonly z?: number | undefined;
+  /**
+   * Where on the body it landed, when the caller measured it.
+   *
+   * Absent for a blast, for the same reason. A receiver uses it to choose the
+   * REACTION - a leg takes a stagger, a trunk takes a fold - and never to
+   * re-derive damage, which the caller has already applied.
+   */
+  readonly zone?: HitZone | undefined;
 }
 
 export interface ActorSource {

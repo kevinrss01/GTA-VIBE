@@ -79,7 +79,9 @@ function addFloor(ctx: Fitout): void {
 
   addQuad(ctx, room.palette.floor, [0, W], [0, D], F, true);
   // The walkable surface covers the whole footprint, including the cavity
-  // behind the lining, so the player cannot find a seam at the threshold.
+  // behind the lining, so the player cannot find a seam at the threshold. It
+  // carries the palette's own floor material so the footstep mixer hears the
+  // floor that is drawn rather than one generic indoor sound for every room.
   addCollider(
     ctx,
     {
@@ -89,6 +91,7 @@ function addFloor(ctx: Fitout): void {
     },
     false,
     true,
+    room.palette.floor,
   );
 
   // A border band in a second stone reads as a laid floor rather than a decal.

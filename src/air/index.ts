@@ -33,9 +33,12 @@ export {
 
 export {
   FLIGHT_CONTROLS,
+  FLIGHT_HUD_CONTROLS,
   Flying,
   flightControlHints,
+  flightHudHints,
   type EngineReport,
+  type FlightHintState,
   type FlyingOptions,
   type FlyingPlayer,
   type FlyingState,

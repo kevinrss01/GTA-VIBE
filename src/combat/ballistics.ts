@@ -39,6 +39,34 @@ export const HEAD_ZONE = 0.12;
 /** Damage multiplier for a hit inside that zone. */
 export const HEAD_MULTIPLIER = 2.2;
 
+/**
+ * Fraction of an actor's height below which a round is in a leg.
+ *
+ * A person is one vertical cylinder to the ray test, so HEIGHT is the only
+ * thing the geometry can honestly tell us about where on a body a round
+ * landed: an arm and the ribs beside it are the same millimetre of the same
+ * cylinder, and inventing a horizontal split would be guessing. Height is not
+ * a guess - 45 per cent of a standing adult is below the hip.
+ */
+export const LEG_ZONE = 0.45;
+/**
+ * Damage multiplier for a hit in a leg.
+ *
+ * Enough that a limb hit hurts and staggers, and low enough that it is not the
+ * round that fells a healthy person: three carbine rounds in a leg still kill,
+ * one does not, and that difference is the whole point of the zone.
+ */
+export const LIMB_MULTIPLIER = 0.6;
+
+/**
+ * Where on a body a round landed.
+ *
+ * `'body'` is the trunk, which is everything between the legs and the head.
+ * Used for the damage multiplier AND for the reaction: a limb hit staggers
+ * somebody, a trunk hit folds them.
+ */
+export type HitZone = 'head' | 'body' | 'limb';
+
 /** Health of anybody in the city who is not the player. */
 export const ACTOR_HEALTH = 100;
 
@@ -57,14 +85,32 @@ export function damageAtRange(spec: WeaponSpec, distance: number): number {
 }
 
 /**
+ * Where on a body a round landed.
+ *
+ * `hitY` and `footY` are world heights; `height` is the actor's full height.
+ * A zero-height actor is unclassifiable and is reported as a trunk hit, which
+ * is the neutral answer both callers already assumed.
+ */
+export function hitZone(hitY: number, footY: number, height: number): HitZone {
+  if (height <= 0) return 'body';
+  const up = (hitY - footY) / height;
+  if (up >= 1 - HEAD_ZONE) return 'head';
+  if (up <= LEG_ZONE) return 'limb';
+  return 'body';
+}
+
+/**
  * Multiplier for where on a body the shot landed.
  *
  * `hitY` and `footY` are world heights; `height` is the actor's full height.
+ * The head figure is unchanged; the leg figure is new, and is the mechanism
+ * behind "a limb hit staggers rather than fells" - see `LIMB_MULTIPLIER`.
  */
 export function zoneMultiplier(hitY: number, footY: number, height: number): number {
-  if (height <= 0) return 1;
-  const up = (hitY - footY) / height;
-  return up >= 1 - HEAD_ZONE ? HEAD_MULTIPLIER : 1;
+  const zone = hitZone(hitY, footY, height);
+  if (zone === 'head') return HEAD_MULTIPLIER;
+  if (zone === 'limb') return LIMB_MULTIPLIER;
+  return 1;
 }
 
 /** Seconds between shots for a weapon's cyclic rate. */

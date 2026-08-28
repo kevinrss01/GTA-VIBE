@@ -220,16 +220,23 @@ describe('vehicle geometry', () => {
       expect(box.max.y, kind).toBeLessThan(bp.height + 0.24);
       expect(box.max.y, kind).toBeGreaterThan(bp.height - 0.25);
 
-      for (const attribute of ['position', 'normal', 'aAlbedo', 'aSurf', 'aPaint', 'aEmit', 'aChan']) {
+      // WebGL guarantees only sixteen vertex attribute slots and a vehicle
+      // instance spends four on its matrix alone, so the three one-number
+      // flags share `aMask` and `aSurf` carries the body coordinates localized
+      // damage needs. See `MeshBuilder.build`.
+      for (const attribute of ['position', 'normal', 'aAlbedo', 'aSurf', 'aMask', 'aEmit']) {
         expect(shell.geometry.getAttribute(attribute), `${kind}.${attribute}`).toBeTruthy();
       }
+      const layout = shell.geometry.attributes;
+      expect(Object.keys(layout).length, `${kind} attribute slots`).toBeLessThanOrEqual(7);
+      expect(shell.geometry.getAttribute('aSurf').itemSize).toBe(4);
     }
   });
 
   it('gives every shell paint, glazing and lit lamps', () => {
     for (const kind of ALL_VEHICLE_KINDS) {
       const geometry = vehicleShell(kind).geometry;
-      const paint = geometry.getAttribute('aPaint');
+      const paint = geometry.getAttribute('aMask');
       const emit = geometry.getAttribute('aEmit');
       const surf = geometry.getAttribute('aSurf');
       let painted = 0;
@@ -660,9 +667,29 @@ describe('TrafficSystem', () => {
   it('draws the whole fleet in a dozen calls and culls by distance', () => {
     const system = new TrafficSystem({ plan, ground, network, quality: 'high' });
     try {
-      // One instanced draw per shell plus one for every wheel in the city.
-      expect(system.group.children.length).toBeLessThanOrEqual(12);
-      expect(system.stats.drawCalls).toBeLessThanOrEqual(12);
+      // One instanced draw per shell, one for every wheel in the city, and one
+      // for every plume of smoke, fire and shower of sparks in it - thirteen.
+      // The damage effects are ONE batch on purpose: a burning car costs the
+      // same slot in a shared pool that an undamaged one costs nothing in, and
+      // a street full of wrecks is still one draw. Three skips an instanced
+      // draw whose count is zero, so an undamaged city pays twelve.
+      expect(system.group.children.length).toBeLessThanOrEqual(13);
+      expect(system.stats.drawCalls).toBeLessThanOrEqual(13);
+
+      // VERTEX ATTRIBUTE BUDGET. WebGL guarantees sixteen slots and an
+      // attribute of one component costs the same slot as one of four. An
+      // instanced vehicle spends four on `instanceMatrix` before it declares
+      // anything of its own, so this is the ceiling that actually binds - and
+      // it binds silently: going over it makes the driver refuse the program
+      // with "Too many attributes" and the whole fleet stops being drawn, with
+      // nothing failing anywhere a test would normally look. Measured: at
+      // eighteen, not one car rendered.
+      for (const child of system.group.children) {
+        const geometry = (child as { geometry?: { attributes?: object } }).geometry;
+        if (!geometry?.attributes) continue;
+        const slots = Object.keys(geometry.attributes).length + 4; // + instanceMatrix
+        expect(slots, `${child.name} attribute slots`).toBeLessThanOrEqual(16);
+      }
       expect(system.stats.population).toBeGreaterThan(100);
 
       system.update(1 / 60, { x: plan.spawn.x, z: plan.spawn.z, time: 0 });
@@ -722,9 +749,24 @@ describe('TrafficSystem', () => {
       expect(handle.view.speed).toBeCloseTo(9, 5);
       expect(handle.view.braking).toBe(true);
 
+      // Releasing PARKS it. It does not rejoin the traffic AI, it does not
+      // snap to a lane, and a car stopped before the driver got out does not
+      // move at all - see `abandonedVehicle.test.ts` for the full set.
+      handle.setPose({ x: 12, z: -34, yaw: 1.2, speed: 0 });
       handle.release();
-      system.update(1 / 60, { x: 12, z: -34, time: 3 });
-      expect(handle.view.control).toBe('ambient');
+      for (let i = 0; i < 120; i += 1) {
+        system.update(1 / 60, { x: 12, z: -34, time: 3 + i / 60 });
+      }
+      expect(handle.view.state).toBe('parked');
+      expect(handle.view.control, 'nobody is driving a parked car').toBe('loose');
+      expect(handle.view.x).toBeCloseTo(12, 5);
+      expect(handle.view.z).toBeCloseTo(-34, 5);
+      expect(handle.view.yaw).toBeCloseTo(1.2, 5);
+
+      // And it can be taken again, which is the other half of leaving it.
+      const again = system.takeControl(target.id);
+      expect(again, 'a car you parked can be got back into').not.toBeNull();
+      expect(again?.view.control).toBe('player');
     } finally {
       system.dispose();
     }

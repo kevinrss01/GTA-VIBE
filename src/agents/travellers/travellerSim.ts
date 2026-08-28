@@ -77,6 +77,15 @@ export interface Traveller {
   /** Which baked character this person is drawn as. */
   readonly variant: number;
   readonly luggage: LuggageKind | null;
+  /**
+   * How much room this person needs, as a multiple of `TRAVELLER_RADIUS`.
+   *
+   * One for almost everybody. The exception is the character in the long coat,
+   * which is 0.32 m front to back against everyone else's 0.21 to 0.25 - at
+   * the shared radius she is inside the person in front before they touch.
+   * See `VAT_FOOTPRINT`.
+   */
+  readonly spacing: number;
   state: TravellerState;
   /** Index into `queues`, or -1. */
   queue: number;
@@ -117,6 +126,16 @@ export interface TravellerSimOptions {
   readonly seed: number;
   /** Share of travellers carrying something. */
   readonly luggageShare?: number | undefined;
+  /**
+   * Per-variant stature in metres, where the roster asks for one.
+   *
+   * The bake carries no height - every rig is normalised to 1.0 - so a tall
+   * character comes out short as often as not unless the two are correlated
+   * here. An absent or undefined entry keeps whatever `appearance.ts` drew.
+   */
+  readonly variantStature?: readonly (number | undefined)[] | undefined;
+  /** Per-variant personal-space multiplier. Defaults to 1. See `spacing`. */
+  readonly variantSpacing?: readonly number[] | undefined;
 }
 
 export interface TravellerSimStats {
@@ -271,7 +290,19 @@ export class TravellerSim {
     const luggageShare = options.luggageShare ?? 0.62;
     const variants = Math.max(1, options.variants);
     for (let i = 0; i < options.population && this.graph.count > 0; i += 1) {
-      const look = makeLook(this.rng);
+      const drawn = makeLook(this.rng);
+      /*
+       * The character is chosen FIRST and the body is then drawn around it.
+       * A stature is only meaningful next to the mesh it is applied to: put
+       * the tall man in cargo trousers at 1.56 m and the elderly woman at
+       * 1.90 and the seven distinct body types the roster was generated for
+       * are thrown away again. The jitter keeps two of the same character from
+       * being exactly the same size.
+       */
+      const variant = this.rng.int(0, variants - 1);
+      const stature = options.variantStature?.[variant];
+      const look =
+        stature === undefined ? drawn : { ...drawn, height: stature * this.rng.range(0.97, 1.03) };
       this.travellers.push({
         index: i,
         x: 0,
@@ -281,8 +312,10 @@ export class TravellerSim {
         gait: 0,
         walked: this.rng.range(0, 4),
         look,
-        variant: this.rng.int(0, variants - 1),
-        luggage: this.rng.chance(luggageShare) ? this.pickLuggage() : null,
+        variant,
+        spacing: options.variantSpacing?.[variant] ?? 1,
+        luggage:
+          this.rng.chance(luggageShare) && LUGGAGE_KINDS.length > 0 ? this.pickLuggage() : null,
         state: 'walk',
         queue: -1,
         slot: -1,
@@ -536,8 +569,20 @@ export class TravellerSim {
   }
 
   private pickLuggage(): LuggageKind {
-    const weights = LUGGAGE_KINDS.map((kind) => LUGGAGE_SPECS[kind].share);
-    return this.rng.weighted(LUGGAGE_KINDS, weights);
+    /*
+     * Only kinds that actually have a spec, and only ones with a positive
+     * share. A kind listed in `LUGGAGE_KINDS` with no entry in
+     * `LUGGAGE_SPECS` is a programming error, but it is one that used to take
+     * the whole game down on the first frame - `undefined.share` inside a
+     * constructor - and a traveller with no bag is a far better failure than a
+     * black screen.
+     */
+    const kinds = LUGGAGE_KINDS.filter((kind) => (LUGGAGE_SPECS[kind]?.share ?? 0) > 0);
+    if (kinds.length === 0) return LUGGAGE_KINDS[0] as LuggageKind;
+    return this.rng.weighted(
+      kinds,
+      kinds.map((kind) => LUGGAGE_SPECS[kind].share),
+    );
   }
 
   /** Where this traveller is trying to be, and how fast. */
@@ -642,7 +687,6 @@ export class TravellerSim {
    */
   private resolve(player?: { readonly x: number; readonly z: number } | undefined): void {
     const people = this.travellers;
-    const minimum = TRAVELLER_RADIUS * 2;
 
     for (let pass = 0; pass < RESOLVE_PASSES; pass += 1) {
       for (let i = 0; i < people.length; i += 1) {
@@ -651,6 +695,9 @@ export class TravellerSim {
         for (let j = i + 1; j < people.length; j += 1) {
           const b = people[j];
           if (!b) continue;
+          // Personal space is the SUM of the pair's own radii, so the one in
+          // the long coat keeps everybody a little further off.
+          const minimum = TRAVELLER_RADIUS * (a.spacing + b.spacing);
           let dx = a.x - b.x;
           let dz = a.z - b.z;
           let d2 = dx * dx + dz * dz;

@@ -229,8 +229,18 @@ export class TrafficSystem {
     // traffic from driving through one; without it a crash in a live lane is
     // invisible to every driver behind it.
     let driverIndex = 0;
+    const publishRange = RENDER_DISTANCE[this.quality];
     for (const vehicle of this.sim.vehicles) {
       if (!vehicle.active || vehicle.control === 'ambient') continue;
+      // An abandoned car on the far side of the city is nobody's obstacle, and
+      // projecting it onto the lane graph would cost three lane queries a
+      // frame for a street the player will never see it on. The pool is capped
+      // at a dozen, so this bounds the whole list rather than trimming a tail.
+      if (vehicle.control === 'parked') {
+        const px = vehicle.x - ctx.x;
+        const pz = vehicle.z - ctx.z;
+        if (px * px + pz * pz > publishRange * publishRange) continue;
+      }
       const fx = -Math.sin(vehicle.yaw);
       const fz = -Math.cos(vehicle.yaw);
       const halfLength = vehicle.blueprint.length * 0.5;
@@ -247,7 +257,7 @@ export class TrafficSystem {
     this.sim.setObstacles(this.obstacles);
 
     this.sim.update(dt, ctx.x, ctx.z, ctx.time);
-    this.renderer.update(this.sim.vehicles, ctx.x, ctx.z);
+    this.renderer.update(this.sim.vehicles, ctx.x, ctx.z, dt);
   }
 
   // -- player handover ------------------------------------------------------
@@ -267,8 +277,14 @@ export class TrafficSystem {
    */
   takeControl(id: number): VehicleHandle | null {
     const vehicle = this.sim.vehicles.find((v) => v.id === id && v.active);
+    if (!vehicle) return null;
     // A car that is mid-crash has no pose to hand over and nothing to drive.
-    if (!vehicle || vehicle.control !== 'ambient') return null;
+    // A PARKED one does: getting back into a car you left at the kerb is the
+    // other half of being able to leave it there, so it is taken exactly like
+    // any other - unless it is a write-off or lying on its roof, which is not
+    // a car any more whatever state it is in.
+    if (vehicle.control !== 'ambient' && vehicle.control !== 'parked') return null;
+    if (vehicle.integrity <= 0 || vehicle.view.overturned) return null;
     return this.makeHandle(vehicle);
   }
 
@@ -277,11 +293,21 @@ export class TrafficSystem {
     return this.sim.nearestVehicle(x, z, maxDistance)?.view ?? null;
   }
 
-  /** Returns a vehicle to ambient control, rejoining the nearest suitable lane. */
+  /**
+   * Gives a vehicle up. IT STAYS WHERE IT IS.
+   *
+   * This used to hand the car back to the traffic AI, which snapped it onto
+   * the nearest lane, turned it to face along that lane and drove it away -
+   * and, when no lane was close enough to accept it, deleted the car the
+   * player had just parked and respawned it somewhere else entirely. A car
+   * with nobody in it does neither. It is parked: same place, same heading,
+   * same damage, still solid, still enterable, and removed only by the
+   * bounded out-of-view rule in `TrafficSim.enforceParkedLimit`.
+   */
   releaseControl(id: number): void {
     const vehicle = this.sim.vehicles.find((v) => v.id === id);
     if (!vehicle || vehicle.control !== 'player') return;
-    this.sim.attach(vehicle);
+    this.sim.park(vehicle);
     this.handles.delete(id);
   }
 
@@ -337,10 +363,21 @@ export class TrafficSystem {
    * Ordinary cars and patrol cars share this one model, on the one scale:
    * `VEHICLE_INTEGRITY` points, zero is a write-off. Read the result back off
    * `VehicleView.integrity`.
+   *
+   * PASS THE WORLD POINT THE ROUND LANDED ON when you know it. It is what
+   * makes the damage local, and localised damage is what the car's behaviour
+   * and its appearance are both driven from: rounds into the bonnet kill the
+   * engine and the car loses power, rounds into a wheel arch flat the tyre and
+   * it pulls to that side, rounds through the glazing take the windows out.
+   * Without it the same points are spread evenly over the shell, which is the
+   * right answer for damage that genuinely has no location - a scrape charged
+   * after the fact - and a poor one for a bullet.
+   *
+   * Read the result back off `VehicleView.regions` and `VehicleView.handling`.
    */
-  applyDamage(vehicleId: number, amount: number): boolean {
+  applyDamage(vehicleId: number, amount: number, x?: number, y?: number, z?: number): boolean {
     if (this.disposed) return false;
-    return this.sim.applyDamage(vehicleId, amount);
+    return this.sim.applyDamage(vehicleId, amount, x, y, z);
   }
 
   /**
@@ -403,7 +440,17 @@ export class TrafficSystem {
     laneLength: number;
     /** False when a generated asset failed to load and the fallback is drawn. */
     generated: boolean;
+    /** Abandoned cars and wrecks held. Bounded; see `parkedLimit`. */
+    parked: number;
+    /** How many of those are write-offs rather than cars somebody walked away from. */
+    wrecks: number;
+    parkedLimit: number;
+    /** Metres from the camera past which a parked vehicle may be removed. */
+    parkedRemoveDistance: number;
+    /** Live damage particles. Bounded by the pool; see `TrafficRenderer`. */
+    particles: number;
   } {
+    const limits = this.sim.parkedLimits;
     return {
       population: this.sim.vehicles.length,
       active: this.sim.liveCount,
@@ -412,6 +459,11 @@ export class TrafficSystem {
       drawCalls: this.renderer.drawCallCeiling,
       laneLength: this.sim.laneLength,
       generated: this.models !== null,
+      parked: this.sim.parkedCount,
+      wrecks: this.sim.wreckCount,
+      parkedLimit: limits.limit,
+      parkedRemoveDistance: limits.removeDistance,
+      particles: this.renderer.liveParticles,
     };
   }
 

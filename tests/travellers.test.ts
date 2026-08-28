@@ -334,7 +334,9 @@ describe('travellers', () => {
     expect(result.sawWalking).toBe(true);
     expect(result.sawQueueing).toBe(true);
     const stats = crowd.sim.stats;
-    expect(stats.population).toBe(52);
+    // The shipped 'high' population. Raised from 52 when the terminal was
+    // measured reading as deserted; see `TerminalCrowd`'s `POPULATION`.
+    expect(stats.population).toBe(78);
     expect(stats.walking + stats.queueing + stats.paused).toBe(stats.population);
     // A search that fails is a goal in another pocket of the graph. With one
     // connected component there should be none at all.
@@ -823,7 +825,11 @@ function fakeCharacter(id: string): PedestrianVatCharacter {
 
 describe('the rendered instances', () => {
   it('stands everybody on the floor, upright, at their own build', async () => {
-    const owned = ['a', 'b', 'c', 'd'].map(fakeCharacter);
+    // Characters supplied by a caller are matched BY ID now that the street
+    // and terminal rosters are different lists, so the test names the roster
+    // it is standing up rather than relying on array order.
+    const roster = ['ped-a', 'ped-b', 'ped-c', 'ped-d'];
+    const owned = roster.map(fakeCharacter);
     const crowd = new TerminalCrowd({
       region: REGION,
       obstacles: OBSTACLES,
@@ -832,6 +838,7 @@ describe('the rendered instances', () => {
       floorY: FLOOR,
       quality: 'high',
       seed: 5150,
+      roster,
       characters: owned,
       // Nothing can be fetched from a unit test, so the prop models are
       // exercised through their failure branch: a terminal with no luggage

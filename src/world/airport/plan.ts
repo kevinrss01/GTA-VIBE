@@ -26,6 +26,7 @@ import {
   isOnRunway,
   isOnTaxiway,
   type AirportRect,
+  type Stand,
 } from './layout';
 
 /**
@@ -242,6 +243,38 @@ export const CHECKIN_DESK_X: readonly [number, number] = [156, 160];
 export const CHECKIN_DESK_Z: readonly number[] = [368, 380, 392];
 export const SECURITY_Z = 428;
 
+/**
+ * The security lanes, and where the baggage hall is partitioned off.
+ *
+ * Published here rather than kept in the builder because they are the two
+ * places the terminal's plan is actually ENFORCED - the partitions have
+ * colliders, so these numbers decide whether a route through the building
+ * exists at all. The fit-out builds to them and `tests/terminalSurfaces`
+ * asserts that nothing else was ever built across them.
+ */
+/*
+ * MOVED from 166/183/200. The structural column rows stand at x = 165 and
+ * x = 199, so the outer two lanes had a 0.9 m concrete column inside their
+ * 3.2 m width - measured, and it is the reason `tests/terminalSurfaces` now
+ * asserts every lane is clear. 170 and 196 sit in the bays between the rows.
+ */
+export const SECURITY_LANES: readonly number[] = [170, 183, 196];
+export const SECURITY_LANE_HALF = 1.6;
+export const BAGGAGE_Z = 528;
+
+/**
+ * The concourse spine: the clear route from the main entrance to the baggage
+ * hall, on the centre security lane so that it is a route and not an aspiration.
+ *
+ * Nothing solid may stand in this band anywhere between the north wall and the
+ * baggage partition. It is 3.2 m wide, which is the width of the lane it has to
+ * thread; widening it would not help, because the lane is the pinch point.
+ */
+export const CONCOURSE_SPINE = {
+  minX: SECURITY_LANES[1]! - SECURITY_LANE_HALF,
+  maxX: SECURITY_LANES[1]! + SECURITY_LANE_HALF,
+} as const;
+
 export const TERMINAL_QUEUES: readonly QueueAnchor[] = [
   { x: CHECKIN_DESK_X[1] + 0.8, z: 372, heading: Math.PI / 2, slots: 8 },
   { x: CHECKIN_DESK_X[1] + 0.8, z: 388, heading: Math.PI / 2, slots: 8 },
@@ -249,6 +282,98 @@ export const TERMINAL_QUEUES: readonly QueueAnchor[] = [
   // the terminal, and the line runs back north into the check-in hall.
   { x: 176, z: SECURITY_Z - 1.5, heading: Math.PI, slots: 8 },
 ];
+
+// ---------------------------------------------------------------------------
+// Stand envelopes
+// ---------------------------------------------------------------------------
+
+/**
+ * How much room the largest aircraft of each stand class occupies, in metres
+ * from the stand point.
+ *
+ * REAL NUMBERS, taken from `air/AircraftCatalogue.ts` and rounded UP to the
+ * largest type that parks on a stand of that size (`STAND_FLEET` in
+ * `air/AircraftSystem.ts` decides which):
+ *
+ *   heavy   liner   39.5 long, 35.8 span
+ *   medium  jet     17.2 long, 15.6 span      twin  15.8 long, 19.8 span
+ *   light   cessna   8.3 long, 11.0 span
+ *
+ * They live here rather than being imported because `props.ts` must not pull
+ * `AircraftSystem` - and therefore Three.js and the model library - into the
+ * world builder. `tests/apronClearance.test.ts` reads the catalogue directly
+ * and fails if this table ever stops covering the fleet actually parked.
+ */
+export interface StandEnvelope {
+  /** Nose and tail reach along the aircraft's own axis. */
+  readonly halfLength: number;
+  /** Wingtip reach either side. */
+  readonly halfSpan: number;
+  /** Fuselage half-width. Ground equipment may stand outside this, not in it. */
+  readonly halfFuselage: number;
+}
+
+export const STAND_ENVELOPE: Readonly<Record<Stand['size'], StandEnvelope>> = {
+  heavy: { halfLength: 19.75, halfSpan: 17.9, halfFuselage: 2.0 },
+  medium: { halfLength: 8.6, halfSpan: 9.9, halfFuselage: 1.4 },
+  light: { halfLength: 4.15, halfSpan: 5.5, halfFuselage: 0.9 },
+};
+
+/** Margin either side of the wingtips that must also stay clear. */
+export const STAND_WINGTIP_CLEARANCE = 2;
+
+/** Unit vector the aircraft's nose points along, from its parked heading. */
+export function standForward(stand: Stand): { x: number; z: number } {
+  // The game's convention: forward is (-sin yaw, 0, -cos yaw).
+  return { x: -Math.sin(stand.heading), z: -Math.cos(stand.heading) };
+}
+
+/**
+ * The ground an aircraft sweeps taxiing off its stand, in plan.
+ *
+ * From the nose forward to the edge of the movement area, as wide as the
+ * wingspan plus a margin. NOTHING SOLID MAY STAND IN IT - which is not a
+ * decorating preference: a ground power unit 0.6 m off the nose stops a
+ * turboprop dead at full throttle, which is exactly what it did on stand 3.
+ *
+ * Axis-aligned only, because every stand at Meridian Bay Regional is.
+ */
+export function standTaxiCorridor(stand: Stand, reach = 40): AirportRect {
+  const env = STAND_ENVELOPE[stand.size];
+  const forward = standForward(stand);
+  const half = env.halfSpan + STAND_WINGTIP_CLEARANCE;
+  if (Math.abs(forward.x) >= Math.abs(forward.z)) {
+    const nose = stand.x + Math.sign(forward.x) * env.halfLength;
+    const far = nose + Math.sign(forward.x) * reach;
+    return {
+      minX: Math.min(nose, far),
+      maxX: Math.max(nose, far),
+      minZ: stand.z - half,
+      maxZ: stand.z + half,
+    };
+  }
+  const nose = stand.z + Math.sign(forward.z) * env.halfLength;
+  const far = nose + Math.sign(forward.z) * reach;
+  return {
+    minX: stand.x - half,
+    maxX: stand.x + half,
+    minZ: Math.min(nose, far),
+    maxZ: Math.max(nose, far),
+  };
+}
+
+/** The parked aircraft's fuselage in plan. Equipment goes beside it, not in it. */
+export function standFuselage(stand: Stand): AirportRect {
+  const env = STAND_ENVELOPE[stand.size];
+  const forward = standForward(stand);
+  const alongX = Math.abs(forward.x) >= Math.abs(forward.z);
+  return {
+    minX: stand.x - (alongX ? env.halfLength : env.halfFuselage),
+    maxX: stand.x + (alongX ? env.halfLength : env.halfFuselage),
+    minZ: stand.z - (alongX ? env.halfFuselage : env.halfLength),
+    maxZ: stand.z + (alongX ? env.halfFuselage : env.halfLength),
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Car park

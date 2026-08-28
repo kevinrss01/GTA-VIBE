@@ -90,6 +90,10 @@ const INTERIOR_MODELS: Readonly<Record<TerminalModelAnchor['model'], AirportMode
   'flight-board': { file: 'flight-board', axis: 'z', metres: 3.2, front: '-z' },
   trolley: { file: 'trolley', axis: 'y', metres: 1.05, front: '-z' },
   'gate-seats': { file: 'gate-seats', axis: 'z', metres: 3.6, front: '-z' },
+  // Left luggage. Static props on the same recipe as `suitcase` and `duffel`:
+  // standing on +Y with a centre pivot, so they fit by their height.
+  backpack: { file: 'backpack', axis: 'y', metres: 0.5, front: '-z' },
+  'garment-bag': { file: 'garment-bag', axis: 'y', metres: 0.9, front: '-z' },
 };
 
 /**

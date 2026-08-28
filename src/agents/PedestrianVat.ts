@@ -42,11 +42,171 @@ import { lerp } from '../core/mathx';
 /** Where the runtime assets live, relative to the site root. */
 export const PEDESTRIAN_VAT_BASE = 'models/pedestrians';
 
+// ---------------------------------------------------------------------------
+// The rosters
+//
+// EACH CHARACTER COSTS ONE COLOUR DRAW CALL AND ONE SHADOW DRAW CALL, PER
+// SYSTEM THAT DRAWS IT. That is why there is a roster per system rather than
+// one shared list: the street crowd and the terminal crowd each build a mesh
+// per id they are given, so a single list of twelve would cost the downtown
+// street twenty-four draw calls for eight characters it never shows.
+//
+// So the cast is data and the budgets are stated. Adding characters is a
+// ONE-LINE change to `AIRPORT_VAT_IDS` below and nothing else moves.
+// ---------------------------------------------------------------------------
+
 /**
- * The characters the crowd draws from. Each costs one colour draw call and one
- * shadow draw call, so this list is a rendering budget as much as a cast list.
+ * Characters the CITY crowd draws from.
+ *
+ * Four, unchanged, and deliberately so: this is the roster whose cost was
+ * measured in `docs/pedestrian-characters.md` at +6 draw calls and +0.27 ms
+ * over the procedural crowd, downtown, with 266 people in view. Adding to it
+ * is a measured decision, not a free one.
  */
-export const PEDESTRIAN_VAT_IDS = ['ped-a', 'ped-b', 'ped-c', 'ped-d'] as const;
+export const CITY_VAT_IDS: readonly string[] = ['ped-a', 'ped-b', 'ped-c', 'ped-d'];
+
+/**
+ * Characters generated for the airport, in preference order.
+ *
+ * >>> THIS IS THE ONE LINE TO EDIT when more traveller characters land. Add
+ * >>> their ids here, most distinctive first, and nothing else changes: the
+ * >>> terminal roster, its mesh count, its instance buffers, its draw-call
+ * >>> budget and the tests all read from this array.
+ *
+ * All seven were baked WITH A HAND TRACK, which is what lets
+ * `travellers/props.ts` hang a bag off the hand that is holding it rather than
+ * off a fixed point on the hip. The original four have `hand: null`, which is
+ * why they are not in this list and why the terminal does not use them.
+ *
+ * THERE IS DELIBERATELY NO `ped-j`. The ids are matched to the Tripo tasks
+ * that made them, and `ped-j` - the heavy-set traveller - was generated twice
+ * and slid worse than `MAX_WALK_SLIP` both times (68/164/797 mm, then
+ * 50/157/617 mm): a short, wide humanoid does not fit `preset:biped:walk`.
+ * The gap in the sequence is the record of that, not an oversight.
+ */
+export const AIRPORT_VAT_IDS: readonly string[] = [
+  'ped-e',
+  'ped-f',
+  'ped-g',
+  'ped-h',
+  'ped-i',
+  'ped-k',
+  'ped-l',
+];
+
+/**
+ * How many characters each system may draw at once.
+ *
+ * The terminal gets more than the street for three reasons that are all about
+ * where the calls land rather than about how many there are:
+ *
+ *   - it is a smaller, denser space the player walks through slowly and looks
+ *     at closely, so a repeated face is far more obvious;
+ *   - it is only ever active inside one building. `TerminalCrowd.update`
+ *     returns before it simulates or draws anything from more than
+ *     `EXIT_RANGE` away, so none of these calls is ever added to the city's
+ *     frame - which is the whole reason the rosters are separate lists. Seven
+ *     airport characters on ONE shared roster would have cost the downtown
+ *     street fourteen draw calls for people it never shows;
+ *   - the terminal vantage was measured submitting about 330 calls, against
+ *     which seven characters (fourteen with shadows) is under five per cent.
+ */
+export const CITY_ROSTER_BUDGET = 4;
+export const TERMINAL_ROSTER_BUDGET = 7;
+
+/**
+ * Stature to draw each character at, in metres, where the generator's own
+ * proportions call for one.
+ *
+ * THE BAKE CARRIES NO HEIGHT: every rig is normalised to 1.0 tall, so how big
+ * a person is is entirely the instance matrix's business. Left to the crowd's
+ * own 1.54-1.92 m draw, the tall man in cargo trousers comes out 1.56 m as
+ * often as not and the elderly woman comes out 1.90 m, which throws away the
+ * body variety the seven characters were generated for.
+ *
+ * These are the generator's suggestions and all of them sit inside the crowd's
+ * existing band, so nothing here widens the range - it only correlates it with
+ * the mesh. A character with no entry keeps whatever `appearance.ts` drew.
+ */
+export const VAT_STATURE: Readonly<Record<string, number>> = {
+  'ped-e': 1.8,
+  'ped-f': 1.6,
+  'ped-g': 1.72,
+  'ped-h': 1.68,
+  'ped-i': 1.66,
+  'ped-k': 1.88,
+  'ped-l': 1.7,
+};
+
+/**
+ * How much room a character needs against its neighbours, as a multiple of the
+ * shared shoulder radius.
+ *
+ * `ped-f` is the deepest mesh in the game - 0.322 m front to back against
+ * everyone else's 0.21 to 0.25, because of the coat - so at the shared radius
+ * she intersects the person in front of her before they are touching. This is
+ * the one place a per-character number is worth carrying; everybody else is 1.
+ */
+export const VAT_FOOTPRINT: Readonly<Record<string, number>> = {
+  'ped-f': 1.3,
+};
+
+/**
+ * Shortest period an idle clip is played back over, in seconds.
+ *
+ * `ped-e`'s idle loops in 1.02 s where every other bake is 1.60 to 1.65, so
+ * played at its own rate he fidgets half again as fast as the person next to
+ * him - which is invisible walking past and impossible to miss in a queue of
+ * people standing still. Stretching the short clip to the common period costs
+ * nothing (the phase is a lookup either way) and puts a whole line of
+ * travellers on the same unhurried breath.
+ */
+export const IDLE_MIN_PERIOD = 1.55;
+
+/**
+ * The terminal's cast: every airport character, topped up from the city's so a
+ * build with none of them still has a varied concourse rather than an empty
+ * one, and truncated to the budget.
+ */
+export const TERMINAL_VAT_IDS: readonly string[] = (() => {
+  const out: string[] = [];
+  for (const id of AIRPORT_VAT_IDS) {
+    if (out.length >= TERMINAL_ROSTER_BUDGET) break;
+    if (!out.includes(id)) out.push(id);
+  }
+  for (const id of CITY_VAT_IDS) {
+    if (out.length >= TERMINAL_ROSTER_BUDGET) break;
+    if (!out.includes(id)) out.push(id);
+  }
+  return out;
+})();
+
+/**
+ * Historical alias for the city roster.
+ *
+ * Kept because it is the name the crowd, the police rig and the docs all grew
+ * up with; new code should say which roster it means.
+ */
+export const PEDESTRIAN_VAT_IDS: readonly string[] = CITY_VAT_IDS;
+
+/**
+ * Worst measured foot slide a walk clip may have and still be shown, in rig
+ * units where the body is 1.0 tall.
+ *
+ * The runtime cannot fix a bad clip. It already drives the cycle from distance
+ * travelled rather than from a clock, so a planted foot is planted by
+ * construction; what `slip` measures is the provider's own retarget quality -
+ * how far a single sole vertex wanders during one footfall - and no playback
+ * rate makes that go away. See `docs/pedestrian-characters.md`.
+ *
+ * So it is a GATE instead. The shipped roster's worst is `ped-a` at 0.196
+ * (about 340 mm on a 1.73 m person, which is the figure the doc records);
+ * 0.24 leaves that room and still rejects a bake whose legs are skating,
+ * which would otherwise reach the street unnoticed. `loadPedestrianVat`
+ * refuses such a character and the crowd falls back exactly as it does for a
+ * missing file.
+ */
+export const MAX_WALK_SLIP = 0.24;
 
 interface RawHandTrack {
   readonly hand: readonly (readonly number[])[];
@@ -338,6 +498,14 @@ export async function loadPedestrianVat(
 
     const walkRaw = meta.clips.find((clip) => clip.name === 'walk') ?? meta.clips[0];
     if (!walkRaw) throw new Error(`${id}: bake carries no clips`);
+    // A walk whose feet skate is a defect the runtime cannot correct, so it is
+    // refused here and the caller degrades to the rest of the roster. See
+    // `MAX_WALK_SLIP`.
+    if (walkRaw.slip > MAX_WALK_SLIP) {
+      throw new Error(
+        `${id}: walk slides ${walkRaw.slip.toFixed(3)} rig units, over the ${MAX_WALK_SLIP} ceiling`,
+      );
+    }
     const idleRaw = meta.clips.find((clip) => clip.name === 'idle');
     const actionRaw = meta.clips.find((clip) => clip.name === 'shoot');
 

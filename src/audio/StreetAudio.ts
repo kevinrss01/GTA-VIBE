@@ -30,7 +30,16 @@
  * ## What it makes a noise about
  *
  *   - the player's engine, as two crossfaded loops through a lowpass whose
- *     pitch, level and colour come from `engineCurve.ts`;
+ *     pitch, level and colour come from `engineCurve.ts`, in the voice of the
+ *     class the player is actually driving - a hatchback, a saloon, a coupe, a
+ *     van, a box truck and a police interceptor are six different engines with
+ *     six different gearboxes, not one engine at six playback rates;
+ *   - tyre and road noise under it, on its own layer because it follows road
+ *     speed rather than revs;
+ *   - the gearbox: a clunk and a fifth of a second of torque cut on every
+ *     upshift under power;
+ *   - brake pad squeal rolling to a stop, which is not the same event as the
+ *     emergency skid below;
  *   - up to five nearby ambient cars, one panned tyre-roll loop each;
  *   - tyre scrub when anything brakes hard, the player included;
  *   - the car door on the way in and the way out;
@@ -54,20 +63,28 @@
  * silent. Unassigned voices are ramped to zero and left running, which costs a
  * gain multiply and buys immunity from node churn.
  *
- *   player engine     2 looping sources, 1 filter, 3 gains   (allocated once)
- *   ambient cars      5 looping sources, 5 panners, 5 gains  (allocated once)
+ *   player engine     3 looping sources, 1 filter, 4 gains   (allocated once)
+ *   ambient cars      5 looping sources, 5 filters,
+ *                     5 panners, 5 gains                     (allocated once)
  *   distant hum       1 looping source, 1 gain               (allocated once)
  *   crowd footsteps   MAX_STEP_VOICES at a time, MAX 3 nodes each
  *   other one-shots   MAX_OTHER_VOICES at a time, self-releasing on `ended`
  *                     (impacts included: a crash is a positional one-shot and
  *                     is counted in exactly the same budget)
  *
- * 23 persistent nodes, and a transient tail capped by voice COUNT rather than
- * by a rate limiter - 65 nodes in the absolute worst case, whatever the
+ * 30 persistent nodes, and a transient tail capped by voice COUNT rather than
+ * by a rate limiter - 72 nodes in the absolute worst case, whatever the
  * population, the frame rate or the relationship between simulated and real
  * time. The rate limiters alone were not enough; see MAX_STEP_VOICES.
  * `stats.liveNodes` is exported so a test can prove it over a long run rather
  * than trusting this comment.
+ *
+ * Seven more persistent nodes than the 23 this layer used to hold, and both
+ * additions buy something the mix could not do without them: the tyre layer
+ * (1 source, 1 gain) is what lets road noise track ROAD SPEED while the engine
+ * note tracks REVS, and the five ambient filters are the only thing separating
+ * a box truck from a hatchback across a junction, because the pool shares one
+ * recording and a source cannot change its buffer.
  *
  * ## Why pedestrian positions come out of the instance matrices
  *
@@ -85,13 +102,20 @@
 
 import type { AudioBusHost } from './AudioDirector';
 import {
+  ambientCutoff,
   ambientLevel,
   ambientRate,
+  engineProfileFor,
   engineTone,
+  engineVoiceFor,
   loadFromAcceleration,
+  DEFAULT_PROFILE,
+  type EngineProfile,
   type EngineTone,
+  type EngineVoice,
 } from './engineCurve';
 import {
+  ENGINE_VOICE_LAYERS,
   getAudioAsset,
   IMPACT_SOUNDS,
   STEP_SURFACES,
@@ -195,6 +219,39 @@ const IMPACT_WORLD_RATE = 0.93;
 const PLAYER_SCRUB_DECEL = 5.5;
 const PLAYER_SCRUB_SPEED = 6;
 const SCRUB_COOLDOWN = 0.7;
+
+/**
+ * Ordinary braking, which is not a skid.
+ *
+ * The layer had exactly one braking sound and it was an emergency stop, so
+ * everything short of one was silent: coming to a halt at a junction made no
+ * noise at all beyond the engine dropping to idle. `veh/brake-squeal` is the
+ * other end of that range - pad squeal as a car rolls to a stop - and it is
+ * gated on stopping rather than on decelerating, because that squeal happens at
+ * walking pace and not at speed.
+ */
+const BRAKE_SQUEAL_DECEL = 1.6;
+const BRAKE_SQUEAL_MAX_SPEED = 5.5;
+const BRAKE_SQUEAL_MIN_SPEED = 0.6;
+const BRAKE_SQUEAL_COOLDOWN = 2.4;
+const BRAKE_SQUEAL_LEVEL = 0.5;
+
+/**
+ * The upshift, and the hole it puts in the note.
+ *
+ * A real automatic cuts torque for a moment as it swaps ratios: the note drops,
+ * dulls, and comes back on the other side of the change. Without that, a
+ * gearbox that only ever drops the pitch reads as the engine stumbling. The
+ * clunk is fired on the rising edge of the gear number and only under power -
+ * a car coasting down through the gears does not clunk.
+ */
+const SHIFT_DIP_TIME = 0.2;
+const SHIFT_DIP_GAIN = 0.32;
+const SHIFT_DIP_CUTOFF = 0.4;
+const SHIFT_MIN_LOAD = 0.15;
+const SHIFT_LEVEL = 0.5;
+/** Below this road speed a gear change is the model settling, not a shift. */
+const SHIFT_MIN_SPEED = 1.5;
 
 /** Ambient cars: how many voices, how far they carry, when they are released. */
 const TRAFFIC_VOICES = 5;
@@ -305,6 +362,14 @@ function moved(value: number, previous: number, epsilon: number): boolean {
 
 /** Hoisted so a per-frame mix never pays for a `Math.pow` or a map lookup. */
 const AMBIENT_TRIM = dbToGain(getAudioAsset(VEHICLE_SOUNDS.engineFar).trimDb);
+const TYRE_TRIM = dbToGain(getAudioAsset(VEHICLE_SOUNDS.tyreRoll).trimDb);
+/**
+ * How near a player-controlled vehicle has to be to BE the player's car.
+ *
+ * The listener is inside it, so a metre or two of camera offset is all there
+ * ever is. Police units are also player-controlled and are never this close.
+ */
+const PLAYER_CAR_RADIUS = 4;
 const HUM_TRIM = dbToGain(getAudioAsset(TRAFFIC_HUM).trimDb);
 /** The engine's resting state, reported while the player is on foot. */
 const SILENT_TONE: EngineTone = engineTone(0, 0);
@@ -329,12 +394,23 @@ export interface VehicleAudioView {
   /** Longitudinal acceleration in m/s². Negative under braking. */
   readonly accelLong: number;
   /**
-   * `loose` is a car that has been knocked out of the traffic AI and is rolling
-   * free; it is still an engine and a set of tyres, so it is voiced exactly as
-   * ambient traffic is. Only `player` is special here, because the driven car
-   * has its own engine note.
+   * Which body shell this is, e.g. `'boxTruck'`. Optional and typed as a plain
+   * string so this module never imports the traffic system's `VehicleKind`, and
+   * so a shell added over there does not have to be added here to compile: an
+   * unrecognised kind falls back to the saloon voice.
    */
-  readonly control: 'ambient' | 'player' | 'loose';
+  readonly kind?: string | undefined;
+  /**
+   * Who is driving. `'ambient'`, `'player'` or `'loose'` today.
+   *
+   * Deliberately widened to `string`. Only `'ambient'` and `'player'` are ever
+   * tested against here, and the traffic system is free to add a control state
+   * - a parked or abandoned car, say - without this view refusing to accept its
+   * own fleet. `loose` is a car that has been knocked out of the traffic AI and
+   * is rolling free; it is still an engine and a set of tyres, so it is voiced
+   * exactly as ambient traffic is.
+   */
+  readonly control: string;
   /**
    * True while this car is a police unit.
    *
@@ -413,9 +489,15 @@ export interface StreetAudioStats {
   readonly crowdSteps: number;
   /** True once the player's engine graph exists. */
   readonly engineReady: boolean;
+  /** Which recorded engine pair the player's car is speaking with. */
+  readonly engineVoice: EngineVoice;
+  /** Gear the model is in, zero-based. Rises and falls with road speed. */
+  readonly gear: number;
   readonly rev: number;
   readonly engineGain: number;
   readonly engineCutoff: number;
+  /** Level of the tyre/road layer under the engine, 0 to 1. */
+  readonly tyreLevel: number;
   readonly humLevel: number;
 }
 
@@ -424,17 +506,38 @@ export interface StreetAudioStats {
 // ---------------------------------------------------------------------------
 
 interface EngineGraph {
-  readonly idle: AudioBufferSourceNode;
-  readonly load: AudioBufferSourceNode;
+  /**
+   * The two engine layers. NOT readonly: swapping the vehicle class swaps the
+   * buffers, and an `AudioBufferSourceNode` cannot change its buffer, so the
+   * source nodes are replaced while the gains, the filter and the output stay
+   * exactly where they are. The node COUNT is unchanged by a swap.
+   */
+  idle: AudioBufferSourceNode;
+  load: AudioBufferSourceNode;
   readonly idleGain: GainNode;
   readonly loadGain: GainNode;
   readonly filter: BiquadFilterNode;
+  /**
+   * Tyre and road noise, summed AFTER the engine filter.
+   *
+   * After, because the engine's lowpass is the throttle's colour and has
+   * nothing to do with the tyres: routing the tyres through it would make them
+   * duck every time the driver lifted off, which is the opposite of what
+   * happens. It also tracks road speed rather than revs, so it holds steady
+   * through a gearchange while the engine note drops.
+   */
+  tyre: AudioBufferSourceNode | null;
+  readonly tyreGain: GainNode;
   readonly out: GainNode;
+  /** Which recorded pair the two sources are currently playing. */
+  voice: EngineVoice;
   /** Last values pushed, so an unchanged frame schedules nothing. */
   idleRate: number;
   loadRate: number;
   idleMix: number;
   loadMix: number;
+  tyreRate: number;
+  tyreLevel: number;
   gain: number;
   cutoff: number;
 }
@@ -442,6 +545,15 @@ interface EngineGraph {
 interface TrafficVoice {
   readonly source: AudioBufferSourceNode;
   readonly gain: GainNode;
+  /**
+   * The class colour.
+   *
+   * The pool shares one recording, because five sources is the budget and a
+   * source cannot change its buffer - so what separates a box truck from a
+   * hatchback across a junction is this filter's corner and the playback rate,
+   * not a different file. One biquad per voice, allocated with the voice.
+   */
+  readonly filter: BiquadFilterNode;
   readonly panner: PannerNode;
   vehicleId: number | null;
   wasBraking: boolean;
@@ -449,6 +561,8 @@ interface TrafficVoice {
   seen: boolean;
   rate: number;
   level: number;
+  cutoff: number;
+  profile: EngineProfile;
 }
 
 /** A one-shot in flight, held so `dispose` can release it and voices counted. */
@@ -478,8 +592,14 @@ export class StreetAudio {
 
   private engine: EngineGraph | null = null;
   private engineRequested = false;
+  private tyreReady = false;
   private engineOn = false;
   private tone: EngineTone = SILENT_TONE;
+  /** The class of the car the player is in, and the curve that goes with it. */
+  private profile: EngineProfile = DEFAULT_PROFILE;
+  private voice: EngineVoice = 'saloon';
+  private lastGear = 0;
+  private shiftDip = 0;
 
   private lastSpeed = 0;
   private smoothedLoad = 0;
@@ -487,6 +607,7 @@ export class StreetAudio {
   private wasDriving = false;
   private impactCooldown = 0;
   private scrubCooldown = 0;
+  private brakeCooldown = 0;
   private doorCloseIn = -1;
 
   private readonly voices: TrafficVoice[] = [];
@@ -538,9 +659,12 @@ export class StreetAudio {
       crowdTracks: tracked,
       crowdSteps: this.crowdSteps,
       engineReady: this.engine !== null,
+      engineVoice: this.engine ? this.engine.voice : this.voice,
+      gear: this.tone.gear,
       rev: this.tone.rev,
       engineGain: this.engine ? this.engine.gain : 0,
       engineCutoff: this.engine ? this.engine.cutoff : 0,
+      tyreLevel: this.engine ? this.engine.tyreLevel : 0,
       humLevel: this.humLevel,
     };
   }
@@ -552,7 +676,9 @@ export class StreetAudio {
 
     this.impactCooldown = Math.max(0, this.impactCooldown - step);
     this.scrubCooldown = Math.max(0, this.scrubCooldown - step);
+    this.brakeCooldown = Math.max(0, this.brakeCooldown - step);
     this.trafficScrubCooldown = Math.max(0, this.trafficScrubCooldown - step);
+    this.shiftDip = Math.max(0, this.shiftDip - step / SHIFT_DIP_TIME);
     this.stepBudget = Math.min(CROWD_STEP_BURST, this.stepBudget + CROWD_STEP_RATE * step);
 
     this.updateDoors(step, ctx);
@@ -648,6 +774,34 @@ export class StreetAudio {
     }
   }
 
+  /**
+   * Which class the player is driving, taken from the fleet.
+   *
+   * The driven car stays in `traffic.vehicles` with its control set to
+   * `'player'` and the listener sits inside it, so the nearest player-controlled
+   * vehicle IS the player's car. Reading it here rather than adding a field to
+   * the context means no caller has to remember to publish the class, and a
+   * police unit - which is also under `'player'` control while it is being
+   * driven by the pursuit system - is excluded by the distance test.
+   */
+  private resolveVoice(ctx: StreetAudioContext): void {
+    if (!ctx.driving) return;
+    let best: string | undefined;
+    let bestSq = PLAYER_CAR_RADIUS * PLAYER_CAR_RADIUS;
+    for (const vehicle of ctx.vehicles) {
+      if (vehicle.control !== 'player') continue;
+      const dx = vehicle.x - ctx.x;
+      const dz = vehicle.z - ctx.z;
+      const d = dx * dx + dz * dz;
+      if (d > bestSq) continue;
+      bestSq = d;
+      best = vehicle.kind;
+    }
+    if (best === undefined) return;
+    this.voice = engineVoiceFor(best);
+    this.profile = engineProfileFor(best);
+  }
+
   private updateEngine(dt: number, ctx: StreetAudioContext): void {
     if (!ctx.driving) {
       if (this.engineOn) {
@@ -656,13 +810,19 @@ export class StreetAudio {
         if (engine) {
           this.ramp(engine.out.gain, 0, ENGINE_FADE_OUT);
           engine.gain = 0;
+          this.ramp(engine.tyreGain.gain, 0, ENGINE_FADE_OUT);
+          engine.tyreLevel = 0;
         }
       }
       this.lastSpeed = 0;
       this.smoothedLoad = 0;
+      this.lastGear = 0;
+      this.shiftDip = 0;
       this.tone = SILENT_TONE;
       return;
     }
+
+    this.resolveVoice(ctx);
 
     // Acceleration from two speed samples. This is also the impact detector:
     // the driving layer resolves a collision by scrubbing speed in one frame,
@@ -695,6 +855,18 @@ export class StreetAudio {
     ) {
       this.scrubCooldown = SCRUB_COOLDOWN;
       this.playOneShot(VEHICLE_SOUNDS.tyreScrub, 0.85);
+    } else if (
+      !settling &&
+      accel < -BRAKE_SQUEAL_DECEL &&
+      Math.abs(ctx.driveSpeed) < BRAKE_SQUEAL_MAX_SPEED &&
+      Math.abs(ctx.driveSpeed) > BRAKE_SQUEAL_MIN_SPEED &&
+      this.brakeCooldown <= 0
+    ) {
+      // Rolling to a stop, not standing on the brakes. The `else` matters: a
+      // hard stop passes through this window on its way to rest, and hearing
+      // pad squeal on the tail of a skid is one event too many.
+      this.brakeCooldown = BRAKE_SQUEAL_COOLDOWN;
+      this.playOneShot(VEHICLE_SOUNDS.brakeSqueal, BRAKE_SQUEAL_LEVEL);
     }
 
     this.lastSpeed = ctx.driveSpeed;
@@ -702,10 +874,26 @@ export class StreetAudio {
     const target = settling ? 0 : loadFromAcceleration(accel);
     this.smoothedLoad += (target - this.smoothedLoad) * Math.min(1, dt / LOAD_TAU);
 
-    this.tone = engineTone(ctx.driveSpeed, this.smoothedLoad);
+    this.tone = engineTone(ctx.driveSpeed, this.smoothedLoad, this.profile);
+
+    // The upshift. Rising edge of the gear number, under power, above walking
+    // pace: a car rolling to a stop drops through every gear it owns and must
+    // not clunk on the way down.
+    if (
+      !settling &&
+      this.tone.gear > this.lastGear &&
+      this.smoothedLoad > SHIFT_MIN_LOAD &&
+      Math.abs(ctx.driveSpeed) > SHIFT_MIN_SPEED
+    ) {
+      this.shiftDip = 1;
+      this.playOneShot(VEHICLE_SOUNDS.gearShift, SHIFT_LEVEL);
+    }
+    this.lastGear = settling ? this.tone.gear : this.tone.gear;
+
     this.ensureEngine();
     const engine = this.engine;
     if (!engine) return;
+    this.swapVoice(engine);
 
     if (!this.engineOn) {
       this.engineOn = true;
@@ -729,16 +917,64 @@ export class StreetAudio {
       engine.loadMix = tone.loadMix;
       this.ramp(engine.loadGain.gain, tone.loadMix, MIX_RAMP);
     }
-    if (moved(tone.cutoff, engine.cutoff, FILTER_EPSILON)) {
-      engine.cutoff = tone.cutoff;
-      this.ramp(engine.filter.frequency, tone.cutoff, FILTER_RAMP);
+
+    // The gearchange dips the level and closes the filter for a fifth of a
+    // second, which is the torque cut a real automatic takes to swap ratios.
+    const dip = this.shiftDip;
+    const cutoff = tone.cutoff * (1 - SHIFT_DIP_CUTOFF * dip);
+    if (moved(cutoff, engine.cutoff, FILTER_EPSILON)) {
+      engine.cutoff = cutoff;
+      this.ramp(engine.filter.frequency, cutoff, FILTER_RAMP);
     }
 
-    const level = tone.gain * ENGINE_LEVEL;
+    const tyre = tone.tyreGain * TYRE_TRIM;
+    if (moved(tyre, engine.tyreLevel, GAIN_EPSILON)) {
+      engine.tyreLevel = tyre;
+      this.ramp(engine.tyreGain.gain, tyre, GAIN_RAMP);
+    }
+    if (engine.tyre && moved(tone.tyreRate, engine.tyreRate, RATE_EPSILON)) {
+      engine.tyreRate = tone.tyreRate;
+      this.ramp(engine.tyre.playbackRate, tone.tyreRate, RATE_RAMP);
+    }
+
+    const level = tone.gain * ENGINE_LEVEL * (1 - SHIFT_DIP_GAIN * dip);
     if (Math.abs(level - engine.gain) > GAIN_EPSILON) {
       this.ramp(engine.out.gain, level, engine.gain < 0 ? ENGINE_FADE_IN : GAIN_RAMP);
       engine.gain = level;
     }
+  }
+
+  /**
+   * Points the two engine sources at the class the player is actually driving.
+   *
+   * The graph is built once with the saloon pair, which is the only engine pair
+   * that is preloaded, and the class layers are fetched on demand - so getting
+   * into a box truck sounds like a saloon for the fraction of a second it takes
+   * the truck's two loops to arrive, and then sounds like a truck. That is far
+   * better than silence, and it is why the saloon pair is deliberately not in
+   * `LAZY_ASSET_IDS`.
+   *
+   * A swap stops two sources and starts two more. It happens when the player
+   * changes car, i.e. at most once per vehicle entry, and it leaves the node
+   * count exactly where it was.
+   */
+  private swapVoice(engine: EngineGraph): void {
+    if (engine.voice === this.voice) return;
+    const layers = ENGINE_VOICE_LAYERS[this.voice];
+    const idleBuffer = this.host.bufferFor(layers.idle);
+    const loadBuffer = this.host.bufferFor(layers.load);
+    if (!idleBuffer || !loadBuffer) {
+      this.host.requestAsset(layers.idle);
+      this.host.requestAsset(layers.load);
+      return;
+    }
+    this.stop(engine.idle);
+    this.stop(engine.load);
+    engine.idle = this.startLoop(idleBuffer, engine.idleGain, layers.idle);
+    engine.load = this.startLoop(loadBuffer, engine.loadGain, layers.load);
+    engine.idle.playbackRate.value = engine.idleRate;
+    engine.load.playbackRate.value = engine.loadRate;
+    engine.voice = this.voice;
   }
 
   /**
@@ -748,9 +984,17 @@ export class StreetAudio {
    * other; only their gains and rates move. Nothing is torn down when the
    * player gets out, because a stopped `AudioBufferSourceNode` can never be
    * started again and getting back into a car has to work.
+   *
+   * The tyre layer is optional and is added as soon as its buffer arrives: it
+   * is deferred like the class engines, and an engine with no tyres under it is
+   * a far better first second than no engine at all.
    */
   private ensureEngine(): void {
-    if (this.engine || this.engineRequested) return;
+    if (this.engine) {
+      this.ensureTyreLayer();
+      return;
+    }
+    if (this.engineRequested) return;
     const ctx = this.host.context;
     const bus = this.host.effectsBus;
     if (!ctx || !bus) return;
@@ -779,11 +1023,15 @@ export class StreetAudio {
     const loadGain = ctx.createGain();
     loadGain.gain.value = 0;
     loadGain.connect(filter);
+    // After the filter, not through it; see the note on `EngineGraph.tyre`.
+    const tyreGain = ctx.createGain();
+    tyreGain.gain.value = 0;
+    tyreGain.connect(out);
 
     const idle = this.startLoop(idleBuffer, idleGain, VEHICLE_SOUNDS.engineIdle);
     const load = this.startLoop(loadBuffer, loadGain, VEHICLE_SOUNDS.engineLoad);
-    // Two sources, two layer gains, the filter and the output gain.
-    this.liveNodes += 6;
+    // Two sources, two layer gains, the filter, the tyre gain and the output.
+    this.liveNodes += 7;
 
     this.engine = {
       idle,
@@ -791,14 +1039,38 @@ export class StreetAudio {
       idleGain,
       loadGain,
       filter,
+      // Null until its buffer arrives; the gain is already at zero, so the
+      // engine simply runs without a tyre bed for the first second.
+      tyre: null,
+      tyreGain,
       out,
+      voice: 'saloon',
       idleRate: 1,
       loadRate: 1,
       idleMix: 0,
       loadMix: 0,
+      tyreRate: 1,
+      tyreLevel: 0,
       gain: -1,
       cutoff: 1200,
     };
+    this.tyreReady = false;
+    this.ensureTyreLayer();
+  }
+
+  /** Starts the tyre loop once its buffer has arrived. Idempotent. */
+  private ensureTyreLayer(): void {
+    const engine = this.engine;
+    if (!engine || this.tyreReady) return;
+    const buffer = this.host.bufferFor(VEHICLE_SOUNDS.tyreRoll);
+    if (!buffer) {
+      this.host.requestAsset(VEHICLE_SOUNDS.tyreRoll);
+      return;
+    }
+    this.tyreReady = true;
+    engine.tyre = this.startLoop(buffer, engine.tyreGain, VEHICLE_SOUNDS.tyreRoll);
+    engine.tyre.playbackRate.value = engine.tyreRate;
+    this.liveNodes += 1;
   }
 
   // -- ambient traffic -------------------------------------------------------
@@ -853,12 +1125,20 @@ export class StreetAudio {
 
   private driveVoice(voice: TrafficVoice, vehicle: VehicleAudioView, distance: number): void {
     this.setPanner(voice.panner, vehicle.x, vehicle.y, vehicle.z);
-    const rate = ambientRate(vehicle.speed);
+    // The class can change under a voice when it is reassigned to another car,
+    // so it is refreshed here rather than only at assignment.
+    voice.profile = engineProfileFor(vehicle.kind);
+    const rate = ambientRate(vehicle.speed, voice.profile);
     if (moved(rate, voice.rate, RATE_EPSILON)) {
       voice.rate = rate;
       this.ramp(voice.source.playbackRate, rate, RATE_RAMP);
     }
-    this.setVoiceLevel(voice, ambientLevel(vehicle.speed) * AMBIENT_TRIM);
+    const cutoff = ambientCutoff(voice.profile);
+    if (moved(cutoff, voice.cutoff, FILTER_EPSILON)) {
+      voice.cutoff = cutoff;
+      this.ramp(voice.filter.frequency, cutoff, FILTER_RAMP);
+    }
+    this.setVoiceLevel(voice, ambientLevel(vehicle.speed, voice.profile) * AMBIENT_TRIM);
 
     // Rising edge of a HARD stop, not of the brake lamp. See the constants.
     const hard = vehicle.accelLong <= -TRAFFIC_SCRUB_DECEL;
@@ -988,21 +1268,29 @@ export class StreetAudio {
     const panner = this.makePanner(TRAFFIC_REF_DISTANCE, TRAFFIC_RELEASE);
     if (!panner) return null;
     panner.connect(bus);
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = ambientCutoff(DEFAULT_PROFILE);
+    filter.Q.value = 0.7;
+    filter.connect(panner);
     const gain = ctx.createGain();
     gain.gain.value = 0;
-    gain.connect(panner);
+    gain.connect(filter);
     const source = this.startLoop(buffer, gain, VEHICLE_SOUNDS.engineFar);
-    this.liveNodes += 3;
+    this.liveNodes += 4;
 
     const voice: TrafficVoice = {
       source,
       gain,
+      filter,
       panner,
       vehicleId: null,
       wasBraking: false,
       seen: false,
       rate: 1,
       level: 0,
+      cutoff: ambientCutoff(DEFAULT_PROFILE),
+      profile: DEFAULT_PROFILE,
     };
     this.voices.push(voice);
     return voice;
@@ -1370,19 +1658,26 @@ export class StreetAudio {
     if (engine) {
       this.stop(engine.idle);
       this.stop(engine.load);
+      if (engine.tyre) {
+        this.stop(engine.tyre);
+        this.liveNodes -= 1;
+      }
       this.disconnect(engine.idleGain);
       this.disconnect(engine.loadGain);
       this.disconnect(engine.filter);
+      this.disconnect(engine.tyreGain);
       this.disconnect(engine.out);
-      this.liveNodes -= 6;
+      this.liveNodes -= 7;
     }
+    this.tyreReady = false;
     this.engine = null;
 
     for (const voice of this.voices) {
       this.stop(voice.source);
       this.disconnect(voice.gain);
+      this.disconnect(voice.filter);
       this.disconnect(voice.panner);
-      this.liveNodes -= 3;
+      this.liveNodes -= 4;
     }
     this.voices.length = 0;
 

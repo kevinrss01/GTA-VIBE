@@ -507,7 +507,13 @@ export function addPlatform(ctx: Fitout, key: MaterialKey, box: LocalBox): void 
  * bounds of something built from struts). Walls pass `force` because they are
  * the room and are laid out around the doorway rather than checked against it.
  */
-export function addCollider(ctx: Fitout, box: LocalBox, solid = true, force = false): boolean {
+export function addCollider(
+  ctx: Fitout,
+  box: LocalBox,
+  solid = true,
+  force = false,
+  surface?: MaterialKey,
+): boolean {
   if (solid && !force && blocksEntry(ctx.room, box)) return false;
   const rect = worldRect(ctx.room, box);
   ctx.sink.collider({
@@ -518,6 +524,11 @@ export function addCollider(ctx: Fitout, box: LocalBox, solid = true, force = fa
     bottom: box.y[0],
     top: box.y[1],
     solid,
+    // Optional, and only the walkable floor passes it: the footstep mixer reads
+    // the collider's own surface, so a club's timber deck must not be decided
+    // by the terrain the building stands on. Everything else leaves it unset
+    // and keeps the generic indoor classification.
+    ...(surface === undefined ? {} : { surface }),
   });
   return true;
 }

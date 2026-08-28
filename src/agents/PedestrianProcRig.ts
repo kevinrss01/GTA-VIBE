@@ -38,7 +38,7 @@
  *   iAnim   = (cycle 0..1, hip amplitude rad, arm amplitude rad, gait 0..1)
  *   iAnim2  = (extra dip, forward lean rad, shoulder roll rad, shape bits)
  *   iColors = packed sRGB (top, bottom, skin, hair)
- *   iExtra  = packed sRGB (accent, shoe), unused, unused
+ *   iExtra  = packed sRGB (accent, shoe), dissolve 0..1, unused
  * Four garment colours ride in one vec4 because an sRGB triple packs exactly
  * into a float's 24-bit mantissa; that keeps the attribute count to 11 of the
  * 16 WebGL guarantees.
@@ -506,10 +506,33 @@ const COLOR_ASSIGN_GLSL = /* glsl */ `
 }
 `;
 
+
+/**
+ * The dissolve, shared with the baked crowd's rig for exactly the same reason:
+ * the population changes while the player is looking at it, so nobody may be
+ * switched on or off at full opacity. `iExtra.z` was one of two spare floats
+ * in a buffer that already existed. See `PedestrianRig.ts` for why a stipple
+ * rather than alpha blending.
+ */
+const FADE_VERTEX_GLSL = /* glsl */ `
+varying float vPedFade;
+`;
+
+const FADE_FRAGMENT_GLSL = /* glsl */ `
+varying float vPedFade;
+float mbFadeNoise(vec2 c) {
+  return fract(52.9829189 * fract(dot(c, vec2(0.06711056, 0.00583715))));
+}
+`;
+
+const FADE_TEST_GLSL = /* glsl */ `
+  if (vPedFade < 0.996 && mbFadeNoise(gl_FragCoord.xy) > vPedFade) discard;
+`;
+
 function injectVertex(source: string, withColor: boolean): string {
   let out = source.replace(
     '#include <common>',
-    `#include <common>\n${withColor ? COLOR_GLSL : ''}${POSE_GLSL}`,
+    `#include <common>\n${withColor ? COLOR_GLSL : ''}${FADE_VERTEX_GLSL}${POSE_GLSL}`,
   );
   if (withColor) {
     out = out.replace(
@@ -519,7 +542,7 @@ function injectVertex(source: string, withColor: boolean): string {
   }
   return out.replace(
     '#include <begin_vertex>',
-    `#include <begin_vertex>\ntransformed = mbPose(transformed, false);${
+    `#include <begin_vertex>\ntransformed = mbPose(transformed, false);\nvPedFade = iExtra.z;${
       withColor ? COLOR_ASSIGN_GLSL : ''
     }`,
   );
@@ -540,14 +563,18 @@ export function createProcPedestrianMaterials(): ProcPedestrianMaterials {
   material.onBeforeCompile = (shader) => {
     shader.vertexShader = injectVertex(shader.vertexShader, true);
     shader.fragmentShader = shader.fragmentShader
-      .replace('#include <common>', `#include <common>\n${COLOR_GLSL}`)
+      .replace('#include <common>', `#include <common>\n${COLOR_GLSL}${FADE_FRAGMENT_GLSL}`)
+      .replace(
+        '#include <clipping_planes_fragment>',
+        `#include <clipping_planes_fragment>${FADE_TEST_GLSL}`,
+      )
       .replace('#include <color_fragment>', '#include <color_fragment>\ndiffuseColor.rgb *= vPedColor;')
       .replace(
         '#include <roughnessmap_fragment>',
         '#include <roughnessmap_fragment>\nroughnessFactor = vPedRough;',
       );
   };
-  material.customProgramCacheKey = (): string => 'meridian-pedestrian-proc-v1';
+  material.customProgramCacheKey = (): string => 'meridian-pedestrian-proc-v2';
 
   // The shadow pass uses its own program. Without the same displacement here
   // the crowd would cast the shadow of an unanimated bind pose, which is the
@@ -556,8 +583,14 @@ export function createProcPedestrianMaterials(): ProcPedestrianMaterials {
   depth.name = 'pedestrianDepth';
   depth.onBeforeCompile = (shader) => {
     shader.vertexShader = injectVertex(shader.vertexShader, false);
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>\n${FADE_FRAGMENT_GLSL}`)
+      .replace(
+        '#include <clipping_planes_fragment>',
+        `#include <clipping_planes_fragment>${FADE_TEST_GLSL}`,
+      );
   };
-  depth.customProgramCacheKey = (): string => 'meridian-pedestrian-proc-depth-v1';
+  depth.customProgramCacheKey = (): string => 'meridian-pedestrian-proc-depth-v2';
 
   return { material, depth };
 }

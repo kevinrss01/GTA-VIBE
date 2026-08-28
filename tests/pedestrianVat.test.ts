@@ -12,9 +12,24 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
-import { VatClip } from '../src/agents/PedestrianVat';
+import {
+  AIRPORT_VAT_IDS,
+  CITY_ROSTER_BUDGET,
+  CITY_VAT_IDS,
+  MAX_WALK_SLIP,
+  TERMINAL_ROSTER_BUDGET,
+  TERMINAL_VAT_IDS,
+  VAT_STATURE,
+  VatClip,
+} from '../src/agents/PedestrianVat';
 
-const IDS = ['ped-a', 'ped-b', 'ped-c', 'ped-d'] as const;
+/**
+ * Every character the game ships, taken from the rosters themselves rather
+ * than restated here - so a character added to a roster is covered by all of
+ * the assertions below on the same commit, and a character removed from one
+ * stops being asserted rather than failing to open.
+ */
+const IDS = [...new Set([...CITY_VAT_IDS, ...AIRPORT_VAT_IDS])] as const;
 
 /**
  * How close to its own lowest point a sole vertex has to be to count as
@@ -172,9 +187,17 @@ describe.each(IDS)('baked character %s', (id) => {
       expect(phase).toBeGreaterThanOrEqual(previous);
       previous = phase;
     }
-    // One whole cycle of distance returns to the start of the clip.
-    expect(walk.phaseFor(walk.travelPerCycle)).toBeCloseTo(0, 6);
-    expect(walk.phaseFor(walk.travelPerCycle * 3)).toBeCloseTo(0, 6);
+    /*
+     * One whole cycle of distance returns to the start of the clip - and the
+     * comparison has to be CYCLIC, because the phase is. `3 * a / a` is not
+     * exactly 3 for every `travelPerCycle` a bake can carry (`ped-f`'s 1.5778
+     * is one that it is not), so the answer legitimately lands a rounding
+     * error BELOW one rather than at zero. Those are the same pose; a linear
+     * `toBeCloseTo(0)` calls one of them a whole cycle wrong.
+     */
+    const fromStart = (phase: number): number => Math.min(phase, 1 - phase);
+    expect(fromStart(walk.phaseFor(walk.travelPerCycle))).toBeCloseTo(0, 6);
+    expect(fromStart(walk.phaseFor(walk.travelPerCycle * 3))).toBeCloseTo(0, 6);
     // A negative distance is still a valid phase, not NaN.
     expect(Number.isFinite(walk.phaseFor(-walk.travelPerCycle * 0.3))).toBe(true);
   });
@@ -291,5 +314,82 @@ describe.each(IDS)('baked character %s', (id) => {
     // The wrap column is a copy of the first frame, so this is exact bar the
     // half-float rounding.
     expect(worst).toBeLessThan(0.002);
+  });
+});
+
+/**
+ * The rosters, which are a RENDERING BUDGET as much as a cast list: each id a
+ * system is given costs it one colour draw call and one shadow draw call, so a
+ * single shared list of eleven characters would have cost the downtown street
+ * twenty-two calls for people it never shows.
+ */
+describe('the rosters', () => {
+  it('keeps each system inside its stated draw-call budget', () => {
+    expect(CITY_VAT_IDS.length).toBeLessThanOrEqual(CITY_ROSTER_BUDGET);
+    expect(TERMINAL_VAT_IDS.length).toBeLessThanOrEqual(TERMINAL_ROSTER_BUDGET);
+    // A budget that is not doing anything is not a budget.
+    expect(AIRPORT_VAT_IDS.length).toBeGreaterThan(0);
+    expect(CITY_VAT_IDS.length).toBeGreaterThan(0);
+    expect(TERMINAL_VAT_IDS.length).toBeGreaterThan(0);
+  });
+
+  it('gives the airport its own cast rather than the street crowd cast', () => {
+    // The whole point of two lists. If the terminal ever falls back to the
+    // city's characters it is because the airport roster is short, not because
+    // the split stopped working.
+    for (const id of AIRPORT_VAT_IDS.slice(0, TERMINAL_ROSTER_BUDGET)) {
+      expect(TERMINAL_VAT_IDS).toContain(id);
+    }
+    expect(new Set(TERMINAL_VAT_IDS).size).toBe(TERMINAL_VAT_IDS.length);
+    expect(new Set(CITY_VAT_IDS).size).toBe(CITY_VAT_IDS.length);
+  });
+
+  it('ships a file for every id on every roster', () => {
+    for (const id of [...CITY_VAT_IDS, ...AIRPORT_VAT_IDS]) {
+      const meta = JSON.parse(readFileSync(`${BASE}/${id}.json`, 'utf8')) as Meta;
+      expect(meta.id, `${id}.json disagrees about its own id`).toBe(id);
+      expect(meta.version).toBe(1);
+    }
+  });
+
+  it('keeps every roster character inside the foot-slide gate', () => {
+    // `loadPedestrianVat` REFUSES a bake over this, so a character that failed
+    // here would silently leave the crowd a face short in the browser.
+    for (const id of [...CITY_VAT_IDS, ...AIRPORT_VAT_IDS]) {
+      const meta = JSON.parse(readFileSync(`${BASE}/${id}.json`, 'utf8')) as Meta;
+      const walk = meta.clips.find((clip) => clip.name === 'walk');
+      expect(walk, `${id} has no walk`).toBeTruthy();
+      expect(
+        (walk as Clip).slip,
+        `${id} slides ${(walk as Clip).slip.toFixed(3)} rig units`,
+      ).toBeLessThanOrEqual(MAX_WALK_SLIP);
+    }
+  });
+
+  it('gives the airport cast a hand to carry a bag with', () => {
+    // The four street characters were baked before the tool recorded a hand
+    // track; the airport ones were not, which is what lets a holdall hang off
+    // the hand that is holding it. Read straight out of the shipped files.
+    for (const id of AIRPORT_VAT_IDS) {
+      const raw = JSON.parse(readFileSync(`${BASE}/${id}.json`, 'utf8')) as {
+        clips: { name: string; hand?: unknown }[];
+      };
+      const walk = raw.clips.find((clip) => clip.name === 'walk');
+      expect(walk?.hand, `${id} carries no hand track`).toBeTruthy();
+    }
+  });
+
+  it('states a plausible stature for every airport character', () => {
+    for (const id of AIRPORT_VAT_IDS) {
+      const stature = VAT_STATURE[id];
+      expect(stature, `${id} has no stature`).toBeGreaterThan(0);
+      // Inside the crowd's own 1.54-1.92 m band: the roster correlates height
+      // with the mesh, it does not widen the range.
+      expect(stature).toBeGreaterThanOrEqual(1.54);
+      expect(stature as number).toBeLessThanOrEqual(1.92);
+    }
+    // And they are not all the same person.
+    const spread = AIRPORT_VAT_IDS.map((id) => VAT_STATURE[id] ?? 0);
+    expect(Math.max(...spread) - Math.min(...spread)).toBeGreaterThan(0.2);
   });
 });

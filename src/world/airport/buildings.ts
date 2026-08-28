@@ -24,7 +24,7 @@
  * end of the runway.
  */
 
-import { BoxGeometry, BufferGeometry, CylinderGeometry } from 'three';
+import { BoxGeometry, BufferGeometry, CylinderGeometry, PlaneGeometry } from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
 import type { MaterialKey } from '../../render/materials';
@@ -72,6 +72,26 @@ export class WorldBatch {
     if (w < 1e-4 || h < 1e-4 || d < 1e-4) return;
     const geometry = new BoxGeometry(w, h, d);
     geometry.translate((minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2);
+    this.add(key, geometry);
+  }
+
+  /**
+   * A single upward-facing quad at `y`, two triangles.
+   *
+   * The floor of the terminal is laid as a mosaic of these - see the floor
+   * note in `terminal.ts` - and a mosaic of boxes would be six times the
+   * triangles for five faces that are buried inside the plinth. Nothing here
+   * needs a bottom or sides, so nothing here has them.
+   */
+  top(key: MaterialKey, minX: number, minZ: number, maxX: number, maxZ: number, y: number): void {
+    const w = maxX - minX;
+    const d = maxZ - minZ;
+    if (w < 1e-4 || d < 1e-4) return;
+    const geometry = new PlaneGeometry(w, d);
+    // PlaneGeometry faces +Z; -90 degrees about X turns it face-up, and its
+    // own +Y axis then runs toward -Z, which is why the translate is plain.
+    geometry.rotateX(-Math.PI / 2);
+    geometry.translate((minX + maxX) / 2, y, (minZ + maxZ) / 2);
     this.add(key, geometry);
   }
 
@@ -243,8 +263,30 @@ export function buildTerminalShell(sink: GeometrySink): void {
   const base = TERMINAL_FLOOR - 0.7;
   const w = TERMINAL_WALL;
 
-  // Plinth: the slab the building stands on, carried down past the platform.
-  batch.box('concrete', TERMINAL.minX - 0.6, base - 0.5, TERMINAL.minZ - 0.6, TERMINAL.maxX + 0.6, TERMINAL_FLOOR, TERMINAL.maxZ + 0.6);
+  /*
+   * Plinth: the step the building stands on, carried down past the platform.
+   *
+   * An APRON RATHER THAN A SLAB, and the reason is a defect this shape fixes.
+   * Emitted as one box it had a top face at exactly `TERMINAL_FLOOR` under the
+   * whole 62 by 190 m footprint - and `terminal.ts` lays the interior floor at
+   * exactly `TERMINAL_FLOOR` too, entirely inside it. Two coplanar, fully
+   * overlapping top faces mean the depth test has nothing to choose between,
+   * so the floor rendered as flickering bands that moved with the camera.
+   *
+   * The four boxes below cover only the ring the plinth is actually visible
+   * in: from 0.6 m outside the walls to the inner wall face, which is where
+   * the interior floor picks the surface up. The two surfaces meet edge to
+   * edge at `INNER` and never share a pixel. The collider is unchanged - it is
+   * one non-solid box over the whole footprint, because that is what makes the
+   * building walkable, and colliders have no depth test to lose.
+   */
+  const plinthTop = TERMINAL_FLOOR;
+  const plinthBottom = base - 0.5;
+  const inner = { minX: TERMINAL.minX + w, maxX: TERMINAL.maxX - w, minZ: TERMINAL.minZ + w, maxZ: TERMINAL.maxZ - w };
+  batch.box('concrete', TERMINAL.minX - 0.6, plinthBottom, TERMINAL.minZ - 0.6, TERMINAL.maxX + 0.6, plinthTop, inner.minZ);
+  batch.box('concrete', TERMINAL.minX - 0.6, plinthBottom, inner.maxZ, TERMINAL.maxX + 0.6, plinthTop, TERMINAL.maxZ + 0.6);
+  batch.box('concrete', TERMINAL.minX - 0.6, plinthBottom, inner.minZ, inner.minX, plinthTop, inner.maxZ);
+  batch.box('concrete', inner.maxX, plinthBottom, inner.minZ, TERMINAL.maxX + 0.6, plinthTop, inner.maxZ);
   sink.collider({
     minX: TERMINAL.minX - 0.6,
     maxX: TERMINAL.maxX + 0.6,
@@ -257,9 +299,12 @@ export function buildTerminalShell(sink: GeometrySink): void {
   });
 
   // Four walls, cut for their doors.
+  // The side walls run between the inner faces of the two end walls. Run to
+  // the corners they overlapped them, and two wall tops in the same plane over
+  // the same 0.5 m square is the coplanar defect the surface tests sweep for.
   terminalWall(batch, sink, 'north', TERMINAL.minX, TERMINAL.maxX, TERMINAL.minZ, TERMINAL.minZ + w, () => terminalRoof(TERMINAL.minZ));
-  terminalWall(batch, sink, 'west', TERMINAL.minZ, TERMINAL.maxZ, TERMINAL.minX, TERMINAL.minX + w, terminalRoof);
-  terminalWall(batch, sink, 'east', TERMINAL.minZ, TERMINAL.maxZ, TERMINAL.maxX - w, TERMINAL.maxX, terminalRoof);
+  terminalWall(batch, sink, 'west', TERMINAL.minZ + w, TERMINAL.maxZ - w, TERMINAL.minX, TERMINAL.minX + w, terminalRoof);
+  terminalWall(batch, sink, 'east', TERMINAL.minZ + w, TERMINAL.maxZ - w, TERMINAL.maxX - w, TERMINAL.maxX, terminalRoof);
   // South gable: baggage hall, no openings.
   batch.box('concreteBoard', TERMINAL.minX, base, TERMINAL.maxZ - w, TERMINAL.maxX, TERMINAL_FLOOR + TERMINAL_EAVES, TERMINAL.maxZ);
   solid(sink, TERMINAL.minX, TERMINAL.maxZ - w, TERMINAL.maxX, TERMINAL.maxZ, base, TERMINAL_FLOOR + TERMINAL_EAVES, 'concreteBoard');
@@ -277,29 +322,50 @@ export function buildTerminalShell(sink: GeometrySink): void {
 
   // Mullions, so the glazing has a grain instead of reading as a sheet.
   for (let x = TERMINAL.minX + 2; x <= TERMINAL.maxX - 2; x += 3.5) {
-    batch.box('windowFrame', x - 0.09, TERMINAL_FLOOR + 4.0, TERMINAL.minZ - 0.1, x + 0.09, TERMINAL_FLOOR + TERMINAL_HALL_EAVES - 1.4, TERMINAL.minZ + 0.1);
+    // 0.06 m past the head of the glass, so the two tops are not in one plane.
+    batch.box('windowFrame', x - 0.09, TERMINAL_FLOOR + 4.0, TERMINAL.minZ - 0.1, x + 0.09, TERMINAL_FLOOR + TERMINAL_HALL_EAVES - 1.34, TERMINAL.minZ + 0.1);
   }
   for (let z = TERMINAL.minZ + 3; z <= TERMINAL.maxZ - 12; z += 3.5) {
     const low = z < TERMINAL_HALL_Z ? 4.0 : 3.4;
     const high = (z < TERMINAL_HALL_Z ? TERMINAL_HALL_EAVES : TERMINAL_EAVES) - 1.5;
-    batch.box('windowFrame', TERMINAL.minX - 0.1, TERMINAL_FLOOR + low, z - 0.09, TERMINAL.minX + 0.1, TERMINAL_FLOOR + high, z + 0.09);
-    batch.box('windowFrame', TERMINAL.maxX - 0.1, TERMINAL_FLOOR + 3.6, z - 0.09, TERMINAL.maxX + 0.1, TERMINAL_FLOOR + TERMINAL_EAVES - 1.1, z + 0.09);
+    batch.box('windowFrame', TERMINAL.minX - 0.1, TERMINAL_FLOOR + low, z - 0.09, TERMINAL.minX + 0.1, TERMINAL_FLOOR + high + 0.06, z + 0.09);
+    batch.box('windowFrame', TERMINAL.maxX - 0.1, TERMINAL_FLOOR + 3.6, z - 0.09, TERMINAL.maxX + 0.1, TERMINAL_FLOOR + TERMINAL_EAVES - 0.94, z + 0.09);
   }
 
-  // Roof: two slabs at the two eaves heights, each with a parapet.
+  /*
+   * Roof: two slabs at the two eaves heights, each with a parapet.
+   *
+   * The parapet is a RING of four upstands rather than a second slab over the
+   * first. Drawn as a slab it covered the whole roof deck, so the tar surface
+   * under it was never visible from the tower or from an aircraft on approach
+   * and the building read as a concrete lid - and its underside sat 0.35 m
+   * above the deck it was hiding, which is inside the depth budget at the
+   * range the roof is actually seen from.
+   */
   const roofSlab = (minZ: number, maxZ: number, height: number): void => {
-    batch.box('roofTar', TERMINAL.minX, TERMINAL_FLOOR + height, minZ, TERMINAL.maxX, TERMINAL_FLOOR + height + 0.35, maxZ);
-    batch.box('concrete', TERMINAL.minX - 0.35, TERMINAL_FLOOR + height + 0.35, minZ - 0.35, TERMINAL.maxX + 0.35, TERMINAL_FLOOR + height + 1.05, maxZ + 0.35);
+    const deck = TERMINAL_FLOOR + height;
+    // The deck stops at the inner face of the parapet, so the two abut rather
+    // than overlap: no shared face anywhere, at any height.
+    batch.box('roofTar', TERMINAL.minX + 0.35, deck, minZ + 0.35, TERMINAL.maxX - 0.35, deck + 0.35, maxZ - 0.35);
+    const capTop = deck + 1.05;
+    batch.box('concrete', TERMINAL.minX - 0.35, deck, minZ - 0.35, TERMINAL.minX + 0.35, capTop, maxZ + 0.35);
+    batch.box('concrete', TERMINAL.maxX - 0.35, deck, minZ - 0.35, TERMINAL.maxX + 0.35, capTop, maxZ + 0.35);
+    batch.box('concrete', TERMINAL.minX + 0.35, deck, minZ - 0.35, TERMINAL.maxX - 0.35, capTop, minZ + 0.35);
+    batch.box('concrete', TERMINAL.minX + 0.35, deck, maxZ - 0.35, TERMINAL.maxX - 0.35, capTop, maxZ + 0.35);
   };
   roofSlab(TERMINAL.minZ, TERMINAL_HALL_Z, TERMINAL_HALL_EAVES);
   roofSlab(TERMINAL_HALL_Z, TERMINAL.maxZ, TERMINAL_EAVES);
 
-  // Entrance canopy over the forecourt doors, on round columns.
+  // Entrance canopy over the forecourt doors, on round columns. The columns
+  // stand on the forecourt, which is the platform, not on the terminal floor.
   const canopyZ = TERMINAL.minZ - 7;
+  const kerb = AIRFIELD_LEVEL;
   batch.box('metalLight', TERMINAL.minX + 4, TERMINAL_FLOOR + 5.2, canopyZ, TERMINAL.maxX - 4, TERMINAL_FLOOR + 5.6, TERMINAL.minZ);
+  // Fascia along the canopy's outer edge, which is what a canopy reads by.
+  batch.box('metalDark', TERMINAL.minX + 4, TERMINAL_FLOOR + 4.5, canopyZ - 0.12, TERMINAL.maxX - 4, TERMINAL_FLOOR + 5.2, canopyZ + 0.12);
   for (let x = TERMINAL.minX + 8; x <= TERMINAL.maxX - 8; x += 11) {
-    batch.cylinder('metalLight', x, canopyZ + 1.2, 0.22, 0.26, TERMINAL_FLOOR, 5.2, 10);
-    solid(sink, x - 0.3, canopyZ + 0.9, x + 0.3, canopyZ + 1.5, TERMINAL_FLOOR, TERMINAL_FLOOR + 5.2, 'metalLight');
+    batch.cylinder('metalLight', x, canopyZ + 1.2, 0.22, 0.26, kerb, TERMINAL_FLOOR + 5.2 - kerb, 10);
+    solid(sink, x - 0.3, canopyZ + 0.9, x + 0.3, canopyZ + 1.5, kerb, TERMINAL_FLOOR + 5.2, 'metalLight');
   }
 
   // Roof plant, which is what stops a 190 m roof reading as a lid.
@@ -348,8 +414,13 @@ export function buildTower(sink: GeometrySink): void {
   // Mullions round the cab.
   for (let i = 0; i < 4; i += 1) {
     const t = -cabHalf + 0.2 + ((cabHalf - 0.2) * 2 * i) / 3;
-    batch.box('metalDark', TOWER.x + t - 0.07, cabBase + 0.9, TOWER.z - cabHalf, TOWER.x + t + 0.07, cabBase + 4.3, TOWER.z + cabHalf);
-    batch.box('metalDark', TOWER.x - cabHalf, cabBase + 0.9, TOWER.z + t - 0.07, TOWER.x + cabHalf, cabBase + 4.3, TOWER.z + t + 0.07);
+    // Carried 0.3 m INTO the capping roof. Stopped at the glazing head they
+    // shared its plane over their whole width, which is the coplanar-overlap
+    // defect `tests/terminalSurfaces` sweeps the airport for.
+    batch.box('metalDark', TOWER.x + t - 0.07, cabBase + 0.9, TOWER.z - cabHalf, TOWER.x + t + 0.07, cabBase + 4.6, TOWER.z + cabHalf);
+    // 0.1 m short of the ones running the other way, so the four crossings are
+    // not four pairs of coplanar squares.
+    batch.box('metalDark', TOWER.x - cabHalf, cabBase + 0.9, TOWER.z + t - 0.07, TOWER.x + cabHalf, cabBase + 4.5, TOWER.z + t + 0.07);
   }
   // Mast and its obstruction light.
   batch.cylinder('metalLight', TOWER.x, TOWER.z, 0.09, 0.14, cabBase + 5.1, 6.5, 6);
@@ -378,11 +449,13 @@ export function buildHangars(sink: GeometrySink): void {
       batch.box('corrugated', minX, base, minZ, maxX, eaves, maxZ);
       solid(sink, minX, minZ, maxX, maxZ, base, eaves, 'corrugated');
     };
+    // The two long walls stop at the inner face of the end walls, so no two
+    // of them share a top face over the same corner.
     wall(hangar.minX, hangar.minZ, hangar.minX + 0.4, hangar.maxZ);
-    wall(hangar.minX, hangar.minZ, hangar.maxX, hangar.minZ + 0.4);
-    wall(hangar.minX, hangar.maxZ - 0.4, hangar.maxX, hangar.maxZ);
-    wall(hangar.maxX - 0.4, hangar.minZ, hangar.maxX, door.minZ);
-    wall(hangar.maxX - 0.4, door.maxZ, hangar.maxX, hangar.maxZ);
+    wall(hangar.minX + 0.4, hangar.minZ, hangar.maxX, hangar.minZ + 0.4);
+    wall(hangar.minX + 0.4, hangar.maxZ - 0.4, hangar.maxX, hangar.maxZ);
+    wall(hangar.maxX - 0.4, hangar.minZ + 0.4, hangar.maxX, door.minZ);
+    wall(hangar.maxX - 0.4, door.maxZ, hangar.maxX, hangar.maxZ - 0.4);
 
     // Sliding door leaves, parked half open, with the head beam over them.
     batch.box('paintedMetal', hangar.maxX - 0.42, base, door.minZ, hangar.maxX - 0.1, base + 9.6, door.minZ + 5.5);
@@ -553,11 +626,33 @@ export function buildAirfieldLighting(sink: GeometrySink): void {
       fitting('signalLens', TAXIWAY.centreX + side * (TAXIWAY.halfWidth + 1.2), z, 0.22, 0.28);
     }
   }
+  /*
+   * PAPI, one box per threshold, west of the runway.
+   *
+   * Four units in a row abeam a point 200 m in from the threshold, which is
+   * where a precision approach path indicator goes on a runway this short. It
+   * is four boxes and it is the single clearest signal that the strip of
+   * concrete is a runway rather than a road: nothing else on an airfield is a
+   * row of four lights at right angles to the pavement.
+   */
+  for (const [z, into] of [
+    [RUNWAY.northZ, 1],
+    [RUNWAY.southZ, -1],
+  ] as const) {
+    const at = z + into * 200;
+    for (let k = 0; k < 4; k += 1) {
+      const x = RUNWAY.centreX - RUNWAY.halfWidth - 12 - k * 6;
+      batch.box('metalDark', x - 0.7, y, at - 0.5, x + 0.7, y + 0.42, at + 0.5);
+      batch.box('signalLens', x - 0.5, y + 0.42, at - 0.34, x + 0.5, y + 0.62, at + 0.34);
+    }
+  }
+
   // Apron floodlight masts: a real light source would be eight more point
   // lights, so these are masts with emissive heads and nothing else.
   for (let z = APRON.minZ + 40; z < APRON.maxZ; z += 80) {
     const x = APRON.maxX - 3;
-    batch.cylinder('metalDark', x, z, 0.16, 0.24, y, 16, 8);
+    // The mast stops inside the head rather than flush with its top face.
+    batch.cylinder('metalDark', x, z, 0.16, 0.24, y, 15.7, 8);
     batch.box('signEmissiveWarm', x - 1.1, y + 15.4, z - 0.4, x + 1.1, y + 16, z + 0.4);
   }
 
@@ -598,12 +693,29 @@ export function buildAirportSignage(sink: GeometrySink): void {
   for (const z of TAXIWAY_LINKS) {
     const base = AIRFIELD_LEVEL;
     signBoard(batch, RUNWAY.centreX - RUNWAY.halfWidth - 18, z - TAXIWAY.halfWidth - 2.5, 1.5, 0.12, base, 0.4, 0.9, 'signEmissiveWarm');
-    signBoard(batch, TAXIWAY.centreX + TAXIWAY.halfWidth + 2.5, z, 0.12, 1.5, base, 0.4, 0.9, 'signEmissive');
+    // Location signs are a yellow legend on black. `signEmissive` is the
+    // palette's magenta, authored for the nightclub, and it read as one.
+    signBoard(batch, TAXIWAY.centreX + TAXIWAY.halfWidth + 2.5, z, 0.12, 1.5, base, 0.4, 0.9, 'lampGlass');
   }
 
-  // The airport's own sign, on the forecourt side of the terminal canopy.
+  /*
+   * The airport's own name, on the frontage.
+   *
+   * RESIZED. It was one 18 by 3.2 m board on legs 16 m out from the doors,
+   * which from anywhere on the forecourt was a cream rectangle across the
+   * whole building - the sign was reading as the elevation. A terminal
+   * frontage carries its name as a band on the canopy fascia, at the height
+   * of the fascia and a fraction of its length, with a pylon at each end of
+   * the kerb; that is what these are.
+   */
   const base = AIRFIELD_LEVEL;
-  signBoard(batch, 183, TERMINAL.minZ - 16, 9, 0.2, base, 2.4, 3.2, 'signEmissiveWarm');
+  const canopyZ = TERMINAL.minZ - 7;
+  // Set INTO the fascia rather than in front of it: the back of the band is
+  // buried in the fascia solid, so there is no near-coplanar pair to fight.
+  batch.box('signEmissiveWarm', 176, TERMINAL_FLOOR + 4.62, canopyZ - 0.3, 190, TERMINAL_FLOOR + 5.08, canopyZ - 0.05);
+  for (const x of [166, 200]) {
+    signBoard(batch, x, TERMINAL.minZ - 16, 1.7, 0.18, base, 2.6, 1.2, 'signEmissiveWarm');
+  }
 
   // Gate numbers over the airside doors, hung off the terminal's east wall.
   for (const door of TERMINAL_DOORS) {

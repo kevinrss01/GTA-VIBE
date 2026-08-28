@@ -56,6 +56,41 @@
  * is vetted exactly the way `Driving.exit` vets its own: beside a wingtip
  * first, then behind the tail, then - only if the world has nowhere else -
  * where the aircraft is.
+ *
+ * ## Taking the controls
+ *
+ * The key set is a FAITHFUL MIRROR OF THE KEYBOARD, held whether or not this
+ * object currently owns an aeroplane, and `board` does not clear it. That is
+ * not tidiness either; it is the difference between the aeroplane working and
+ * not working. Shift is the game's run key, so the ordinary way a player
+ * arrives at an aeroplane is at a sprint with Shift already down. An earlier
+ * version ignored every keydown while no aircraft was held and then wiped the
+ * set on boarding, so the throttle key the player was ALREADY HOLDING had
+ * never been seen and never would be: full throttle produced nothing at all
+ * until they let go and pressed it again. The same applied to W, S, A, D and
+ * the arrows, which are the walking keys. Control ownership transfers with
+ * the keys as they actually are.
+ *
+ * ## Getting unstuck
+ *
+ * `CollisionWorld` and `AircraftSystem` both answer "is this footprint inside
+ * something solid" with a boolean, and `flight.ts` answers a refusal by
+ * zeroing the refused velocity components. Together those mean an aeroplane
+ * that meets a small immovable object is stopped DEAD and stays stopped: at
+ * rest the nose wheel steers by `along * tan(angle)`, which is zero, and the
+ * rudder's moment is proportional to dynamic pressure, which is also zero, so
+ * it cannot even turn away. That is a soft-locked aeroplane with no feedback,
+ * and it was live: a ground-power cart sits 0.6 m in front of the Light twin's
+ * nose on stand 3, so the twin taxied 0.6 m and stopped for ever.
+ *
+ * Two things answer it. The jam is REPORTED - `state.blocked` and
+ * `state.blockedSeconds`, which the HUD shows - and after `JAM_SECONDS` of
+ * pushing, ground clutter GIVES WAY. Clutter is defined by measurement, not by
+ * a list: the same footprint is re-tested in the band from `CLUTTER_HEIGHT`
+ * above the wheels upward, and the obstruction only yields when that band is
+ * clear, i.e. when everything refusing the aeroplane is shorter than a person.
+ * A wall, a pier, a hangar or another aeroplane never yields, and none of it
+ * applies in the air or above taxi speed.
  */
 
 import type { PerspectiveCamera } from 'three';
@@ -108,6 +143,45 @@ const CAM_BANK = 0.7;
 /** Seconds after a write-off before the player is put out on the ground. */
 const WRECK_EJECT_SECONDS = 2.5;
 
+/**
+ * How long an aeroplane must push against ground clutter before it gives way.
+ *
+ * Long enough that it is never mistaken for a collision response - a wall
+ * still stops the aircraft on the frame it is touched, and stays stopping it -
+ * and short enough that a player who has just applied power sees the aircraft
+ * move rather than concluding the controls are dead.
+ */
+const JAM_SECONDS = 1;
+/**
+ * Ground speed under which a refusal is a jam rather than a crash, m/s.
+ *
+ * A taxi speed. Above it the aircraft is arriving at the obstruction, not
+ * leaning on it, and `flight.ts` should be free to report the impact and break
+ * the airframe exactly as it does today.
+ */
+const JAM_SPEED = 8;
+/**
+ * Height above the wheels below which an obstruction counts as ground clutter.
+ *
+ * Measured against the airport's own props: a ground-power cart is 1.3 m, a
+ * baggage cart 1.6 m, a tug 1.9 m, a bollard 0.6 m. The things that must never
+ * yield are all far taller - air stairs 3.4 m, the fuel bowser 2.9 m, the
+ * terminal, the hangars and the tower - so 2.2 m separates them with a margin
+ * at both ends rather than threading a gap.
+ */
+const CLUTTER_HEIGHT = 2.2;
+
+/**
+ * How long the contextual control panel stays up once the aircraft is rolling.
+ *
+ * It holds indefinitely while the aeroplane is stopped on the ground, which is
+ * exactly when a player is reading it, and fades this many seconds after they
+ * start doing something, which is exactly when they are not.
+ */
+const HINT_HOLD_SECONDS = 7;
+/** Ground speed above which the aircraft counts as under way, m/s. */
+const HINT_IDLE_SPEED = 1.5;
+
 /** Matches `FirstPersonController`; kept local so `src/air` owns no player state. */
 const PLAYER_CLEARANCE = 1.6;
 
@@ -135,6 +209,32 @@ export function flightControlHints(platform: Platform = detectPlatform()): reado
 
 /** Resolved once, like `CONTROL_HINTS`: nobody changes machine mid-flight. */
 export const FLIGHT_CONTROLS: readonly ControlHint[] = flightControlHints();
+
+/**
+ * The subset the in-flight HUD panel shows, with labels written for a corner
+ * of the screen rather than for a settings page.
+ *
+ * The Controls tab keeps all nine and keeps the long wording - it is a
+ * reference and the reader is not flying at the time. The panel is an overlay
+ * competing with the airspeed readout and the vitals bar, and measured at
+ * 844x424 the full list was 187 px tall and reached across into the prompt.
+ * Mouse-look and the gear lever are the two a player discovers without being
+ * told, so they are the two that go.
+ */
+export function flightHudHints(platform: Platform = detectPlatform()): readonly ControlHint[] {
+  const mac = platform === 'mac';
+  return [
+    { keys: 'S / W', action: 'Nose up / down' },
+    { keys: 'A / D', action: 'Roll' },
+    { keys: 'Z / C', action: 'Rudder, steering' },
+    { keys: mac ? '⇧ / ⌃' : 'Shift / Ctrl', action: 'Throttle' },
+    { keys: 'Space', action: 'Brakes' },
+    { keys: 'E', action: 'Get out (stopped)' },
+  ];
+}
+
+/** Resolved once, for the same reason as `FLIGHT_CONTROLS`. */
+export const FLIGHT_HUD_CONTROLS: readonly ControlHint[] = flightHudHints();
 
 /**
  * The slice of the walking player this module touches.
@@ -208,6 +308,28 @@ export interface FlyingState {
   readonly stall: number;
   readonly angleOfAttack: number;
   readonly crashed: boolean;
+  /**
+   * True while the aircraft is being refused by solid geometry on the ground.
+   *
+   * The one thing a pinned aeroplane owes the player is an explanation, so
+   * this is deliberately part of the public state rather than an internal
+   * detail: the HUD reads it, and so does the QA harness.
+   */
+  readonly blocked: boolean;
+  /** How long it has been blocked, seconds. Zero when it is not. */
+  readonly blockedSeconds: number;
+}
+
+/** The contextual control panel, as the HUD wants it. */
+export interface FlightHintState {
+  readonly hints: readonly ControlHint[];
+  /**
+   * True while the panel should stay up regardless of its age: the aeroplane
+   * is stopped on the ground, or it is jammed and the player needs to know why.
+   */
+  readonly hold: boolean;
+  /** A short line about why the aeroplane is not moving, or null. */
+  readonly warning: string | null;
 }
 
 const IDLE_STATE: FlyingState = {
@@ -231,6 +353,8 @@ const IDLE_STATE: FlyingState = {
   stall: 0,
   angleOfAttack: 0,
   crashed: false,
+  blocked: false,
+  blockedSeconds: 0,
 };
 
 export class Flying {
@@ -253,6 +377,18 @@ export class Flying {
   private lookYaw = 0;
   private lookPitch = 0;
   private wreckTimer = 0;
+
+  /** How long the aircraft has been refused by something solid, seconds. */
+  private jamSeconds = 0;
+  /**
+   * Whether ground clutter may give way this frame.
+   *
+   * Read inside `world.blocked`, which is called from deep inside the
+   * integrator and has no other way to know how long the jam has lasted.
+   */
+  private shoving = false;
+  /** Seconds since boarding, for ageing the contextual control panel. */
+  private hintAge = 0;
 
   private camX = 0;
   private camY = 0;
@@ -322,6 +458,8 @@ export class Flying {
       stall: stallFraction(spec, angleOfAttack(flight)),
       angleOfAttack: angleOfAttack(flight),
       crashed: flight.crashed,
+      blocked: this.jamSeconds > 0,
+      blockedSeconds: this.jamSeconds,
     };
   }
 
@@ -330,6 +468,45 @@ export class Flying {
     if (this.handle) return null;
     const found = this.options.aircraft.nearest(x, z);
     return found ? { id: found.id, type: found.type, label: found.spec.label } : null;
+  }
+
+  /**
+   * The line to put under the crosshair while the player is standing here, or
+   * null when there is no aircraft within reach.
+   *
+   * The non-flyable case is why this exists rather than the caller formatting
+   * `candidateAt` itself. Walking up to the airliner used to show nothing and
+   * `E` used to do nothing, which is indistinguishable from a broken key; the
+   * catalogue already carries the reason it cannot be taken, so it is said.
+   */
+  promptAt(x: number, z: number): string | null {
+    if (this.handle) return null;
+    const flyable = this.options.aircraft.nearest(x, z);
+    if (flyable) return `Press E to board the ${flyable.spec.label}`;
+    const grounded = this.options.aircraft.nearest(x, z, false);
+    if (!grounded) return null;
+    const reason = grounded.spec.groundedReason;
+    return reason ? `${grounded.spec.label} — ${reason}` : `${grounded.spec.label} — not flyable`;
+  }
+
+  /**
+   * The contextual control panel, or null when the player is not in anything.
+   *
+   * Computed here rather than in the HUD because everything it depends on -
+   * what is being flown, whether it is stopped, whether it is jammed - lives
+   * here, and because the platform-dependent key LABELS are already resolved
+   * by `flightControlHints`.
+   */
+  get hintState(): FlightHintState | null {
+    const flight = this.flight;
+    if (!flight) return null;
+    const stopped = flight.onGround && groundSpeedOf(flight) < HINT_IDLE_SPEED;
+    const jammed = this.jamSeconds >= JAM_SECONDS * 0.25;
+    return {
+      hints: FLIGHT_HUD_CONTROLS,
+      hold: stopped || jammed || this.hintAge < HINT_HOLD_SECONDS,
+      warning: jammed ? 'Blocked — something solid ahead' : null,
+    };
   }
 
   /**
@@ -392,8 +569,14 @@ export class Flying {
     this.flight = createFlightState(handle.spec, info.x, info.z, info.yaw, info.y);
     this.throttleLever = 0;
     this.gearLever = true;
-    this.gearLatch = false;
+    // Seeded from the keyboard rather than from `false`, so a `G` that is
+    // already down when the player climbs in does not read as a fresh press
+    // and cycle the undercarriage on the first frame.
+    this.gearLatch = this.keys.has('KeyG');
     this.wreckTimer = 0;
+    this.jamSeconds = 0;
+    this.shoving = false;
+    this.hintAge = 0;
     this.lookYaw = 0;
     this.lookPitch = 0;
     this.controls.elevator = 0;
@@ -402,7 +585,8 @@ export class Flying {
     this.controls.throttle = 0;
     this.controls.brakes = true;
     this.controls.gearDown = true;
-    this.keys.clear();
+    // The key set is NOT cleared. See the header: the player arrives holding
+    // the run key, and that key is the throttle.
     this.seatCamera();
     this.options.controller?.setPaused(true);
     return true;
@@ -465,7 +649,10 @@ export class Flying {
     this.handle = null;
     this.spec = null;
     this.flight = null;
-    this.keys.clear();
+    this.jamSeconds = 0;
+    this.shoving = false;
+    // The key set survives, for the same reason `board` does not clear it: it
+    // is what the keyboard is currently doing, not what the aeroplane was.
     this.options.controller?.setPaused(false);
   }
 
@@ -507,6 +694,8 @@ export class Flying {
     advanceFlight(flight, controls, spec, this.world, this.events, dt);
     handle.setPose(this.poseFrom(flight, spec));
 
+    this.trackJam(flight, dt);
+    this.hintAge += dt;
     this.reportEvents(flight, spec);
     this.reportEngine(flight, spec, handle.type);
     this.updateCamera(dt, flight, spec);
@@ -517,6 +706,24 @@ export class Flying {
       // sealed inside a written-off aeroplane would be a soft lock.
       if (this.wreckTimer > WRECK_EJECT_SECONDS && groundSpeedOf(flight) < 4) this.exit(true);
     }
+  }
+
+  /**
+   * Ages the jam, and decides whether clutter may give way on the NEXT frame.
+   *
+   * Deciding here rather than inside `world.blocked` is deliberate: the
+   * closure is called several times per sub-step and must be a pure question
+   * about geometry, so the one piece of history it needs is computed once,
+   * after the step that produced it.
+   */
+  private trackJam(flight: FlightState, dt: number): void {
+    const jammed =
+      this.events.blocked &&
+      flight.onGround &&
+      !flight.crashed &&
+      groundSpeedOf(flight) < JAM_SPEED;
+    this.jamSeconds = jammed ? this.jamSeconds + dt : 0;
+    this.shoving = this.jamSeconds >= JAM_SECONDS;
   }
 
   private copyControls(source: Readonly<FlightControls>): FlightControls {
@@ -632,6 +839,13 @@ export class Flying {
    * Note what is NOT here: `CollisionWorld.setVehicleSource` is owned by
    * `Driving` for the whole game, so aircraft-versus-traffic is out of scope
    * and aircraft-versus-aircraft is answered by `AircraftSystem` instead.
+   *
+   * The clutter waiver at the bottom is the second half of the jam fix
+   * described in the header. It is asked ONLY after `JAM_SECONDS` of pushing,
+   * only about the baked city - another aeroplane is never displaced - and
+   * only when re-testing the same footprint from `CLUTTER_HEIGHT` upward comes
+   * back clear, which is a measurement of the obstruction rather than a guess
+   * about it.
    */
   private readonly world: FlightWorld = {
     groundY: (x: number, z: number): number => this.options.groundY(x, z),
@@ -645,7 +859,23 @@ export class Flying {
       top: number,
     ): boolean => {
       if (
-        this.options.collision.blockedBox(
+        this.options.aircraft.blockedBy(
+          x,
+          z,
+          yaw,
+          halfLength,
+          halfWidth,
+          bottom,
+          top,
+          this.handle?.id ?? -1,
+          this.fromX,
+          this.fromZ,
+        )
+      ) {
+        return true;
+      }
+      if (
+        !this.options.collision.blockedBox(
           x,
           z,
           yaw,
@@ -657,17 +887,19 @@ export class Flying {
           this.fromZ,
         )
       ) {
-        return true;
+        return false;
       }
-      return this.options.aircraft.blockedBy(
+      if (!this.shoving) return true;
+      return this.options.collision.blockedBox(
         x,
         z,
         yaw,
         halfLength,
         halfWidth,
-        bottom,
+        bottom + CLUTTER_HEIGHT,
         top,
-        this.handle?.id ?? -1,
+        this.fromX,
+        this.fromZ,
       );
     },
   };
@@ -743,9 +975,17 @@ export class Flying {
     return false;
   }
 
+  /**
+   * Records the key WHETHER OR NOT an aeroplane is held. See the header: a
+   * player sprints up to the aircraft with Shift down, and Shift is the
+   * throttle - if the press is only recorded while already flying, the key
+   * they are holding when they climb in is invisible for as long as they hold
+   * it. `preventDefault` stays gated, because the page's own use of Space and
+   * the arrows is only wrong while the aeroplane is being flown.
+   */
   private readonly onKeyDown = (event: KeyboardEvent): void => {
-    if (!this.handle) return;
     this.keys.add(event.code);
+    if (!this.handle) return;
     // Arrows and Space scroll the page otherwise, which fights the aeroplane.
     if (event.code.startsWith('Arrow') || event.code === 'Space') event.preventDefault();
   };

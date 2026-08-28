@@ -4,23 +4,24 @@
  * Free of Three.js so the placement arithmetic - which is where an attachment
  * actually goes wrong - can be asserted without a renderer.
  *
- * ## Why luggage is not held in a hand
+ * ## When luggage is held in a hand, and when it is not
  *
- * `PedestrianVat` ships a per-frame HAND TRACK for the two characters that
- * were baked with a `shoot` clip, and `OfficerRig` uses it to put a pistol in
- * an officer's grip. The four civilian bakes have `hand: null` - measured, see
- * `tools/bake-pedestrian-vat.mjs` - so there is no wrist to attach to, and
- * inventing one would put every case a hand's width away from a hand that is
- * somewhere else entirely.
+ * `PedestrianVat` ships a per-frame HAND TRACK where the bake recorded one, and
+ * `OfficerRig` uses it to put a pistol in an officer's grip. The four original
+ * civilian bakes have `hand: null` - measured, see
+ * `tools/bake-pedestrian-vat.mjs` - and the traveller bakes have it, so
+ * `placeLuggage` takes an optional hand and uses it when there is one.
  *
- * A rolling case does not need one. It trails on the floor behind the person
- * at a fixed offset from their body, and the only thing the body's own
- * transform has to contribute is that a wider person's case is further out and
- * a taller person's hand is higher. Both of those fall out of applying the
- * instance matrix to the offset, which is exactly what `OfficerRig` does with
- * the hand track and exactly what `placeLuggage` does here. Skip that step and
- * the case drifts off a tall traveller: the offset is in the CHARACTER's
- * frame, not the world's.
+ * It uses it only for a `hang` piece, which is the only kind actually held. A
+ * rolling case does not need a wrist: it trails on the floor behind the person
+ * at a fixed offset, and a rucksack is strapped to a back. Putting either at
+ * the measured hand would have it bobbing a hand's width every stride, which
+ * is worse than the fixed offset, not better.
+ *
+ * Either way the offset goes through the body's own transform, so a wider
+ * traveller's case swings wider and a taller one's bag hangs higher. Skip that
+ * step and the case drifts off a tall traveller: the offset is in the
+ * CHARACTER's frame, not the world's.
  *
  * ## Units
  *
@@ -61,9 +62,15 @@ export const FRONT_TURNS: Readonly<Record<FrontAxis, number>> = {
   '-x': -Math.PI / 2,
 };
 
-export type LuggageKind = 'suitcase' | 'duffel' | 'trolley';
+export type LuggageKind = 'suitcase' | 'duffel' | 'trolley' | 'backpack' | 'garment-bag';
 
-export const LUGGAGE_KINDS: readonly LuggageKind[] = ['suitcase', 'duffel', 'trolley'];
+export const LUGGAGE_KINDS: readonly LuggageKind[] = [
+  'suitcase',
+  'duffel',
+  'trolley',
+  'backpack',
+  'garment-bag',
+];
 
 /** Where a piece rides relative to its owner, in rig units. */
 export interface CarryOffset {
@@ -91,10 +98,18 @@ export interface LuggageSpec {
   readonly front: FrontAxis;
   readonly offset: CarryOffset;
   /**
-   * `floor` stands the piece on the ground under the grip; `hang` suspends it
-   * from the grip by its own top.
+   * How the piece sits relative to its grip height.
+   *
+   *   `floor`  stands it on the ground under the grip - a rolling case.
+   *   `hang`   suspends it from the grip by its own top, AND follows the
+   *            measured hand when the character has one - a holdall.
+   *   `shoulder` hangs from the grip like `hang` but never follows the hand,
+   *            because it is over a shoulder rather than in a fist.
+   *   `worn`   centres it on the grip - a backpack, which is neither carried
+   *            nor rolled but strapped to a back, so the thing the offset
+   *            describes is the middle of it rather than its top or its base.
    */
-  readonly rest: 'floor' | 'hang';
+  readonly rest: 'floor' | 'hang' | 'shoulder' | 'worn';
   /** Share of luggage-carrying travellers who take this. Normalised at use. */
   readonly share: number;
 }
@@ -123,7 +138,7 @@ export const LUGGAGE_SPECS: Readonly<Record<LuggageKind, LuggageSpec>> = {
     front: '-x',
     offset: { right: 0.24, back: 0.54, grip: 0.47 },
     rest: 'floor',
-    share: 0.56,
+    share: 0.34,
   },
   duffel: {
     url: 'models/airport/duffel.glb',
@@ -132,7 +147,7 @@ export const LUGGAGE_SPECS: Readonly<Record<LuggageKind, LuggageSpec>> = {
     front: '-z',
     offset: { right: 0.29, back: 0.05, grip: 0.46 },
     rest: 'hang',
-    share: 0.34,
+    share: 0.2,
   },
   trolley: {
     url: 'models/airport/trolley.glb',
@@ -143,7 +158,46 @@ export const LUGGAGE_SPECS: Readonly<Record<LuggageKind, LuggageSpec>> = {
     // push bar clears the arm swing rather than passing through it.
     offset: { right: 0, back: -0.72, grip: 0.55 },
     rest: 'floor',
-    share: 0.1,
+    share: 0.08,
+  },
+  /*
+   * 0.875 x 0.998 x 0.703 normalised, standing on +Y with a centre pivot and
+   * facing -Z, the same convention as the three above and as the workstream
+   * that staged it reported. Real day packs are 0.45 to 0.55 m tall.
+   *
+   * `worn` rather than `hang`: a rucksack is strapped to a back, so what the
+   * offset describes is the middle of it, and it must NOT follow the measured
+   * hand - a pack that bobs a hand's width every stride is worse than one at a
+   * fixed offset.
+   */
+  backpack: {
+    url: 'models/airport/backpack.glb',
+    fit: 'y',
+    metres: 0.5,
+    front: '-z',
+    // Against the back, centred on the shoulder blades: 0.68 of a 1.73 m
+    // person is 1.18 m, so the pack spans roughly 0.93 to 1.43 m.
+    offset: { right: 0, back: 0.2, grip: 0.68 },
+    rest: 'worn',
+    share: 0.26,
+  },
+  /*
+   * 0.382 x 0.998 x 0.425 normalised, with 983 of its 1441 vertices in the top
+   * half: the bulk is the shoulder end, which is what a garment bag looks
+   * like. Carried over a shoulder rather than swinging from a hand, because a
+   * 0.9 m bag hanging from a hand at hip height reaches through the floor -
+   * which is why its `grip` is a shoulder height and not a wrist one.
+   */
+  'garment-bag': {
+    url: 'models/airport/garment-bag.glb',
+    fit: 'y',
+    metres: 0.9,
+    front: '-z',
+    // Over the shoulder: 0.80 of height is 1.38 m on a 1.73 m person, so the
+    // bag hangs from there down to about knee height.
+    offset: { right: 0.22, back: 0.1, grip: 0.8 },
+    rest: 'shoulder',
+    share: 0.12,
   },
 };
 
@@ -168,6 +222,16 @@ export interface PropPlacement {
 }
 
 /**
+ * A hand, in the rig's own frame: `x` right, `y` up as a fraction of body
+ * height, `z` back. Exactly what `VatClip.handAt` writes.
+ */
+export interface HandPoint {
+  readonly x: number;
+  readonly y: number;
+  readonly z: number;
+}
+
+/**
  * Where one piece of luggage goes this frame.
  *
  * The offset is carried through the SAME transform the instance matrix applies
@@ -184,18 +248,39 @@ export function placeLuggage(
   floorY: number,
   modelHeight: number,
   out: PropPlacement,
+  hand?: HandPoint | null,
 ): void {
   const c = Math.cos(carrier.heading);
   const s = Math.sin(carrier.heading);
-  const right = spec.offset.right;
-  const back = spec.offset.back;
+  /*
+   * A HELD bag follows the hand that is holding it, when the bake measured one.
+   *
+   * `VatClip.handAt` reports the right hand per frame in the same rig frame
+   * these offsets are written in, so it drops straight in: x is right, z is
+   * back, y is the fraction of the body's height. `ped-e` is the first
+   * traveller baked with the track, and it is the difference between a holdall
+   * that swings with the arm and one welded to a hip.
+   *
+   * Only `hang` pieces use it. A towed spinner's position is decided by the
+   * floor and by staying out from under the walker's heels, and a rucksack's
+   * by the back it is strapped to; putting either at the wrist would have them
+   * bobbing a hand's width every stride.
+   */
+  const held = hand != null && spec.rest === 'hang';
+  const right = held ? (hand as HandPoint).x : spec.offset.right;
+  const back = held ? (hand as HandPoint).z : spec.offset.back;
   // Columns 0 and 2 of the body's instance matrix, applied to (right, _, back).
   out.x = carrier.x + carrier.girth * (c * right + s * back);
   out.z = carrier.z + carrier.girth * (-s * right + c * back);
+  const grip =
+    floorY + carrier.height * (held ? (hand as HandPoint).y : spec.offset.grip);
   if (spec.rest === 'floor') {
     out.y = floorY;
+  } else if (spec.rest === 'worn') {
+    // Centred on the grip: the model's pivot is at its base, so half its own
+    // height comes off. Never below the floor, whatever height it is given.
+    out.y = Math.max(floorY, grip - modelHeight * 0.5);
   } else {
-    const grip = floorY + carrier.height * spec.offset.grip;
     // Never below the floor, whatever height the caller hands us.
     out.y = Math.max(floorY, grip - HANG_GAP - modelHeight);
   }

@@ -98,7 +98,14 @@ async function boot(): Promise<void> {
 
   const player = new PlayerState();
   const worldRays = new WorldRayIndex(sink.colliders);
-  const civilians = new CrowdTargets(pedestrians.group);
+  // Wired exactly as `main.ts` wires it: a lethal hit is forwarded to the
+  // crowd with the round's CONTACT POINT and direction of travel, so the right
+  // person goes down the right way and stays down.
+  const civilians = new CrowdTargets(pedestrians.group, {
+    removeAt: (x: number, y: number, z: number, dirX?: number, dirZ?: number) => {
+      pedestrians.downAt(x, y, z, undefined, dirX, dirZ);
+    },
+  });
 
   const police = new PoliceSystem({
     player,
@@ -133,8 +140,10 @@ async function boot(): Promise<void> {
     player,
     spawn: plan.spawn,
     teleport: (x, z, heading) => controller.teleport(x, z, heading),
-    isDriving: () => driving.driving,
-    exitVehicle: () => driving.exit(),
+    // Every seat the player can be in. This harness has no flight layer; the
+    // game does, and `main.ts` has to list it here too or a player killed in
+    // the air is respawned still nominally flying. See `RespawnDirector`.
+    mounts: [{ occupied: () => driving.driving, exit: () => driving.exit() }],
     setPaused: (paused) => controller.setPaused(paused),
     onBanner: (title, detail) => hud.setBanner(title, detail),
     onBust: () => {

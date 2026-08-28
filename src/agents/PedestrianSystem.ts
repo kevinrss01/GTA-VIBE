@@ -77,20 +77,28 @@ import type { CityPlan } from '../world/CityPlan';
 import type { ColliderBox } from '../world/build/types';
 import { hash2 } from '../core/rng';
 import {
+  ALARM_RADIUS,
+  CASUALTY_CLEAR,
+  CASUALTY_LIMIT,
+  CASUALTY_TIME,
   Crowd,
   RENDER_RADIUS,
+  type CasualtyOptions,
   type CrowdContext,
   type CrowdVehicle,
   type PedestrianImpact,
 } from './crowd';
 import { ObstacleIndex } from './obstacles';
 import { buildPavementGraph, type PavementGraph } from './pavement';
+import { PEDESTRIAN_ZONES } from './travellers/zones';
 import { hipAmplitude } from './gait';
 import { createProcPedestrianMesh, type ProcPedestrianMeshBundle } from './PedestrianProcRig';
 import { createPedestrianVatMesh, type PedestrianVatBundle } from './PedestrianRig';
 import {
+  CITY_ROSTER_BUDGET,
+  CITY_VAT_IDS,
+  IDLE_MIN_PERIOD,
   loadPedestrianVat,
-  PEDESTRIAN_VAT_IDS,
   type PedestrianVatCharacter,
 } from './PedestrianVat';
 
@@ -105,9 +113,24 @@ export interface PedestrianSystemOptions {
   readonly obstacles?: readonly ColliderBox[] | undefined;
   /** Overrides the quality level's population. */
   readonly density?: number | undefined;
+  /**
+   * Which baked characters to draw from. Defaults to the city roster.
+   *
+   * EVERY ID COSTS ONE COLOUR DRAW CALL AND ONE SHADOW DRAW CALL, so this is a
+   * rendering budget as much as a cast list; it is truncated to
+   * `CITY_ROSTER_BUDGET`. See `PedestrianVat.ts`, which owns the rosters.
+   */
+  readonly roster?: readonly string[] | undefined;
 }
 
-export type { CrowdVehicle, CrowdContext, PedestrianImpact };
+export type { CrowdVehicle, CrowdContext, PedestrianImpact, CasualtyOptions };
+/*
+ * Re-exported so the combat layer can read the crowd's casualty contract from
+ * the module it already imports, rather than reaching into `crowd.ts`:
+ * how long a body stays, how many there may be, how far the player has to be
+ * before one is cleared, and how far a gunshot is heard.
+ */
+export { ALARM_RADIUS, CASUALTY_CLEAR, CASUALTY_LIMIT, CASUALTY_TIME };
 
 /**
  * People simulated at once, per quality level.
@@ -156,8 +179,26 @@ export interface PedestrianStats {
   readonly detours: number;
   /** People currently on the ground, knocked down or shot. */
   readonly down: number;
+  /**
+   * Of those, the ones who are never getting up. Bounded by `CASUALTY_LIMIT`
+   * and cleared only past `CASUALTY_CLEAR` metres, by dissolving.
+   */
+  readonly casualties: number;
   /** Times a vehicle has knocked somebody down. Cumulative. */
   readonly struck: number;
+  /** People currently running from gunfire. See `alarmAt`. */
+  readonly alarmed: number;
+  /**
+   * How many people the ground around the player is judged able to carry.
+   *
+   * Equal to `population` in the city and a fraction of it at the airport,
+   * which is the whole of the fix for the crowd that used to line the access
+   * road. `supply` is the zone-weighted metres of pavement it came from.
+   */
+  readonly limit: number;
+  readonly supply: number;
+  /** People in each airport zone, keyed by name. Diagnostics and tests. */
+  readonly byZone: Readonly<Record<string, number>>;
   readonly obstacles: number;
   readonly links: number;
   /** Mean milliseconds spent in `update` over the last 60 calls. */
@@ -210,6 +251,8 @@ export class PedestrianSystem {
    */
   private readonly characters: PedestrianVatCharacter[] = [];
   private readonly loadedBundles: PedestrianVatBundle[] = [];
+  /** The ids this system draws, already truncated to its draw-call budget. */
+  private readonly roster: readonly string[];
   private readonly graph: PavementGraph;
   private readonly obstacleCount: number;
   private readonly capacity: number;
@@ -239,6 +282,7 @@ export class PedestrianSystem {
 
   constructor(options: PedestrianSystemOptions) {
     this.quality = options.quality;
+    this.roster = (options.roster ?? CITY_VAT_IDS).slice(0, CITY_ROSTER_BUDGET);
     this.graph = buildPavementGraph(options.plan, options.network);
 
     const index = new ObstacleIndex(options.plan, options.ground, options.obstacles);
@@ -257,6 +301,17 @@ export class PedestrianSystem {
     });
     this.crowd.budget = options.density ?? POPULATION[this.quality];
     this.walked = new Float32Array(this.capacity);
+    /*
+     * Start every slot at its own point of the walk cycle.
+     *
+     * `walked` drives the pose through the bake's travel curve, so leaving it
+     * at zero puts THE ENTIRE CROWD in the same stride on the first frame the
+     * characters are installed - three hundred people stepping off with the
+     * same foot. It diverges within a metre of walking, but the first frame is
+     * exactly the one behind the loading screen that the player sees first.
+     * Two rig units covers a full cycle for every bake in the roster.
+     */
+    for (let i = 0; i < this.capacity; i += 1) this.walked[i] = hash2(i, 7, 31) * 2;
     this.lastX = new Float32Array(this.capacity);
     this.lastZ = new Float32Array(this.capacity);
 
@@ -272,7 +327,7 @@ export class PedestrianSystem {
     // that `main.ts`'s pre-compile pass behind the loading screen builds their
     // programs. A material compiled on the first playable frame costs a 200 ms
     // freeze at the exact moment the player takes control.
-    for (let slot = 0; slot < PEDESTRIAN_VAT_IDS.length; slot += 1) {
+    for (let slot = 0; slot < this.roster.length; slot += 1) {
       const bundle = createPedestrianVatMesh(this.capacity, slot);
       bundle.mesh.castShadow = this.quality !== 'low';
       this.bundles.push(bundle);
@@ -292,7 +347,7 @@ export class PedestrianSystem {
    * none of four leaves the procedural one up. Nothing here can reject.
    */
   private async loadCharacters(): Promise<void> {
-    const loaded = await Promise.all(PEDESTRIAN_VAT_IDS.map((id) => loadPedestrianVat(id)));
+    const loaded = await Promise.all(this.roster.map((id) => loadPedestrianVat(id)));
     if (this.disposed) {
       for (const character of loaded) character?.dispose();
       return;
@@ -375,13 +430,94 @@ export class PedestrianSystem {
   }
 
   /**
+   * The combat layer's explicit hook for a round that hit a civilian.
+   *
+   * ============================ INTEGRATION CONTRACT ==========================
+   *
+   *   // a lethal round, which is what `CrowdTargets.removeAt` reports.
+   *   // (x, z) is the round's CONTACT POINT, matched within `radius` (1 m).
+   *   pedestrians.casualtyAt(x, z, { dirX, dirZ });
+   *
+   *   // a round that hit but did not kill: they flinch, stumble and run,
+   *   // and they stay on their feet and stay targetable.
+   *   pedestrians.casualtyAt(x, z, { dirX, dirZ, lethal: false });
+   *
+   *   // gunfire that hit nobody. The street still reacts. Safe to call for
+   *   // every shot, and safe to call repeatedly.
+   *   pedestrians.alarmAt(x, z);
+   *
+   * ============================================================================
+   *
+   * `downAt` still exists and still behaves exactly as it did, so nothing that
+   * calls it has to change. This adds the two things it cannot express:
+   *
+   *   - LETHAL OR NOT. `downAt` always kills. `lethal: false` produces a
+   *     STAGGER - a lean, a stumble along the round's line of travel, a broken
+   *     stride and then a run - and leaves the victim upright and still
+   *     targetable, because a wounded pedestrian lying on the pavement is
+   *     indistinguishable from a dead one and is skipped by the combat
+   *     layer's own targeting. Pass `floor: true` for a blow that genuinely
+   *     takes somebody off their feet. The default leaves a body that never
+   *     rises. Bodies are bounded to
+   *     `CASUALTY_LIMIT` at once, persist for `CASUALTY_TIME` seconds, and are
+   *     only cleared beyond `CASUALTY_CLEAR` metres - and then by dissolving
+   *     over half a second rather than by blinking out.
+   *   - THE STREET REACTING. A shot that drops one person and leaves everybody
+   *     else strolling past reads as nothing having happened, so this raises an
+   *     alarm at the same point unless the caller passes `alarm: false`.
+   *
+   * `(x, z)` is the round's CONTACT POINT rather than the victim's feet, and
+   * `radius` (1 m by default) is how far from it a body may be and still be
+   * the one that was hit. Returns false when nobody was close enough - the
+   * pool slot may have been recycled between the shot landing and this call.
+   */
+  casualtyAt(x: number, z: number, options?: CasualtyOptions): boolean {
+    return this.crowd.casualtyAt(x, z, options);
+  }
+
+  /**
+   * Makes whoever is nearest flinch, without taking them off their feet.
+   *
+   * The same thing `casualtyAt({ lethal: false })` does, exposed on its own so
+   * a caller that has already decided the round did not kill anybody does not
+   * have to say so twice.
+   */
+  staggerAt(x: number, z: number, radius?: number, dirX?: number, dirZ?: number): boolean {
+    return this.crowd.staggerAt(x, z, radius, dirX, dirZ);
+  }
+
+  /**
+   * Tells the crowd a gun went off here, whether or not it hit anybody.
+   *
+   * Everybody within `radius` (default `ALARM_RADIUS`, 26 m) stops dawdling,
+   * hurries, and starts preferring routes that take them AWAY from the point
+   * for the next nine seconds. Returns how many people heard it.
+   *
+   * Cheap enough to call per shot: it is one sweep of the crowd's own hash grid
+   * over the cells inside the radius, and the reaction is then stamped on each
+   * person rather than tested against a list every frame.
+   */
+  alarmAt(x: number, z: number, radius = ALARM_RADIUS): number {
+    return this.crowd.alarmAt(x, z, radius);
+  }
+
+  /** Gunfire the crowd currently remembers. Bounded; diagnostics and tests. */
+  get alarms(): readonly { readonly x: number; readonly z: number; readonly radius: number }[] {
+    return this.crowd.recentAlarms;
+  }
+
+  /**
    * Throws everybody inside a blast radius flat.
    *
    * Called by the combat layer AFTER it has decided who the explosion killed:
    * this is the visible consequence, not the damage model. Returns how many
    * people were moved, for diagnostics.
+   *
+   * Raises an alarm over twice the blast radius, because a bomb is heard a lot
+   * further away than it is survived.
    */
   blastAt(x: number, z: number, radius: number): number {
+    this.crowd.alarmAt(x, z, Math.max(ALARM_RADIUS, radius * 2));
     return this.crowd.blastAt(x, z, radius);
   }
 
@@ -440,7 +576,14 @@ export class PedestrianSystem {
       crossing: s.crossing,
       detours: s.detours,
       down: s.down,
+      casualties: s.casualties,
       struck: s.struck,
+      alarmed: s.alarmed,
+      limit: s.limit,
+      supply: s.supply,
+      byZone: Object.fromEntries(
+        PEDESTRIAN_ZONES.map((zone, i) => [zone, s.byZone[i] ?? 0] as const),
+      ),
       obstacles: this.obstacleCount,
       links: this.graph.links.length,
       updateMs: this.lastUpdateMs,
@@ -591,7 +734,10 @@ export class PedestrianSystem {
         // holding an identical pose.
         anim[a + 1] = hash2(look.height, look.girth, 23);
       } else if (idle && idle.duration > 1e-3) {
-        const rate = (0.85 + 0.3 * hash2(look.preferredSpeed, look.cadence, 11)) / idle.duration;
+        // Stretched to a common period, so a bake with a short idle does not
+        // fidget faster than the person beside it. See `IDLE_MIN_PERIOD`.
+        const period = Math.max(idle.duration, IDLE_MIN_PERIOD);
+        const rate = (0.85 + 0.3 * hash2(look.preferredSpeed, look.cadence, 11)) / period;
         anim[a + 1] = (hash2(look.height, look.girth, 23) + ctx.time * rate) % 1;
       } else {
         anim[a + 1] = 0;
@@ -604,7 +750,9 @@ export class PedestrianSystem {
       tint[a] = colour.r;
       tint[a + 1] = colour.g;
       tint[a + 2] = colour.b;
-      tint[a + 3] = 1;
+      // The dissolve. Nobody is switched on or off at full opacity, so a crowd
+      // whose head count changes with where the player stands never pops.
+      tint[a + 3] = ped.fade;
     }
 
     for (let v = 0; v < variants; v += 1) {
@@ -663,6 +811,8 @@ export class PedestrianSystem {
 
       extra[a] = look.accentColor;
       extra[a + 1] = look.shoeColor;
+      // The dissolve, exactly as the baked crowd's `iTint.w`.
+      extra[a + 2] = ped.fade;
 
       n += 1;
     }

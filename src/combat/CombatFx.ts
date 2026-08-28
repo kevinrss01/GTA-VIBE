@@ -325,13 +325,40 @@ const IMPACT_STYLE: Readonly<Record<ImpactKind, ImpactStyle>> = {
     spark: [0.3, 0.44, 0.18], mark: [0.05, 0.07, 0.03],
     debris: 7, speed: 1.6, size: 0.055, gravity: -3, drag: 3.4, markSize: 0.07,
   },
-  // A hit on a person is the one the player is looking straight at when it
-  // happens, and four dull specks did not read as a hit at all.
+  /*
+   * A HIT ON A PERSON IS THE SMALLEST EFFECT IN THIS TABLE, NOT THE BIGGEST.
+   *
+   * It used to be the biggest: nine fast dark-red embers with no drag, thrown
+   * at up to 5 m/s and pulled down at 14 m/s², plus a blood pool up to 0.6 m
+   * across - PER PELLET. One shotgun shell put seventy-two of those and eight
+   * overlapping pools on one civilian in a single frame, which is not a bullet
+   * wound, it is a detonation, and that is exactly what it was reported as.
+   *
+   * Three fine, slow, dark specks that the air stops almost at once is what a
+   * round arriving on a body actually looks like from ten metres away, and the
+   * READ - "that hit, and it hit a person" - is carried by the colour and by
+   * the mark on the pavement rather than by the count. `CombatSystem` also
+   * spends this ONCE per victim per trigger pull, so a shotgun is one wound
+   * cluster rather than eight.
+   */
   body: {
-    spark: [0.34, 0.07, 0.07], mark: [0.09, 0.02, 0.02],
-    debris: 9, speed: 1.8, size: 0.045, gravity: SPARK_GRAVITY, drag: 0, markSize: 0.18,
+    spark: [0.26, 0.05, 0.05], mark: [0.085, 0.018, 0.018],
+    debris: 3, speed: 1.1, size: 0.03, gravity: SPARK_GRAVITY, drag: 2.4, markSize: 0.1,
   },
 };
+
+/**
+ * Glow slots one impact of a given kind spends.
+ *
+ * Exported so the budget can be ASSERTED rather than described: a test can
+ * pin "a round on a person costs three glows" without reaching into the table.
+ */
+export function impactBudget(kind: ImpactKind): number {
+  return IMPACT_STYLE[kind].debris;
+}
+
+/** Pool ceilings, exported for the same reason. */
+export const FX_CAPACITY = { glows: GLOW_CAPACITY, marks: MARK_CAPACITY } as const;
 
 /** Seconds a blood pool stays on the ground. Far longer than a bullet scuff. */
 const BLOOD_LIFE = 26;
@@ -535,15 +562,18 @@ export class CombatFx {
       // is what a player actually sees afterwards, and it lasts long enough to
       // still be there when they walk back past it.
       mark.maxLife = BLOOD_LIFE;
-      mark.x = x + (rand() - 0.5) * 0.4;
+      // Scattered under the victim rather than around them: the contact point
+      // is now the round's real arrival point, so the pool only has to fall
+      // from it rather than stand in for not knowing where it was.
+      mark.x = x + (rand() - 0.5) * 0.24;
       // A millimetre proud of the floor, not a guessed drop below the wound: a
       // head shot is 1.7 m up a body and the guess left the pool floating.
       mark.y = groundY + 0.01;
-      mark.z = z + (rand() - 0.5) * 0.4;
+      mark.z = z + (rand() - 0.5) * 0.24;
       mark.nx = 0;
       mark.ny = 1;
       mark.nz = 0;
-      mark.size = style.markSize + rand() * 0.12;
+      mark.size = style.markSize + rand() * 0.05;
     } else {
       mark.x = x + nx * 0.012;
       mark.y = y + ny * 0.012;

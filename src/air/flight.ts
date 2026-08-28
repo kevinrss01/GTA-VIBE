@@ -191,6 +191,19 @@ export interface FlightEvents {
   impactSpeed: number;
   /** True on the frame the airframe was written off. */
   crashed: boolean;
+  /**
+   * True when a displacement was REFUSED by solid geometry this frame,
+   * whatever the closing speed.
+   *
+   * Distinct from `impact`, and the distinction is the whole point: `impact`
+   * only fires above 0.2 m/s of closing speed, so an aeroplane creeping into
+   * something reports nothing at all - it simply has its velocity zeroed every
+   * step and stops, silently, for ever. That failure mode was real: a Light
+   * twin taxiing off its stand met a ground-power cart 0.6 m in front of its
+   * nose, and full throttle produced no motion and no message. Reporting every
+   * refusal is what lets the caller notice a jam and say so.
+   */
+  blocked: boolean;
 }
 
 export function createFlightEvents(): FlightEvents {
@@ -202,6 +215,7 @@ export function createFlightEvents(): FlightEvents {
     impact: false,
     impactSpeed: 0,
     crashed: false,
+    blocked: false,
   };
 }
 
@@ -213,6 +227,7 @@ export function resetFlightEvents(events: FlightEvents): void {
   events.impact = false;
   events.impactSpeed = 0;
   events.crashed = false;
+  events.blocked = false;
 }
 
 /**
@@ -892,6 +907,8 @@ function movePosition(
       continue;
     }
 
+    // Every refusal is reported, however gentle. See `FlightEvents.blocked`.
+    events.blocked = true;
     let refusedSq = 0;
     if (!isBlocked(blocked, spec, nx, state.y, state.z, state.yaw)) {
       state.x = nx;
