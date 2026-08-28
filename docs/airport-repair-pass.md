@@ -904,6 +904,24 @@ deferred groups all arriving afterwards — five aircraft present, seven travell
 characters with `missing: []`, the shop, the club and the interiors all loaded,
 and boarding at a sprint still ramping the throttle to 1.0.
 
+### Measured after, on the deployed site
+
+| | before | after |
+| --- | --- | --- |
+| time to the start button, cold | **43 s** | **~21 s** |
+| time to the start button, warm | — | **13.2 s** |
+| requests before the start button | 107 | **49** |
+| downloaded before the start button | 21.9 MB | 22.6 MB |
+| served from browser cache on a revisit | 0 of 107 | **48 of 49** |
+
+The cold figure roughly halved and the request count more than halved. The
+warm figure is the one the cache headers bought: every asset but the HTML now
+comes from the browser instead of revalidating over the network.
+
+Of the 13.2 s warm load, **3.8 s is shader compilation** and the rest is
+procedural city generation on the CPU, not network at all. That is the floor
+without deeper work.
+
 **What was NOT changed, and should be.** `models/street-lamp/model.glb` is
 2.18 MB for a street lamp, and `public/` is 72 MB in total against 65 MB of
 models. None of it is Draco or Meshopt compressed and none of the textures are
