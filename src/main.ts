@@ -1685,6 +1685,12 @@ async function boot(): Promise<void> {
             // car the player parked from one that is merely driverless.
             state: view.state,
             destroyed: view.destroyed,
+            // The damage STAGE, which is the legible form of `damage`:
+            // pristine, scuffed, damaged, crippled, wrecked. `destroyed` only
+            // says whether the last stage was reached, so without this a QA
+            // pass cannot tell a car that took a parking shunt from one that
+            // is a crash away from being written off.
+            condition: view.condition,
             regions: view.regions,
             handling: view.handling,
           });
