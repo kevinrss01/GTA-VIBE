@@ -507,3 +507,64 @@ function reachable(
 
   return { area: footprint.size * CELL * CELL, highest, lowest };
 }
+
+
+/*
+ * BEING TRAPPED IN GEOMETRY IS NOT A RECOVERABLE STATE, so the resolver has to
+ * be able to get out of it.
+ *
+ * The original rescue lifts a settled, stuck body by half a step and only if
+ * that single lift frees it. That frees somebody clipped into a kerb, which is
+ * what it was written for, and it cannot free somebody wedged against something
+ * a whole storey tall: one half-step leaves them stuck, the guard correctly
+ * refuses the move, and every following frame refuses it again.
+ *
+ * Note `blocked()` waives any box whose XZ footprint CONTAINS the body - that
+ * waiver is what stops a player being wedged inside a building's mass collider
+ * - so a stuck body is always one clipped into an edge, which is what these
+ * fixtures build.
+ *
+ * Both original guards still have to hold: each exists to stop the rescue
+ * becoming a worse bug than the one it fixes.
+ */
+describe('getting out of geometry', () => {
+  /** A wall the body at the origin is clipped into, not contained by. */
+  const wall = (bottom: number, top: number) =>
+    new CollisionWorld([
+      { minX: 0.2, maxX: 50, minZ: -50, maxZ: 50, bottom, top, solid: true },
+    ]);
+
+  it('frees a body clipped into something a half-step cannot clear', () => {
+    const world = wall(-1, 3);
+    expect(world.isStuck(0, 0, 0, BODY_HEIGHT, BODY_RADIUS)).toBe(true);
+    expect(world.isStuck(0, 0, STEP_HEIGHT * 0.5, BODY_HEIGHT, BODY_RADIUS)).toBe(true);
+
+    const step = resolveVerticalStep(world, 0, 0, 0, 0, 0, FIXED_STEP);
+    expect(step.y).toBeGreaterThanOrEqual(3);
+    expect(world.isStuck(0, 0, step.y, BODY_HEIGHT, BODY_RADIUS)).toBe(false);
+  });
+
+  it('still refuses to move a body it cannot actually free', () => {
+    // Taller than the search: nothing frees it, so it must not be carried
+    // upward one bounded step per frame for ever.
+    const world = wall(-1, 500);
+    const step = resolveVerticalStep(world, 0, 0, 0, 0, 0, FIXED_STEP);
+    expect(step.y).toBe(0);
+  });
+
+  it('still leaves a falling body alone', () => {
+    // Not settled: above its support with somewhere to fall. The rescue must
+    // not fight gravity here - that is what made brushing a fitting bob.
+    const world = wall(-1, 3);
+    const step = resolveVerticalStep(world, 0, 0, 10, 0, 0, FIXED_STEP);
+    expect(step.settled).toBe(false);
+    expect(step.y).toBeLessThan(10);
+  });
+
+  it('leaves a body standing in the open exactly where it is', () => {
+    const world = new CollisionWorld([]);
+    const step = resolveVerticalStep(world, 0, 0, 5, 0, 5, FIXED_STEP);
+    expect(step.y).toBe(5);
+    expect(step.grounded).toBe(true);
+  });
+});

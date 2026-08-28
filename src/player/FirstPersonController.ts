@@ -72,6 +72,18 @@ export interface VerticalStep {
 }
 
 /**
+ * How far the unstick search will lift a body that a half-step cannot free.
+ *
+ * Tall enough to clear a storey - a terminal floor sits 0.16 m over the airfield
+ * and a building floor slab can be a couple of metres over the terrain - and
+ * short enough that a body sealed inside real geometry is not carried to the
+ * roofline. The step is the body radius, so no gap wide enough to stand in is
+ * skipped over.
+ */
+const UNSTICK_MAX_LIFT = 6;
+const UNSTICK_LIFT_STEP = 0.3;
+
+/**
  * The vertical half of one fixed simulation step: settle onto the support under
  * the feet, otherwise fall toward it, then rescue a body jammed into geometry.
  *
@@ -127,7 +139,41 @@ export function resolveVerticalStep(
   //   vertical teleport: the difference between a rescue and a ride to the roof.
   if (settled && collision.isStuck(x, z, y, BODY_HEIGHT, BODY_RADIUS)) {
     const lifted = y + STEP_HEIGHT * 0.5;
-    if (!collision.isStuck(x, z, lifted, BODY_HEIGHT, BODY_RADIUS)) y = lifted;
+    if (!collision.isStuck(x, z, lifted, BODY_HEIGHT, BODY_RADIUS)) {
+      y = lifted;
+    } else {
+      /*
+       * A HALF-STEP IS NOT ALWAYS ENOUGH, and when it is not the body is
+       * trapped for good.
+       *
+       * The lift above frees somebody standing in a kerb or clipped into a
+       * knee-high fitting, which is what it was written for. It cannot free
+       * somebody who has ended up a whole storey inside the world - under a
+       * floor slab, inside a wall, beneath the map - because one half-step
+       * still leaves them stuck, the guard correctly refuses to move them, and
+       * every subsequent frame makes the same refusal. The player can see the
+       * underside of the world and cannot do anything about it.
+       *
+       * So when the cheap lift fails, look for the LOWEST height that actually
+       * frees the body, and only take it if one exists. That keeps both of the
+       * original guards - the body must have settled, and the move must
+       * actually work - while raising the ceiling from 0.25 m to something that
+       * can clear a building floor.
+       *
+       * It runs only on a body that is both settled and stuck, which is an
+       * error state; once freed it stops. The search is bounded so a body
+       * genuinely sealed inside solid geometry costs a fixed handful of tests
+       * per step rather than climbing forever.
+       */
+      for (let lift = STEP_HEIGHT; lift <= UNSTICK_MAX_LIFT; lift += UNSTICK_LIFT_STEP) {
+        if (!collision.isStuck(x, z, y + lift, BODY_HEIGHT, BODY_RADIUS)) {
+          y += lift;
+          vy = 0;
+          grounded = true;
+          break;
+        }
+      }
+    }
   }
 
   return { y, verticalVelocity: vy, grounded, settled };
@@ -491,8 +537,28 @@ export class FirstPersonController {
     this.yaw = options.spawn.heading;
     this.surfaceIndex = options.colliders ? new ColliderSurfaceIndex(options.colliders) : null;
 
-    const groundY = this.ground.sample(options.spawn.x, options.spawn.z).y;
-    this.position.set(options.spawn.x, groundY, options.spawn.z);
+    /*
+     * THE SPAWN IS RESOLVED AGAINST THE COLLISION WORLD, exactly as `teleport`
+     * resolves every other placement in the game.
+     *
+     * It used to be `ground.sample(...).y`, which is the TERRAIN height and
+     * ignores anything built on top of it. The spawn point is on Harbour Walk,
+     * a boardwalk deck that stands proud of the terrain underneath it, so the
+     * player was placed *below the deck they are meant to be standing on* -
+     * under the world, looking up at the underside of it, with the deck
+     * between them and the sky. The vertical rescue in `update` usually lifted
+     * them out on the first frame, which is why this survived: it is a race,
+     * and losing it means starting the game trapped under the map with no way
+     * out.
+     *
+     * `floorUnder` is the same resolution `teleport` and `placeOnFloor` use, so
+     * all three placements now agree.
+     */
+    this.position.set(
+      options.spawn.x,
+      this.floorUnder(options.spawn.x, options.spawn.z),
+      options.spawn.z,
+    );
     const spawnSample = this.ground.sample(options.spawn.x, options.spawn.z);
     this.surface = spawnSample.surface;
     this.debounce = new SurfaceDebounce(spawnSample.surface);
