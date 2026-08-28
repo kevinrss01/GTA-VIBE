@@ -27,21 +27,26 @@
  * driver's seat, because there is nowhere in a cockpit to look from that shows
  * you what an aeroplane is doing.
  *
- * ## Controls, and why pitch is inverted
+ * ## Two control mappings, and which one is the default
  *
- * `W` pitches the NOSE DOWN and `S` pitches it UP. That is a stick, not a
- * throttle: pulling back climbs, pushing forward descends, and every flight
- * game that maps a centre stick to a keyboard does it this way. Binding `W` to
- * "climb" would read fine for one second and then be wrong for the whole of
- * every landing, where the entire job is holding the nose off with back
- * pressure. The throttle is on Shift and Control, so `W` is not competing with
- * anything a driver would expect it to do.
+ * **Assisted is the default.** Up climbs, Down descends, Left and Right turn,
+ * Shift is the throttle. `assist.ts` converts that into stick, pedals and the
+ * back-pressure a turn needs, and writes it into the same `FlightControls` the
+ * direct mapping writes - the flight model is identical either way and nothing
+ * is faked. The reason it is the default is a player report: they got into an
+ * aeroplane, could not work out how to fly it, and gave up. Pressing `Up` and
+ * watching the nose drop is the first thing that happens on the direct
+ * mapping, and it is enough to end the attempt.
  *
- * `Q`/`E` were the obvious rudder keys and are not usable: `E` is the game's
- * "get in / get out" key everywhere else, and rebinding it inside one vehicle
- * is how a player ends up unable to get out of an aeroplane. The rudder is on
- * `Z` and `C` - bottom row, left hand, where pedals belong - with the sim
- * convention `,` and `.` accepted as well, which costs nothing.
+ * **Direct is the stick**, and it is still here. `W` pitches the NOSE DOWN and
+ * `S` pitches it UP; that is a centre stick, not a throttle, and every flight
+ * game that maps one to a keyboard does it this way. Binding `W` to "climb"
+ * would read fine for one second and then be wrong for the whole of every
+ * landing, where the entire job is holding the nose off with back pressure.
+ * `A`/`D` roll rather than turn, and the rudder is on `Z`/`C` - `Q`/`E` were
+ * the obvious pedals and are not usable, because `E` is the game's "get in and
+ * out" key everywhere else and rebinding it inside one vehicle is how a player
+ * ends up unable to leave an aeroplane.
  *
  * `FLIGHT_CONTROLS` below is the same `ControlHint[]` shape as `CONTROL_HINTS`
  * in `ui/PauseMenu`, so the Controls tab can render it with the loop it
@@ -100,6 +105,7 @@ import { BODY_HEIGHT, BODY_RADIUS } from '../player/FirstPersonController';
 import type { CollisionWorld } from '../player/Collision';
 import { detectPlatform, type ControlHint, type Platform } from '../ui/platform';
 import { AIRCRAFT, type AircraftSpec, type AircraftType } from './AircraftCatalogue';
+import { applyFlightAssist } from './assist';
 import {
   advanceFlight,
   airspeed as airspeedOf,
@@ -192,8 +198,30 @@ const PLAYER_CLEARANCE = 1.6;
  * `ui/platform` gives: a hint that prints a key the player does not have is
  * worse than no hint.
  */
-export function flightControlHints(platform: Platform = detectPlatform()): readonly ControlHint[] {
+export function flightControlHints(
+  platform: Platform = detectPlatform(),
+  assist = true,
+): readonly ControlHint[] {
   const mac = platform === 'mac';
+  if (assist) {
+    /*
+     * The ASSISTED mapping, which is what the player is flying unless they
+     * turned it off - so it is what the Controls tab has to describe. A
+     * reference that documents a different set of keys from the ones the
+     * aeroplane answers is worse than no reference.
+     */
+    return [
+      { keys: '↑ / W', action: 'Climb' },
+      { keys: '↓ / S', action: 'Descend' },
+      { keys: '← / A', action: 'Turn left' },
+      { keys: '→ / D', action: 'Turn right' },
+      { keys: mac ? '⇧ Shift / ⌃ Control' : 'Shift / Ctrl', action: 'Throttle up / down' },
+      { keys: 'Space', action: 'Wheel brakes' },
+      { keys: 'G', action: 'Landing gear (retractable types)' },
+      { keys: 'Mouse', action: 'Look around the aircraft' },
+      { keys: 'E', action: 'Get out - stopped, on the ground' },
+    ];
+  }
   return [
     { keys: 'S / Down', action: 'Pull back - nose up' },
     { keys: 'W / Up', action: 'Push forward - nose down' },
@@ -209,6 +237,11 @@ export function flightControlHints(platform: Platform = detectPlatform()): reado
 
 /** Resolved once, like `CONTROL_HINTS`: nobody changes machine mid-flight. */
 export const FLIGHT_CONTROLS: readonly ControlHint[] = flightControlHints();
+/** The direct stick, for a player who has turned the assist off. */
+export const FLIGHT_CONTROLS_DIRECT: readonly ControlHint[] = flightControlHints(
+  detectPlatform(),
+  false,
+);
 
 /**
  * The subset the in-flight HUD panel shows, with labels written for a corner
@@ -221,8 +254,24 @@ export const FLIGHT_CONTROLS: readonly ControlHint[] = flightControlHints();
  * Mouse-look and the gear lever are the two a player discovers without being
  * told, so they are the two that go.
  */
-export function flightHudHints(platform: Platform = detectPlatform()): readonly ControlHint[] {
+export function flightHudHints(
+  platform: Platform = detectPlatform(),
+  assist = true,
+): readonly ControlHint[] {
   const mac = platform === 'mac';
+  if (assist) {
+    // Five lines, in the order a player needs them: get it moving, get it off
+    // the ground, point it somewhere, put it down.
+    return [
+      { keys: mac ? '⇧ Shift' : 'Shift', action: 'Throttle up' },
+      { keys: '↑ / W', action: 'Climb' },
+      { keys: '↓ / S', action: 'Descend' },
+      { keys: '← / A', action: 'Turn left' },
+      { keys: '→ / D', action: 'Turn right' },
+      { keys: 'Space', action: 'Brakes' },
+      { keys: 'E', action: 'Get out (stopped)' },
+    ];
+  }
   return [
     { keys: 'S / W', action: 'Nose up / down' },
     { keys: 'A / D', action: 'Roll' },
@@ -235,6 +284,11 @@ export function flightHudHints(platform: Platform = detectPlatform()): readonly 
 
 /** Resolved once, for the same reason as `FLIGHT_CONTROLS`. */
 export const FLIGHT_HUD_CONTROLS: readonly ControlHint[] = flightHudHints();
+/** The direct mapping's panel, for a player who has turned the assist off. */
+export const FLIGHT_HUD_CONTROLS_DIRECT: readonly ControlHint[] = flightHudHints(
+  detectPlatform(),
+  false,
+);
 
 /**
  * The slice of the walking player this module touches.
@@ -756,6 +810,43 @@ export class Flying {
    * what a spring-loaded stick does and what makes hands-off flight settle.
    */
   private readInput(dt: number, spec: AircraftSpec): FlightControls {
+    const flight = this.flight;
+    const up = this.pressed('ShiftLeft', 'ShiftRight') ? 1 : 0;
+    const down = this.pressed('ControlLeft', 'ControlRight') ? 1 : 0;
+    /*
+     * The assisted throttle moves faster, because on the assisted controls the
+     * throttle is the only thing between the player and the runway and a slow
+     * lever reads as an aeroplane that will not go.
+     */
+    const rate = this.assistOn ? THROTTLE_RATE * 2.2 : THROTTLE_RATE;
+    this.throttleLever = clamp(this.throttleLever + (up - down) * rate * dt, 0, 1);
+
+    const brakes = this.keys.has('Space');
+
+    if (this.assistOn && flight) {
+      /*
+       * ASSISTED: up is up, and left and right turn.
+       *
+       * The signs here are the ones a player expects from a keyboard, and the
+       * conversion into a stick, pedals and back-pressure is `applyFlightAssist`
+       * - which writes the same `FlightControls` the direct path writes and
+       * changes nothing about the flight model that acts on them.
+       */
+      const climb =
+        (this.pressed('KeyW', 'ArrowUp') ? 1 : 0) - (this.pressed('KeyS', 'ArrowDown') ? 1 : 0);
+      const turn =
+        (this.pressed('KeyD', 'ArrowRight') ? 1 : 0) - (this.pressed('KeyA', 'ArrowLeft') ? 1 : 0);
+      this.demand.climb = climb;
+      this.demand.turn = turn;
+      this.demand.throttle = this.throttleLever;
+      this.demand.brakes = brakes;
+      const gearKeyAssist = this.keys.has('KeyG');
+      if (gearKeyAssist && !this.gearLatch && spec.retractableGear) this.gearLever = !this.gearLever;
+      this.gearLatch = gearKeyAssist;
+      this.demand.gearDown = spec.retractableGear ? this.gearLever : true;
+      return applyFlightAssist(flight, spec, this.demand, this.controls, dt);
+    }
+
     const pitchInput =
       (this.pressed('KeyS', 'ArrowDown') ? 1 : 0) - (this.pressed('KeyW', 'ArrowUp') ? 1 : 0);
     const rollInput =
@@ -767,12 +858,9 @@ export class Flying {
     this.controls.aileron = axis(this.controls.aileron, rollInput, dt);
     this.controls.rudder = axis(this.controls.rudder, yawInput, dt);
 
-    const up = this.pressed('ShiftLeft', 'ShiftRight') ? 1 : 0;
-    const down = this.pressed('ControlLeft', 'ControlRight') ? 1 : 0;
-    this.throttleLever = clamp(this.throttleLever + (up - down) * THROTTLE_RATE * dt, 0, 1);
     this.controls.throttle = this.throttleLever;
 
-    this.controls.brakes = this.keys.has('Space');
+    this.controls.brakes = brakes;
 
     // The gear lever is edge-triggered: holding G must not cycle it.
     const gearKey = this.keys.has('KeyG');
@@ -793,6 +881,44 @@ export class Flying {
     this.pose.power = flight.throttle;
     this.pose.wrecked = flight.crashed;
     return this.pose;
+  }
+
+  /**
+   * Whether the assisted controls are in use. ON by default.
+   *
+   * The direct controls are a stick and they are correct; they are also the
+   * reason somebody gets in, presses Up, watches the nose drop and never gets
+   * airborne. The default is the one a player can fly without being taught,
+   * and the sim mapping is a setting away for anyone who wants it.
+   */
+  private assistOn = true;
+
+  /** Reused, so an assisted frame allocates nothing. See `applyFlightAssist`. */
+  private readonly demand: {
+    climb: number;
+    turn: number;
+    throttle: number;
+    brakes: boolean;
+    gearDown: boolean;
+  } = { climb: 0, turn: 0, throttle: 0, brakes: false, gearDown: true };
+
+  get assist(): boolean {
+    return this.assistOn;
+  }
+
+  /**
+   * Switches between the assisted and the direct controls.
+   *
+   * The surfaces are re-centred on the way through: a stick position that the
+   * assist was holding is not one the player asked for, and leaving it in
+   * would hand them an aeroplane already rolling.
+   */
+  setAssist(on: boolean): void {
+    if (on === this.assistOn) return;
+    this.assistOn = on;
+    this.controls.elevator = 0;
+    this.controls.aileron = 0;
+    this.controls.rudder = 0;
   }
 
   private readonly pose: AircraftPose = {

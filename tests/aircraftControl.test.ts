@@ -33,7 +33,9 @@ import { AIRCRAFT } from '../src/air/AircraftCatalogue';
 import { AircraftSystem } from '../src/air/AircraftSystem';
 import {
   FLIGHT_CONTROLS,
+  FLIGHT_CONTROLS_DIRECT,
   FLIGHT_HUD_CONTROLS,
+  FLIGHT_HUD_CONTROLS_DIRECT,
   Flying,
   type FlyingPlayer,
 } from '../src/air/Flying';
@@ -96,7 +98,16 @@ interface Rig {
 
 const open: Rig[] = [];
 
-function rig(colliders: readonly ColliderBox[] = []): Rig {
+/**
+ * `assist` selects which control mapping the rig flies with.
+ *
+ * The assisted controls are the default in the game, so they are the default
+ * here. The tests that pin the DIRECT stick mapping - S is nose up, A is roll
+ * left, the rudder is on Z and C - ask for `false`, because that mapping still
+ * exists and is still theirs to protect; it is simply no longer what a player
+ * gets without choosing it.
+ */
+function rig(colliders: readonly ColliderBox[] = [], assist = true): Rig {
   const air = new AircraftSystem({ groundY: AIRFIELD_GROUND });
   const player = stubPlayer();
   const flying = new Flying({
@@ -105,6 +116,7 @@ function rig(colliders: readonly ColliderBox[] = []): Rig {
     groundY: AIRFIELD_GROUND,
     controller: player,
   });
+  flying.setAssist(assist);
   const made = { air, flying, player };
   open.push(made);
   return made;
@@ -191,7 +203,7 @@ describe('control ownership', () => {
   });
 
   it('honours a held stick key as well, not only the throttle', () => {
-    const { flying } = rig();
+    const { flying } = rig([], false);
     press('KeyS');
     expect(
       flying.placeInAircraft('cessna', FIELD_X, FIELD_Z, 0, AIRFIELD_LEVEL + 300),
@@ -223,7 +235,7 @@ describe('control ownership', () => {
   });
 
   it('drops every key when the window loses focus', () => {
-    const { flying } = rig();
+    const { flying } = rig([], false);
     expect(flying.placeInAircraft('cessna', FIELD_X, FIELD_Z, 0, AIRFIELD_LEVEL + 400)).toBe(true);
     // Control winds the lever DOWN from the cruise setting the trim solved,
     // so neither end of its travel is reached and "frozen" is distinguishable
@@ -253,8 +265,9 @@ describe('control ownership', () => {
     // aircraft past vertical; it is nowhere near.
     expect(after.bank).toBeLessThan(banked + 0.6);
 
-    // The differential: the same 2.8 s with the keys genuinely held.
-    const kept = rig();
+    // The differential: the same 2.8 s with the keys genuinely held. Direct
+    // mapping as well, so it is comparable with `after` above.
+    const kept = rig([], false);
     expect(
       kept.flying.placeInAircraft('cessna', FIELD_X, FIELD_Z, 0, AIRFIELD_LEVEL + 400),
     ).toBe(true);
@@ -321,7 +334,7 @@ describe('the documented controls', () => {
     const at = AIRFIELD_LEVEL + 400;
 
     // S is back pressure: nose UP.
-    const pitch = rig();
+    const pitch = rig([], false);
     expect(pitch.flying.placeInAircraft('cessna', FIELD_X, FIELD_Z, 0, at)).toBe(true);
     const pitch0 = pitch.flying.state.pitch;
     press('KeyS');
@@ -330,7 +343,7 @@ describe('the documented controls', () => {
     expect(pitch.flying.state.pitch).toBeGreaterThan(pitch0);
 
     // W is the other way: nose DOWN.
-    const push = rig();
+    const push = rig([], false);
     expect(push.flying.placeInAircraft('cessna', FIELD_X, FIELD_Z, 0, at)).toBe(true);
     const push0 = push.flying.state.pitch;
     press('KeyW');
@@ -339,7 +352,7 @@ describe('the documented controls', () => {
     expect(push.flying.state.pitch).toBeLessThan(push0);
 
     // D rolls RIGHT, and `bank` is positive right-wing-down.
-    const roll = rig();
+    const roll = rig([], false);
     expect(roll.flying.placeInAircraft('cessna', FIELD_X, FIELD_Z, 0, at)).toBe(true);
     press('KeyD');
     run(roll.flying, 1.2);
@@ -347,7 +360,7 @@ describe('the documented controls', () => {
     expect(roll.flying.state.bank).toBeGreaterThan(0.1);
 
     // A rolls LEFT.
-    const left = rig();
+    const left = rig([], false);
     expect(left.flying.placeInAircraft('cessna', FIELD_X, FIELD_Z, 0, at)).toBe(true);
     press('KeyA');
     run(left.flying, 1.2);
@@ -355,7 +368,7 @@ describe('the documented controls', () => {
     expect(left.flying.state.bank).toBeLessThan(-0.1);
 
     // C is right rudder. Yaw INCREASES to the left, so nose right is a fall.
-    const yaw = rig();
+    const yaw = rig([], false);
     expect(yaw.flying.placeInAircraft('cessna', FIELD_X, FIELD_Z, 0, at)).toBe(true);
     const yaw0 = yaw.flying.state.yaw;
     press('KeyC');
@@ -364,7 +377,7 @@ describe('the documented controls', () => {
     expect(yaw.flying.state.yaw).toBeLessThan(yaw0);
 
     // Z is left rudder, and the comma/full stop pair is the same axis.
-    const rudder = rig();
+    const rudder = rig([], false);
     expect(rudder.flying.placeInAircraft('cessna', FIELD_X, FIELD_Z, 0, at)).toBe(true);
     const rudder0 = rudder.flying.state.yaw;
     press('Comma');
@@ -681,9 +694,26 @@ describe('the contextual control panel', () => {
    * overlay has to stay the shorter of the two or it is not a summary.
    */
   it('never advertises a key the Controls tab does not document', () => {
+    // Checked per mapping: the overlay and the reference must describe the
+    // SAME set of keys, or one of them is lying about how the aeroplane flies.
     expect(FLIGHT_HUD_CONTROLS.length).toBeLessThan(FLIGHT_CONTROLS.length);
     const documented = FLIGHT_CONTROLS.map((hint) => hint.keys).join(' | ');
     for (const hint of FLIGHT_HUD_CONTROLS) {
+      const tokens = hint.keys
+        .split('/')
+        .map((token) => token.replace(/[()]/g, '').trim())
+        .filter((token) => token.length > 0);
+      expect(tokens.length).toBeGreaterThan(0);
+      for (const token of tokens) {
+        expect(documented).toContain(token);
+      }
+    }
+  });
+
+  it('does the same for the direct mapping', () => {
+    expect(FLIGHT_HUD_CONTROLS_DIRECT.length).toBeLessThan(FLIGHT_CONTROLS_DIRECT.length);
+    const documented = FLIGHT_CONTROLS_DIRECT.map((hint) => hint.keys).join(' | ');
+    for (const hint of FLIGHT_HUD_CONTROLS_DIRECT) {
       const tokens = hint.keys
         .split('/')
         .map((token) => token.replace(/[()]/g, '').trim())
@@ -767,5 +797,138 @@ describe('the contextual control panel', () => {
     const throttle = FLIGHT_CONTROLS.find((hint) => hint.action.startsWith('Throttle'));
     expect(throttle).toBeDefined();
     expect(throttle?.keys).toBe(mac ? '⇧ Shift / ⌃ Control' : 'Shift / Ctrl');
+  });
+});
+
+// -- the assisted controls ----------------------------------------------------
+
+/*
+ * The assist is the default because the direct stick is the reason somebody
+ * gets in, presses Up, watches the nose drop and never gets airborne. These
+ * pin the promises it makes, in the order a player meets them.
+ */
+describe('the assisted controls', () => {
+  const AT = AIRFIELD_LEVEL + 400;
+
+  it('is on unless it is turned off', () => {
+    const { flying } = rig();
+    expect(flying.assist).toBe(true);
+  });
+
+  it('climbs on Up and on W, which the direct stick does the other way', () => {
+    for (const key of ['ArrowUp', 'KeyW'] as const) {
+      const { flying } = rig();
+      expect(flying.placeInAircraft('cessna', FIELD_X, FIELD_Z, 0, AT)).toBe(true);
+      const y0 = flying.state.y;
+      press(key);
+      run(flying, 4);
+      release(key);
+      expect(flying.state.pitch).toBeGreaterThan(0.02);
+      expect(flying.state.y).toBeGreaterThan(y0);
+    }
+  });
+
+  it('descends on Down and on S', () => {
+    for (const key of ['ArrowDown', 'KeyS'] as const) {
+      const { flying } = rig();
+      expect(flying.placeInAircraft('cessna', FIELD_X, FIELD_Z, 0, AT)).toBe(true);
+      const y0 = flying.state.y;
+      press(key);
+      run(flying, 4);
+      release(key);
+      expect(flying.state.y).toBeLessThan(y0);
+    }
+  });
+
+  it('TURNS on Left and Right rather than only rolling', () => {
+    // The direct stick rolls and leaves the pilot to hold the nose up. The
+    // assist has to actually change where the aeroplane is pointing.
+    const { flying } = rig();
+    expect(flying.placeInAircraft('cessna', FIELD_X, FIELD_Z, 0, AT)).toBe(true);
+    const yaw0 = flying.state.yaw;
+    press('ArrowRight');
+    run(flying, 6);
+    release('ArrowRight');
+    // Positive yaw is to the LEFT, so a right turn drives it down.
+    expect(flying.state.yaw).toBeLessThan(yaw0 - 0.2);
+    expect(flying.state.bank).toBeGreaterThan(0.15);
+  });
+
+  it('holds the bank inside the assisted limit however long the key is held', () => {
+    const { flying } = rig();
+    expect(flying.placeInAircraft('cessna', FIELD_X, FIELD_Z, 0, AT)).toBe(true);
+    press('ArrowRight');
+    run(flying, 12);
+    release('ArrowRight');
+    // 35 degrees plus overshoot; the direct stick would be past vertical.
+    expect(flying.state.bank).toBeLessThan(0.8);
+  });
+
+  it('levels the wings when nothing is asked of them', () => {
+    const { flying } = rig();
+    expect(flying.placeInAircraft('cessna', FIELD_X, FIELD_Z, 0, AT)).toBe(true);
+    press('ArrowRight');
+    run(flying, 5);
+    release('ArrowRight');
+    const banked = flying.state.bank;
+    expect(banked).toBeGreaterThan(0.15);
+    run(flying, 6);
+    expect(Math.abs(flying.state.bank)).toBeLessThan(banked * 0.5);
+  });
+
+  it('will not let the player stall the wing by holding Up', () => {
+    const { flying } = rig();
+    expect(flying.placeInAircraft('cessna', FIELD_X, FIELD_Z, 0, AT)).toBe(true);
+    press('ArrowUp');
+    // Long enough that a direct elevator held this hard would be well past the
+    // stall and departing.
+    run(flying, 25);
+    release('ArrowUp');
+    expect(flying.state.stall).toBeLessThan(1);
+    expect(flying.state.crashed).toBe(false);
+  });
+
+  it('steers on the ground instead of banking a parked aeroplane', () => {
+    const { flying } = rig();
+    expect(flying.placeInAircraft('cessna', FIELD_X, FIELD_Z, 0)).toBe(true);
+    press('ShiftLeft');
+    run(flying, 3);
+    const yaw0 = flying.state.yaw;
+    press('ArrowRight');
+    run(flying, 4);
+    release('ArrowRight');
+    release('ShiftLeft');
+    expect(flying.state.onGround).toBe(true);
+    expect(flying.state.yaw).not.toBeCloseTo(yaw0, 2);
+    // Wings stay level on the wheels.
+    expect(Math.abs(flying.state.bank)).toBeLessThan(0.15);
+  });
+
+  it('gets a beginner airborne on two keys', () => {
+    // The whole point: throttle up, hold Up, leave the ground. No rudder, no
+    // trim, no coordination, nothing the player has to be taught.
+    const { flying } = rig();
+    expect(flying.placeInAircraft('cessna', FIELD_X, FIELD_Z, 0)).toBe(true);
+    press('ShiftLeft');
+    press('ArrowUp');
+    run(flying, 30);
+    release('ShiftLeft');
+    release('ArrowUp');
+    expect(flying.state.onGround).toBe(false);
+    expect(flying.state.altitudeAgl).toBeGreaterThan(30);
+    expect(flying.state.crashed).toBe(false);
+  });
+
+  it('re-centres the surfaces when the mapping is switched', () => {
+    const { flying } = rig();
+    expect(flying.placeInAircraft('cessna', FIELD_X, FIELD_Z, 0, AT)).toBe(true);
+    press('ArrowRight');
+    run(flying, 3);
+    release('ArrowRight');
+    flying.setAssist(false);
+    // One frame of the direct mapping with nothing held must not inherit the
+    // deflection the assist was holding.
+    run(flying, 1 / 60);
+    expect(flying.assist).toBe(false);
   });
 });

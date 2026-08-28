@@ -659,3 +659,63 @@ pass and **removed before shipping**: it was a 43 m solid barrier on a movement
 area, added for looks, and this is exactly the defect that had just been
 reported. The apron keeps the PAPI boxes at both thresholds and the painted
 stand numbers instead.
+
+## Flight assist
+
+Reported: "the plane is very hard to drive... I didn't find a way to make it
+fly." The first thing that happens on the direct controls is that `ArrowUp`
+pitches the nose DOWN, because they are a centre stick. That is correct and it
+is also enough to end the attempt.
+
+`src/air/assist.ts` is a fly-by-wire layer and **the default**. Up climbs, Down
+descends, Left and Right turn, Shift is the throttle. It writes into the same
+`FlightControls` the direct mapping writes and `advanceFlight` is untouched -
+nothing about the aerodynamics, the stall or the ground reaction is faked or
+bypassed. The direct stick is still there, in Pause -> Gameplay -> Flight
+assist, and the Controls tab re-renders to document whichever one is live.
+
+What it does: banks to a target rather than rolling freely, levels the wings
+when nothing is asked of them, **holds vertical speed** rather than attitude,
+limits the angle of attack to 82 % of the stall, and steers on the wheels below
+22 m/s instead of banking a parked aeroplane.
+
+### Two things that were measured rather than assumed
+
+**Holding an attitude flies wrong.** A banked wing lifts less vertically, so a
+turn at fixed pitch descends: measured, 30 m lost in ten seconds. Closing the
+loop on vertical speed instead costs 4 m across a 150-degree turn, and makes
+"no key held" mean level flight rather than whatever attitude was left behind.
+
+**The assist uses no rudder in the air, and that is the fast setting.** A loop
+closed on turn rate diverged at every gain from 0.6 to 3.2 - this airframe has
+enough roll-yaw coupling that a rudder strong enough to drive the heading also
+rolls it, so it fought the aileron loop: 109 degrees of bank and 240 m of height
+lost in ten seconds. A static term proportional to bank was stable but made the
+turn monotonically worse:
+
+| rudder per rad of bank | 0.0 | 0.1 | 0.25 | 0.35 | 0.5 | 1.0 |
+| --- | --- | --- | --- | --- | --- | --- |
+| heading change in 10 s, rad | **1.43** | 1.20 | 0.92 | 0.76 | 0.55 | 0.18 |
+| bank held, rad | **0.77** | 0.74 | 0.70 | 0.68 | 0.65 | 0.61 |
+
+`flight.ts` already has directional stability, so the nose weathercocks into the
+turn on its own; any rudder on top of that is inducing sideslip, which drags and
+turns less. The turn rate comes from the bank angle, which is
+`g * tan(bank) / V` and is physics. The assist banks to 45 degrees, which
+roughly doubles the rate against 35 and still only asks 1.4 g of the wing.
+
+### Flown in a production build with only Shift and the arrow keys
+
+| | |
+| --- | --- |
+| ground roll to lift-off | **222 m**, 28.9 m/s |
+| climb, hands on Up | 56 m AGL |
+| level-off, nothing held | held, speed recovered 24.9 to 42.1 m/s |
+| turn on one arrow key | **151 degrees in 15 s**, 44 degrees of bank |
+| height lost across that turn | **4 m** |
+| wings after release | level, 0.00 |
+| stall or crash at any point | none |
+
+The HUD panel reads: `⇧ Shift THROTTLE UP · ↑/W CLIMB · ↓/S DESCEND · ←/A TURN
+LEFT · →/D TURN RIGHT · Space BRAKES · E GET OUT`. 150 px of a 720 px viewport,
+clear of the vitals bar and the airspeed prompt.

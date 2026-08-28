@@ -600,12 +600,28 @@ describe('the control list', () => {
   });
 
   it('covers every axis the model actually reads', () => {
-    const text = flightControlHints('windows')
+    // The DIRECT mapping is the complete stick, so it is the one that has to
+    // name every axis `flight.ts` reads. On the assisted mapping roll and
+    // rudder are reached through "turn" - the player never commands them - so
+    // asserting those words there would be asserting a lie.
+    const text = flightControlHints('windows', false)
       .map((hint) => `${hint.keys} ${hint.action}`)
       .join(' ')
       .toLowerCase();
     for (const word of ['nose up', 'nose down', 'roll', 'rudder', 'throttle', 'brake', 'gear']) {
       expect(text, `no control listed for ${word}`).toContain(word);
     }
+  });
+
+  it('covers everything the assisted mapping lets the player ask for', () => {
+    const text = flightControlHints('windows')
+      .map((hint) => `${hint.keys} ${hint.action}`)
+      .join(' ')
+      .toLowerCase();
+    for (const word of ['climb', 'descend', 'turn left', 'turn right', 'throttle', 'brake', 'gear']) {
+      expect(text, `no control listed for ${word}`).toContain(word);
+    }
+    // And it must not advertise the axes it does not expose.
+    expect(text).not.toContain('rudder');
   });
 });

@@ -153,6 +153,12 @@ export interface StoredSettings {
   readonly sensitivity: number;
   readonly reducedMotion: boolean;
   readonly highContrast: boolean;
+  /**
+   * Assisted flight controls. ON by default, because the direct stick is the
+   * reason a player gets into an aeroplane, cannot work out how to fly it, and
+   * gives up. See the header of `src/air/assist.ts`.
+   */
+  readonly flightAssist: boolean;
 }
 
 const SETTINGS_STORAGE_KEY = 'meridian.settings';
@@ -161,6 +167,7 @@ const SETTINGS_DEFAULTS: StoredSettings = {
   sensitivity: SENSITIVITY_DEFAULT,
   reducedMotion: false,
   highContrast: false,
+  flightAssist: true,
 };
 
 export function loadSettings(): StoredSettings {
@@ -178,6 +185,9 @@ export function loadSettings(): StoredSettings {
           : SENSITIVITY_DEFAULT,
       reducedMotion: record.reducedMotion === true,
       highContrast: record.highContrast === true,
+      // Absent means never chosen, which must mean ON - a stored `false` is
+      // the only thing that turns it off.
+      flightAssist: record.flightAssist !== false,
     };
   } catch {
     // Private-mode Safari throws on read as well as on write.
@@ -229,6 +239,8 @@ export interface PauseMenuCallbacks {
    * built in a harness that has no controller; the game must wire it.
    */
   onSensitivityChange?: ((radiansPerPixel: number) => void) | undefined;
+  /** Told when the player switches between the assisted and direct controls. */
+  onFlightAssistChange?: ((assist: boolean) => void) | undefined;
   /** Which section is on screen. Lets the caller draw the map lazily. */
   onTabChange?: ((tab: PauseTabId) => void) | undefined;
 }
@@ -387,7 +399,14 @@ export class PauseMenu {
     graphics.append(this.buildQuality());
 
     const gameplay = this.section('gameplay');
-    gameplay.append(this.buildSensitivity());
+    /*
+     * Flying first, look-speed second. Not cosmetic: the look-speed slider is
+     * the last focusable control in this section and is therefore the focus
+     * trap's own boundary, which `tests/pauseMenu.test.ts` uses to prove a
+     * range input is inside the tab cycle. Appending after it would move the
+     * boundary onto a button and quietly retire that assertion.
+     */
+    gameplay.append(this.buildFlight(), this.buildSensitivity());
 
     const access = this.section('access');
     access.append(this.buildAccessibility());
@@ -767,6 +786,29 @@ export class PauseMenu {
 
     group.append(row, note);
     return group;
+  }
+
+  private buildFlight(): HTMLElement {
+    const block = document.createElement('div');
+    block.className = 'mb-pause__block';
+    block.append(heading('Flying'));
+    block.append(
+      this.toggle({
+        setting: 'flight-assist',
+        label: 'Flight assist',
+        note: 'Up climbs, Down descends, Left and Right turn, and the wing will not be stalled. Turn it off for a centre stick: W pitches the nose down, A and D roll, and the rudder is on Z and C.',
+        pressed: this.settings.flightAssist,
+        onChange: (on) => {
+          this.settings = { ...this.settings, flightAssist: on };
+          saveSettings(this.settings);
+          // The Controls tab documents whichever mapping is live, so the app
+          // re-supplies the flight section from here rather than leaving it
+          // describing the other one.
+          this.callbacks.onFlightAssistChange?.(on);
+        },
+      }),
+    );
+    return block;
   }
 
   private buildAccessibility(): HTMLElement {

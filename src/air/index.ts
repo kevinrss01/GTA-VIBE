@@ -33,7 +33,9 @@ export {
 
 export {
   FLIGHT_CONTROLS,
+  FLIGHT_CONTROLS_DIRECT,
   FLIGHT_HUD_CONTROLS,
+  FLIGHT_HUD_CONTROLS_DIRECT,
   Flying,
   flightControlHints,
   flightHudHints,

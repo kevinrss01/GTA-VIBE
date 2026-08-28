@@ -43,7 +43,14 @@ import { RespawnDirector } from './combat/Respawn';
 import { defaultViewmodels } from './combat/WeaponViewmodel';
 import type { RocketHandle } from './combat/Projectiles';
 import { PoliceSystem } from './police/PoliceSystem';
-import { AIRCRAFT, AircraftSystem, FLIGHT_CONTROLS, Flying, airQaSection } from './air';
+import {
+  AIRCRAFT,
+  AircraftSystem,
+  FLIGHT_CONTROLS,
+  FLIGHT_CONTROLS_DIRECT,
+  Flying,
+  airQaSection,
+} from './air';
 import { RUNWAY, TERMINAL, TERMINAL_FLOOR } from './world/airport/layout';
 import { GATE_SEATS, TERMINAL_QUEUES } from './world/airport/plan';
 import { buildAirport } from './world/airport';
@@ -496,6 +503,10 @@ async function boot(): Promise<void> {
       pause.setMusicEnabled(enabled);
     },
     onQualityChange: setQuality,
+    onFlightAssistChange: (assist) => {
+      flying.setAssist(assist);
+      showFlightControls(assist);
+    },
   });
 
   // The look-speed slider persists itself; the controller has to be told once
@@ -505,7 +516,18 @@ async function boot(): Promise<void> {
   // The Controls tab lists what the player can actually press, including in
   // the air. Passed in rather than imported by the menu, so the UI layer keeps
   // no dependency on the flight model.
-  pause.setControlSections([{ title: 'In the air', hints: FLIGHT_CONTROLS }]);
+  /*
+   * The Controls tab documents whichever flight mapping is actually live. A
+   * reference that lists a different set of keys from the ones the aeroplane
+   * answers is worse than no reference at all, so this is re-supplied whenever
+   * the assist is switched rather than written once.
+   */
+  const showFlightControls = (assist: boolean): void => {
+    pause.setControlSections([
+      { title: 'In the air', hints: assist ? FLIGHT_CONTROLS : FLIGHT_CONTROLS_DIRECT },
+    ]);
+  };
+  showFlightControls(loadSettings().flightAssist);
 
   /*
    * The Map tab shows the same whole-city picture the `M` overlay does.
@@ -624,6 +646,9 @@ async function boot(): Promise<void> {
     standable: (x: number, z: number) =>
       ground.isInBounds(x, z) && ground.sample(x, z).surface !== 'water',
   });
+  // The stored preference, applied once. Assisted unless the player has been
+  // into the Gameplay tab and turned it off.
+  flying.setAssist(loadSettings().flightAssist);
 
   /*
    * The aircraft's own noise, translated at the seam.
