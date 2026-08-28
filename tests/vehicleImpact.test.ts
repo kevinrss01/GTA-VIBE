@@ -21,7 +21,13 @@ import { getCityPlan, type CityPlan, type Street } from '../src/world/CityPlan';
 import { TrafficSim, type Vehicle } from '../src/traffic/TrafficSim';
 import { TrafficSystem } from '../src/traffic/TrafficSystem';
 import { VEHICLE_BLUEPRINTS } from '../src/traffic/VehicleCatalogue';
-import { VEHICLE_INTEGRITY, impactDamage, type VehicleImpact } from '../src/traffic/types';
+import {
+  VEHICLE_INTEGRITY,
+  WRITE_OFF_DELTA_V,
+  YIELD_DELTA_V,
+  collisionDamage,
+  type VehicleImpact,
+} from '../src/traffic/types';
 
 // -- fixtures ---------------------------------------------------------------
 
@@ -129,7 +135,9 @@ function rearEnd(vehicle: Vehicle, impulse: number): VehicleImpact {
     dirX: fx,
     dirZ: fz,
     impulse,
-    damage: impactDamage(impulse),
+    // Square on the boot, so all of the delta-v this impulse gives THIS
+    // chassis crushes structure. See `collisionDamage`.
+    damage: collisionDamage({ deltaV: impulse / vehicle.blueprint.chassis.mass }),
   };
 }
 
@@ -567,13 +575,27 @@ describe('one damage model for every car', () => {
   });
 
   it('scales a collision to a write-off at the crash that would cause one', () => {
-    // Two 1400 kg cars closing at 15 m/s transfer about 12 kN.s. See
-    // `impactDamage`: that is the crash a car does not drive away from.
-    expect(impactDamage(12000)).toBeCloseTo(VEHICLE_INTEGRITY, 5);
-    // A parking shunt costs a fifth of the shell, not the whole car.
-    expect(impactDamage(2415)).toBeGreaterThan(VEHICLE_INTEGRITY * 0.15);
-    expect(impactDamage(2415)).toBeLessThan(VEHICLE_INTEGRITY * 0.25);
-    expect(impactDamage(-50)).toBe(0);
+    // SEVERITY IS DELTA-V, not impulse: see `collisionDamage`. Two 1400 kg
+    // cars closing at `speed` each change velocity by 1.15 * speed / 2.
+    const closing = (speed: number): number => (1.15 * speed) / 2;
+    // 15 m/s closing is 8.6 m/s of delta-v, and that is still the crash a car
+    // does not drive away from - the boundary this scale was always meant to
+    // sit on, and the only one the old linear mapping got right.
+    expect(collisionDamage({ deltaV: closing(15) })).toBeGreaterThan(VEHICLE_INTEGRITY);
+    // A parking shunt costs paint. It used to cost a fifth of the shell, which
+    // is the defect this calibration exists to prevent.
+    expect(collisionDamage({ deltaV: closing(3) })).toBeLessThan(VEHICLE_INTEGRITY * 0.02);
+    // An ordinary urban collision is real damage and nothing like a write-off.
+    const urban = collisionDamage({ deltaV: closing(8) });
+    expect(urban).toBeGreaterThan(VEHICLE_INTEGRITY * 0.1);
+    expect(urban).toBeLessThan(VEHICLE_INTEGRITY * 0.25);
+    // The two ends of the scale, by definition.
+    expect(collisionDamage({ deltaV: YIELD_DELTA_V })).toBeLessThan(VEHICLE_INTEGRITY * 0.02);
+    expect(collisionDamage({ deltaV: WRITE_OFF_DELTA_V })).toBeCloseTo(
+      VEHICLE_INTEGRITY * 1.01,
+      6,
+    );
+    expect(collisionDamage({ deltaV: -50 })).toBe(0);
   });
 
   it('will not let a written-off car rejoin traffic', () => {

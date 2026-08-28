@@ -103,8 +103,28 @@ export interface ProjectileOptions {
     dz: number,
     maxT: number,
   ) => number;
-  /** The rocket arrived somewhere. Everything violent happens in here. */
-  readonly onDetonate: (x: number, y: number, z: number) => void;
+  /**
+   * The rocket arrived somewhere. Everything violent happens in here.
+   *
+   * `dx/dy/dz` is the unit direction the rocket was travelling on arrival, so
+   * a warhead that struck something can push it the way it was going rather
+   * than only radially.
+   *
+   * `contact` is true when the flight ended on a `probe` HIT and false when
+   * the fuse simply ran out in mid-air. It is what tells the caller whether
+   * the probe result it is holding describes this detonation: the probe that
+   * reported the hit is the last one made before this call, with no other
+   * rocket stepped in between, which is what makes it safe to read.
+   */
+  readonly onDetonate: (
+    x: number,
+    y: number,
+    z: number,
+    dx: number,
+    dy: number,
+    dz: number,
+    contact: boolean,
+  ) => void;
   /** Called along the flight path so the caller can draw an exhaust trail. */
   readonly onTrail?: ((x: number, y: number, z: number) => void) | undefined;
   /** Called once per launch with the live rocket, so audio can follow it. */
@@ -272,6 +292,10 @@ export class Projectiles {
               rocket.x + dirX * at,
               rocket.y + dirY * at,
               rocket.z + dirZ * at,
+              dirX,
+              dirY,
+              dirZ,
+              true,
             );
             continue;
           }
@@ -283,7 +307,17 @@ export class Projectiles {
       }
 
       if (rocket.age >= MAX_FLIGHT) {
-        this.detonate(rocket, rocket.x, rocket.y, rocket.z);
+        const spent = Math.hypot(rocket.vx, rocket.vy, rocket.vz) || 1;
+        this.detonate(
+          rocket,
+          rocket.x,
+          rocket.y,
+          rocket.z,
+          rocket.vx / spent,
+          rocket.vy / spent,
+          rocket.vz / spent,
+          false,
+        );
         continue;
       }
 
@@ -333,13 +367,22 @@ export class Projectiles {
     return rocket;
   }
 
-  private detonate(rocket: Rocket, x: number, y: number, z: number): void {
+  private detonate(
+    rocket: Rocket,
+    x: number,
+    y: number,
+    z: number,
+    dx: number,
+    dy: number,
+    dz: number,
+    contact: boolean,
+  ): void {
     rocket.live = false;
     rocket.x = x;
     rocket.y = y;
     rocket.z = z;
     this.detachView(rocket);
-    this.options.onDetonate(x, y, z);
+    this.options.onDetonate(x, y, z, dx, dy, dz, contact);
   }
 
   /**

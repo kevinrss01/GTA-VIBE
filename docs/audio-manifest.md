@@ -100,8 +100,6 @@ so the measured duration is recorded rather than the requested one.
 | --- | --- | --- | --- |
 | `steps/pavement-1` | `/audio/steps/pavement-1.mp3` | -0.8 dB | one single footstep on a dry concrete paving slab, walking pace, close dry recording, no reverb, no music, no other sound |
 | `steps/pavement-2` | `/audio/steps/pavement-2.mp3` | -0.7 dB | one single footstep landing heel first on a dry concrete paving slab, walking pace, close dry recording, no reverb, no music, no other sound |
-| `steps/asphalt-1` | `/audio/steps/asphalt-1.mp3` | +7.3 dB | one single footstep on worn asphalt road surface, walking pace, close dry recording, no reverb, no music, no other sound |
-| `steps/asphalt-2` | `/audio/steps/asphalt-2.mp3` | -3.4 dB | one single scuffing footstep on worn gritty asphalt road surface, walking pace, close dry recording, no reverb, no music, no other sound |
 | `steps/boardwalk-1` | `/audio/steps/boardwalk-1.mp3` | +8.6 dB | one single footstep on hollow wooden decking boards, walking pace, close dry recording, no reverb, no music, no other sound |
 | `steps/boardwalk-2` | `/audio/steps/boardwalk-2.mp3` | +1.6 dB | one single footstep on a creaking hollow wooden boardwalk plank, walking pace, close dry recording, no reverb, no music, no other sound |
 | `steps/gravel-1` | `/audio/steps/gravel-1.mp3` | -1.5 dB | one single footstep crunching on loose gravel, walking pace, close dry recording, no reverb, no music, no other sound |
@@ -122,7 +120,7 @@ airfield materials because they did not exist. 1.6667 credits each.
 | `steps/terminal-1` | `/audio/steps/terminal-1.mp3` | -4.2 dB | one single loud sharp footstep on a hard polished tiled floor, a bright flat slap of a leather sole at full volume with a very short tail, recorded extremely close, no music, no speech, no other sound |
 | `steps/terminal-2` | `/audio/steps/terminal-2.mp3` | -0.5 dB | one single hard leather heel striking a polished marble floor, one loud crisp high click at full volume with a very short tail, recorded extremely close with the microphone right at the shoe, no music, no speech, no other sound |
 
-All sixteen ship at 0.320 s and 6,313 bytes. Six retries were needed to get the
+All eighteen ship at 0.320 s and 6,313 bytes (the asphalt pair was replaced and the stone pair added on 2026-08-28; see below). Six retries were needed to get the
 four new surfaces above the noise floor; `terminal-1` took three, and each
 retry costs 1.6667 credits.
 
@@ -156,8 +154,8 @@ to hit the target.
 | --- | --- | --- | --- | --- | --- |
 | `steps/pavement-1` | -25.9 dB | -31.6 dB | -23.1 dB | -0.8 dB | **-23.9 dB** |
 | `steps/pavement-2` | -27.1 dB | -32.7 dB | -24.3 dB | -0.7 dB | **-25.0 dB** |
-| `steps/asphalt-1` | -34.6 dB | -32.0 dB | -31.9 dB | +7.3 dB | **-24.6 dB** |
-| `steps/asphalt-2` | -21.4 dB | -27.4 dB | -18.6 dB | -3.4 dB | **-22.0 dB** |
+| `steps/asphalt-1` | -34.6 dB | -32.0 dB | *replaced 2026-08-28* | — | — |
+| `steps/asphalt-2` | -21.4 dB | -27.4 dB | *replaced 2026-08-28* | — | — |
 | `steps/boardwalk-1` | -32.1 dB | -28.1 dB | -30.6 dB | +8.6 dB | **-22.0 dB** |
 | `steps/boardwalk-2` | -26.3 dB | -29.7 dB | -23.6 dB | +1.6 dB | **-22.0 dB** |
 | `steps/gravel-1` | -25.3 dB | -31.3 dB | -22.5 dB | -1.5 dB | **-24.0 dB** |
@@ -191,6 +189,117 @@ top of it.
 
 **Subtotal: 28 credits for the original twelve, plus 16.67 credits of re-renders
 (six new files and four retries): 44.67 credits (USD 0.89).**
+
+### The 2026-08-28 asphalt replacement: the road that sounded like grass
+
+The 2026-08-27 pass fixed two real defects and the road still sounded like a
+verge, because neither of them was the defect being reported.
+
+- The **classifier** was already right. `tests/footsteps.test.ts` sweeps the
+  built world and asserts that all 5,000+ carriageway sample points resolve to
+  the `asphalt` family, and that no outdoor point plays a domestic tile.
+- The **levels** were already right: a 3.0 dB spread across the set.
+- The **recordings** were wrong. Both asphalt renders were rustles.
+
+Neither loudness nor classification says anything about **timbre**, so a third
+measurement was needed. Band-passing each shipped 0.32 s file and taking the
+mean level of each band gives two derived numbers that separate a hard contact
+from a loose one:
+
+```
+body   = mean(180-800 Hz) - mean(8 kHz+)     the contact standing over the air
+crunch = mean(0.8-3 kHz)  - mean(180-800 Hz) whether it peaks in the grit band
+```
+
+Measured over the shipped set with `node tools/generate-world-sfx.mjs --bands`:
+
+| Asset | body | crunch | class |
+| --- | --- | --- | --- |
+| `steps/pavement-1` | +25.5 dB | -14.5 dB | hard |
+| `steps/pavement-2` | +32.6 dB | -8.7 dB | hard |
+| `steps/concrete-1` | +17.7 dB | -3.7 dB | hard |
+| `steps/concrete-2` | +14.4 dB | -4.6 dB | hard |
+| `steps/asphalt-1` **(was)** | **+4.2 dB** | **+3.9 dB** | **loose** |
+| `steps/asphalt-2` **(was)** | **+11.6 dB** | **+2.4 dB** | borderline |
+| `steps/gravel-1` | +4.7 dB | +0.8 dB | loose |
+| `steps/gravel-2` | -4.0 dB | +1.5 dB | loose |
+| `steps/grass-1` | -12.4 dB | +5.7 dB | loose |
+| `steps/grass-2` | +2.5 dB | -0.5 dB | loose |
+| `steps/asphalt-1` **(now)** | **+29.9 dB** | **-9.5 dB** | **hard** |
+| `steps/asphalt-2` **(now)** | **+28.9 dB** | **+1.2 dB** | **hard** |
+| `steps/stone-1` **(new)** | +22.4 dB | +0.3 dB | hard |
+| `steps/stone-2` **(new)** | +23.6 dB | +1.0 dB | hard |
+
+The old asphalt-1 measured a rustle with a grit peak - numerically nearer
+`grass-1` than `pavement-1` - which is exactly what was reported. The
+replacements sit in the hard class, nearest `concrete`, which is the right
+neighbour for a bituminous aggregate: it keeps some of a poured slab's grit and
+none of a paving slab's ring.
+
+Spectrograms confirm the class change independently of the band arithmetic: the
+old pair is a broadband wash for the full 0.32 s, like `grass-1`; the new pair
+is a fast low transient with a dark top, like `pavement-1`.
+
+What changed in the prompt was naming the **damping** and excluding the failure
+modes by name. Asphalt is a bound, slightly porous surface, so a shoe on it is a
+dull blunt low contact with almost no ring and only a trace of grit - not a
+crunch of loose stones and not a rustle.
+
+| Asset | Path | Trim | Prompt |
+| --- | --- | --- | --- |
+| `steps/asphalt-1` | `/audio/steps/asphalt-1.mp3` | +3.0 dB | one single shoe stepping down onto worn asphalt road, a dull blunt low thud on hard bitumen with a short dry sandy grit texture over it, damped with no ring and no tail, walking pace, recorded loud and very close, no crunch, no loose gravel, no stones, no rustling, close dry recording, no reverb, no music, no speech, no other sound |
+| `steps/asphalt-2` | `/audio/steps/asphalt-2.mp3` | -2.5 dB | one single boot heel rolling onto dry tarmac and scraping briefly on road dust, a thick low blunt contact with a short gritty rubber drag, dead and damped, walking pace, recorded loud and very close, no crunch, no gravel, no stones, no grass, no rustle, close dry recording, no reverb, no music, no speech, no other sound |
+
+Rendered at `eleven_text_to_sound_v2`, `duration_seconds: 0.5`,
+`prompt_influence: 0.85`, `mp3_44100_128`, then cut and levelled by the same
+`--steps` path as the rest of the set. Post-trim mean: `asphalt-1` **-25.4 dB**,
+`asphalt-2` **-22.0 dB**, which keeps the whole-set spread at 3.4 dB, inside the
+4 dB the loudness test allows.
+
+### Cut stone becomes its own family
+
+`plazaStone` and `stoneAshlar` are their own materials in the world, and `plaza`
+is its own terrain surface, and all three played the pavement pair. Cut stone is
+denser and brighter than a poured slab: measured, the stone pair carries 9 to
+15 dB more 0.8-3 kHz relative to its contact band than pavement does, which is
+why a paving-slab recording reads as wrong on a stone square. Two recordings
+rather than a remap.
+
+| Asset | Path | Trim | Prompt |
+| --- | --- | --- | --- |
+| `steps/stone-1` | `/audio/steps/stone-1.mp3` | -0.9 dB | one single leather-soled shoe landing on a worn stone flagstone in an old town square, a hard bright stony knock with a short natural click and no grit, walking pace, recorded loud and very close, no crunch, no gravel, no loose stones, no rustling, close dry recording, no reverb, no music, no speech, no other sound |
+| `steps/stone-2` | `/audio/steps/stone-2.mp3` | -1.0 dB | one single footstep pivoting on a smooth worn limestone slab, a hard bright stone contact with a brief dry sole scuff, dense and solid, walking pace, recorded loud and very close, no crunch, no gravel, no dirt, no rustling, close dry recording, no reverb, no music, no speech, no other sound |
+
+`SURFACE_STEP_FAMILY.plaza`, `MATERIAL_STEP_FAMILY.plazaStone` and
+`MATERIAL_STEP_FAMILY.stoneAshlar` now all resolve to `stone`.
+
+### Takes, and why the tool now chooses
+
+A footstep has to satisfy three measured constraints at once - level to the
+set's -22 dBFS mean under a -1.5 dBFS peak guard, body >= 10 dB, crunch <= +2 dB
+- and a single take from a stochastic generator frequently misses one. Over five
+takes of `asphalt-1`, measured body ran from **-0.1 dB to +29.9 dB**: take 0 was
+a rustle and take 2 is the shipped file. Two `stone-1` renders in a row came back
+with a peak already at -0.4 dBFS and a mean at -27 dB, which the peak guard makes
+impossible to level at all.
+
+`node tools/generate-world-sfx.mjs --takes 5 <id>` renders N takes, cuts and
+measures each, keeps the best by penalty against those three targets and deletes
+the rest, so the selection is reproducible and recorded rather than a hand
+re-roll. `--steps` also now refuses to re-cut a file that is already at the
+window; doing so a second time re-seeks the transient inside the trimmed file and
+silently throws away the head of the step.
+
+**Credits: 35 for candidate exploration and the first, rejected renders; 50 for
+the four take-selected finals (four ids x five takes x 1.6667). 85 credits
+(USD 1.70).** Every render was 0.5 s at 3.3333 credits per second.
+
+The measurements are pinned as data in `src/audio/manifest.ts` (`STEP_BAND_DB`,
+`HARD_SURFACE_BODY_DB`) and asserted in `tests/audio.test.ts`, in the same way
+`STEP_MEAN_DB` pins the loudness rebalance. The threshold sits at 10 dB, in the
+gap between the classes rather than on a sample: the weakest hard surface
+measures +12.1 dB and the strongest loose one +4.7 dB. Re-measure with `--bands`
+after any re-render.
 
 ### Surface mapping
 

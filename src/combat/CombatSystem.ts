@@ -76,10 +76,18 @@ import {
   type Direction,
   type HitZone,
 } from './ballistics';
-import { CombatFx, impactSound, surfaceImpact, type ImpactKind, type ImpactSound } from './CombatFx';
+import {
+  CombatFx,
+  impactSound,
+  surfaceImpact,
+  type ImpactKind,
+  type ImpactSound,
+  type ScorchPlacement,
+} from './CombatFx';
 import { Projectiles, type RocketHandle } from './Projectiles';
 import {
   nearestPointOnOrientedBox,
+  orientedBoxNormal,
   rayCylinder,
   rayGround,
   rayOrientedBox,
@@ -165,6 +173,159 @@ const ACTOR_REACH = 1;
 const BLAST_IMPULSE = 7000;
 
 /**
+ * The presented area `BLAST_IMPULSE` is calibrated against, in square metres.
+ *
+ * A saloon is 4.88 x 1.50 m in side elevation, which is 7.3 m². A blast does
+ * not push a "vehicle": it pushes whatever area of one it can see, so a box
+ * truck standing 6.70 x 2.92 m broadside has to take more of the shockwave
+ * than a compact does. Without this the only thing separating them was mass,
+ * and the truck - being heavier and no larger, as far as the arithmetic knew -
+ * simply shrugged everything off.
+ */
+const BLAST_AREA_REFERENCE = 7.3;
+
+/**
+ * How hard the impulse grows with that area, and the ceiling on it.
+ *
+ * A SQUARE ROOT, not a straight ratio. The blast loads the near face hardest
+ * and the far half of a long body barely at all, and the pressure has already
+ * fallen off across the length of a truck, so doubling the silhouette does not
+ * double the shove. Straight proportionality made every vehicle in the
+ * catalogue accelerate to almost exactly the same speed, because area and mass
+ * happen to scale together across it - which is arithmetic, not physics, and
+ * it erased the difference between blowing over a hatchback and rocking a van.
+ */
+const BLAST_AREA_MIN = 0.55;
+const BLAST_AREA_MAX = 2.2;
+
+/**
+ * Newton-seconds a warhead adds to the thing it hits SQUARE ON.
+ *
+ * The blast is radial and reaches everything; this is the part of the round
+ * that was still travelling at 46 m/s when it arrived, and it only exists for
+ * the one body the rocket physically struck. It is what makes a direct hit
+ * different from a near miss at the same distance - the near miss shoves the
+ * car sideways, the direct hit puts it through a shopfront.
+ */
+const DIRECT_IMPULSE = 4600;
+
+/**
+ * Newton-seconds a blast puts straight UP through a body it reaches.
+ *
+ * Scaled by the same exposure and falloff as the shove, then by how much of the
+ * body the overpressure passes UNDER - see `blastLift`. 3200 N.s at the seat of
+ * a blast is 2.25 m/s on a 1420 kg saloon: a car that visibly leaves the road,
+ * hangs for about half a second and comes down hard, rather than one that
+ * either slides or is launched over a rooftop.
+ *
+ * Added to the horizontal impulse rather than divided out of it, so the shove
+ * every existing number was calibrated against is unchanged. See
+ * `VehicleImpact.lift`.
+ */
+const BLAST_LIFT = 3200;
+
+/**
+ * Extra lift for the body the warhead physically struck.
+ *
+ * The counterpart of `DIRECT_IMPULSE`: 2600 N.s more, so a direct hit on a
+ * saloon reaches 3.06 m/s upward - roughly 0.48 m of air and 0.62 s of hang. A
+ * box truck three times the mass takes the same impulse and barely leaves the
+ * ground, which is the difference worth having.
+ */
+const DIRECT_LIFT = 2600;
+
+/**
+ * How much of a blast lifts a body rather than shoving it, as a signed share.
+ *
+ * A blast is radial, so where its seat sits relative to the body decides how
+ * much of it goes underneath. The reference is the body's own CENTRE - which is
+ * what `CombatVehicleView.y` is, `vehicle.y + halfHeight`, not the ground under
+ * the wheels - and the distance is measured in half heights so the answer is
+ * scale free:
+ *
+ *   - a warhead at road level beside a car is a full half height below its
+ *     centre and passes entirely under it: +1
+ *   - one level with the centre is pure shove: 0
+ *   - one arriving through the ROOF presses down instead: -1
+ *
+ * `direct` FLOORS it high, and the number matters. A warhead that physically
+ * struck a car normally lands on a flank at or above mid height, where the
+ * geometry alone returns zero or less - on the bare geometry a rocket into a
+ * windscreen would press the car into the road. But a warhead that struck the
+ * shell has already put its own energy inside it, and a car hit by a rocket
+ * that merely settles on its springs is the whole defect this exists to fix. At
+ * 0.75 a direct hit on a saloon is about 2.4 m/s upward - 0.30 m of air and
+ * half a second of hang, a car visibly thrown. At the 0.35 first tried it was
+ * a tenth of that, which is a pothole.
+ */
+export function blastLift(
+  blastY: number,
+  vehicleCentreY: number,
+  halfHeight: number,
+  direct: boolean,
+): number {
+  const half = Math.max(0.1, halfHeight);
+  const bounded = clamp((vehicleCentreY - blastY) / half, -1, 1);
+  return direct ? Math.max(bounded, 0.75) : bounded;
+}
+
+/**
+ * Projected area of a yaw-oriented box seen from a direction, in square metres.
+ *
+ * The exact shadow a box casts along a direction is the sum over its three
+ * face pairs of `|d · axis| * faceArea`, which is cheap, needs no clipping and
+ * is right for every orientation including the diagonal ones. `d` need not be
+ * normalised; a zero direction reports the side elevation, which is the most
+ * likely answer when a blast is exactly at the centre of a car.
+ */
+export function presentedArea(
+  halfLength: number,
+  halfWidth: number,
+  halfHeight: number,
+  yaw: number,
+  dx: number,
+  dy: number,
+  dz: number,
+): number {
+  const length = Math.max(0, halfLength) * 2;
+  const width = Math.max(0, halfWidth) * 2;
+  const height = Math.max(0, halfHeight) * 2;
+  const norm = Math.hypot(dx, dy, dz);
+  if (norm < 1e-6) return length * height;
+  const ux = dx / norm;
+  const uy = dy / norm;
+  const uz = dz / norm;
+  const sin = Math.sin(yaw);
+  const cos = Math.cos(yaw);
+  // The box's own axes, in the convention `rayOrientedBox` uses: local X runs
+  // across the vehicle and local Z from nose to tail.
+  const acrossX = cos;
+  const acrossZ = -sin;
+  const alongX = sin;
+  const alongZ = cos;
+  const across = Math.abs(ux * acrossX + uz * acrossZ);
+  const along = Math.abs(ux * alongX + uz * alongZ);
+  const up = Math.abs(uy);
+  return across * length * height + along * width * height + up * length * width;
+}
+
+/**
+ * How much of the peak impulse survives to a given share of the radius.
+ *
+ * SHARPER THAN THE DAMAGE CURVE, deliberately. Damage at the rim of a blast
+ * should still be felt - that is what a radius means - but momentum at the rim
+ * should be almost nothing, or every parked car within nine metres takes off
+ * together and the street turns into a fairground. Raising the damage curve to
+ * the power of one and a half gives full shove inside the fireball, 0.43 of it
+ * at half the radius, and 0.028 at four fifths of it - a third of what the
+ * damage curve still reports there.
+ */
+export function blastImpulseFalloff(share: number): number {
+  const damage = blastFalloff(share);
+  return damage * Math.sqrt(damage);
+}
+
+/**
  * Metres per second a body is thrown at by the thing that killed it.
  *
  * A bullet does not move a person; it drops them where they stood. A shockwave
@@ -196,7 +357,7 @@ const WORLD_UP = new Vector3(0, 1, 0);
  * fireball - then a square falloff to nothing at the edge. A linear falloff
  * made the outer half of the radius feel like a much bigger weapon than it is.
  */
-function blastFalloff(share: number): number {
+export function blastFalloff(share: number): number {
   if (share <= 0.34) return 1;
   if (share >= 1) return 0;
   const t = (1 - share) / 0.66;
@@ -243,6 +404,14 @@ export interface VehicleImpact {
   readonly dirZ: number;
   /** Newton-seconds. */
   readonly impulse: number;
+  /**
+   * Newton-seconds STRAIGHT UP, added to the horizontal impulse rather than
+   * divided out of it. Negative presses down. Structurally identical to
+   * `VehicleImpact.lift` in `src/traffic/types.ts`, which is what the traffic
+   * layer reads; this interface is the combat layer's own statement of the
+   * contract so the two modules do not have to import each other.
+   */
+  readonly lift?: number;
   readonly damage: number;
 }
 
@@ -400,6 +569,33 @@ export interface CombatContext {
 }
 
 export type HitKind = 'civilian' | 'police' | 'vehicle' | 'policeVehicle' | 'world' | 'ground' | 'none';
+
+/**
+ * What a warhead physically arrived on, carried into the detonation.
+ *
+ * ONE HIT RESULT DECIDES EVERYTHING. The rocket's swept probe already knows
+ * the surface normal, the material and which vehicle - if any - was struck,
+ * and until this existed all of it was thrown away and only the distance
+ * survived. That is why a rocket into a wall used to leave its scorch lying
+ * flat in mid-air, why it sounded the same against glass as against tarmac,
+ * and why the car it hit dead centre was pushed by exactly the radial blast a
+ * car standing beside it got.
+ */
+export interface BlastContact {
+  /** Outward unit normal of the surface the warhead struck. */
+  readonly nx: number;
+  readonly ny: number;
+  readonly nz: number;
+  /** Unit direction the warhead was travelling on arrival. */
+  readonly dirX: number;
+  readonly dirY: number;
+  readonly dirZ: number;
+  readonly kind: HitKind;
+  /** What the surface is made of, in the visual vocabulary. */
+  readonly impact: ImpactKind;
+  /** The vehicle the warhead physically struck, or -1 for anything else. */
+  readonly vehicleId: number;
+}
 
 interface Hit {
   t: number;
@@ -580,11 +776,39 @@ export class CombatSystem {
     zone: HitZone | undefined;
   } = { dirX: 0, dirZ: 0, speed: 0, x: undefined, y: undefined, z: undefined, zone: undefined };
   private readonly contact: BoxPoint = { x: 0, y: 0, z: 0, distance: 0 };
+  /**
+   * What the rocket's last swept probe found.
+   *
+   * Written by `probeRocket` and read by `onDetonate`, which `Projectiles`
+   * calls in the same loop iteration as the probe that ended the flight - see
+   * `Projectiles.update`. `valid` is cleared on every probe that found
+   * nothing, so a detonation can never read a hit from an earlier rocket.
+   * Reused rather than returned so a rocket in flight allocates nothing.
+   */
+  private readonly probeHit = {
+    valid: false,
+    nx: 0,
+    ny: 1,
+    nz: 0,
+    kind: 'none' as HitKind,
+    impact: 'world' as ImpactKind,
+    vehicleId: -1,
+  };
+  /** The contact handed to `detonate`, reused for the same reason. */
+  private readonly blastContact = {
+    nx: 0, ny: 1, nz: 0,
+    dirX: 0, dirY: 0, dirZ: -1,
+    kind: 'none' as HitKind,
+    impact: 'world' as ImpactKind,
+    vehicleId: -1,
+  };
+  /** Where a detonation's scorch goes. Reused. */
+  private readonly scorch = { x: 0, y: 0, z: 0, nx: 0, ny: 1, nz: 0 };
   private readonly vehicleHit: {
     x: number; y: number; z: number;
     dirX: number; dirZ: number;
-    impulse: number; damage: number;
-  } = { x: 0, y: 0, z: 0, dirX: 0, dirZ: 0, impulse: 0, damage: 0 };
+    impulse: number; lift: number; damage: number;
+  } = { x: 0, y: 0, z: 0, dirX: 0, dirZ: 0, impulse: 0, lift: 0, damage: 0 };
 
   private counters = {
     shotsFired: 0,
@@ -609,7 +833,7 @@ export class CombatSystem {
       url: options.rocketUrl,
       length: 0.62,
       probe: (ox, oy, oz, dx, dy, dz, maxT) => this.probeRocket(ox, oy, oz, dx, dy, dz, maxT),
-      onDetonate: (x, y, z) => this.detonate(x, y, z),
+      onDetonate: (x, y, z, dx, dy, dz, contact) => this.detonateRocket(x, y, z, dx, dy, dz, contact),
       onTrail: (x, y, z) => this.fx.exhaust(x, y, z, () => this.rng.next()),
       ...(options.onRocket ? { onLaunch: options.onRocket } : {}),
     });
@@ -1062,6 +1286,24 @@ export class CombatSystem {
       }
 
       if (!drawImpact) continue;
+      if (hit.kind === 'vehicle' || hit.kind === 'policeVehicle') {
+        /*
+         * SPARKS, BUT NO DECAL.
+         *
+         * A mark is welded to the WORLD, and a car is not part of the world:
+         * it drives off half a second later and leaves its bullet holes
+         * hanging in the middle of the street, which is a worse artefact than
+         * having no holes at all. Parenting a decal to a vehicle would need
+         * the traffic layer to own a decal budget per car, which is a much
+         * larger change than this one and is not what was asked for. The
+         * sparks off the panel, the glass out of the window and the sound are
+         * what a hit on a moving body honestly leaves, and all three live for
+         * a third of a second.
+         */
+        this.fx.debris(endX, endY, endZ, hit.nx, hit.ny, hit.nz, impact, () => this.rng.next());
+        this.options.onImpact?.(impactSound(impact, false), endX, endY, endZ);
+        continue;
+      }
       this.fx.impact(
         endX,
         endY,
@@ -1232,10 +1474,16 @@ export class CombatSystem {
       hit.vehicleY = view.y;
       hit.vehicleHalf = view.halfHeight;
       hit.actor = -1;
-      hit.nx = -dir.x;
-      hit.ny = -dir.y;
-      hit.nz = -dir.z;
       hit.box = null;
+      // The PANEL's own normal, not the reversed shot. Sparks off a wing
+      // struck at forty degrees come off the wing, and the mark lies along it;
+      // the reversed direction was only ever right for a square hit.
+      orientedBoxNormal(
+        ox + dir.x * t, oy + dir.y * t, oz + dir.z * t,
+        view.x, view.y, view.z, view.yaw,
+        view.halfLength, view.halfWidth, view.halfHeight,
+        hit,
+      );
     }
 
     const world = this.options.world.cast(ox, oy, oz, dir.x, dir.y, dir.z, hit.t);
@@ -1360,6 +1608,7 @@ export class CombatSystem {
     dirZ: number,
     damage: number,
     impulse: number,
+    lift: number,
   ): void {
     const fleet = this.options.vehicles;
     if (!fleet?.applyImpact || id < 0 || damage <= 0) return;
@@ -1370,6 +1619,9 @@ export class CombatSystem {
     hit.dirX = dirX;
     hit.dirZ = dirZ;
     hit.impulse = impulse;
+    // Written unconditionally: the object is reused across every vehicle in a
+    // blast, so a value left over from the last one would follow the next.
+    hit.lift = lift;
     hit.damage = damage;
     fleet.applyImpact(id, hit);
   }
@@ -1434,6 +1686,13 @@ export class CombatSystem {
    * Reuses the same candidate gathering and the same cast the hitscan weapons
    * do, so a rocket collides with exactly the things a bullet collides with
    * and there is no second, subtly different world model to keep in step.
+   *
+   * The contract with `Projectiles` is a distance, because that is all the
+   * flight integrator can use - but the cast found a normal, a material and a
+   * victim as well, and every one of those is needed a moment later by the
+   * detonation. They are latched here rather than recomputed there: recasting
+   * from the impact point would be a SECOND hit test with its own answer, and
+   * two hit tests that disagree is exactly the class of defect this is.
    */
   private probeRocket(
     ox: number,
@@ -1453,7 +1712,52 @@ export class CombatSystem {
     cast.direction.z = dz;
     this.gatherCandidates(cast, ox, oy, oz, maxT, 0);
     const hit = this.castOne(cast, ox, oy, oz, maxT);
-    return hit.kind === 'none' ? -1 : hit.t;
+    const latch = this.probeHit;
+    if (hit.kind === 'none') {
+      latch.valid = false;
+      return -1;
+    }
+    latch.valid = true;
+    latch.nx = hit.nx;
+    latch.ny = hit.ny;
+    latch.nz = hit.nz;
+    latch.kind = hit.kind;
+    latch.vehicleId = hit.vehicleId;
+    latch.impact = warheadSurface(hit);
+    return hit.t;
+  }
+
+  /**
+   * A rocket arrived. Turns the latched probe result into a blast contact.
+   *
+   * `contact` false is the fuse running out in mid-air, where there is no
+   * surface, nothing was struck and the scorch has to fall to the ground.
+   */
+  private detonateRocket(
+    x: number,
+    y: number,
+    z: number,
+    dx: number,
+    dy: number,
+    dz: number,
+    contact: boolean,
+  ): void {
+    if (!contact || !this.probeHit.valid) {
+      this.detonate(x, y, z);
+      return;
+    }
+    const at = this.blastContact;
+    at.nx = this.probeHit.nx;
+    at.ny = this.probeHit.ny;
+    at.nz = this.probeHit.nz;
+    at.dirX = dx;
+    at.dirY = dy;
+    at.dirZ = dz;
+    at.kind = this.probeHit.kind;
+    at.impact = this.probeHit.impact;
+    at.vehicleId = this.probeHit.vehicleId;
+    this.probeHit.valid = false;
+    this.detonate(x, y, z, at);
   }
 
   /**
@@ -1474,13 +1778,52 @@ export class CombatSystem {
    * casting a ray to every person in a 9.5 m radius to decide otherwise would
    * cost more than the whole rest of the weapon.
    */
-  detonate(x: number, y: number, z: number): void {
+  detonate(x: number, y: number, z: number, contact?: BlastContact): void {
     const spec = WEAPONS.launcher;
     const radius = spec.blastRadius ?? 8;
     const peak = spec.blastDamage ?? 150;
     const player = this.options.player;
 
-    this.fx.explosion(x, y, z, radius, () => this.rng.next());
+    /*
+     * Where the scorch goes.
+     *
+     * A warhead that struck the WORLD - a wall, a kerb, the road - scorches
+     * exactly that surface, standing the mark up on a wall and laying it down
+     * on a road out of the one normal the probe already found. Anything else -
+     * a car, a person, or a fuse that simply ran out in the air - has no
+     * surface worth marking, because the thing that was struck is about to
+     * move, so the mark falls to the ground under the blast where a player
+     * will still find it afterwards.
+     */
+    const onSurface = contact !== undefined && (contact.kind === 'world' || contact.kind === 'ground');
+    const place = this.scorch;
+    if (onSurface && contact) {
+      place.x = x;
+      place.y = y;
+      place.z = z;
+      place.nx = contact.nx;
+      place.ny = contact.ny;
+      place.nz = contact.nz;
+    } else {
+      place.x = x;
+      place.y = this.options.heightAt(x, z);
+      place.z = z;
+      place.nx = 0;
+      place.ny = 1;
+      place.nz = 0;
+    }
+    this.fx.explosion(x, y, z, radius, () => this.rng.next(), place as ScorchPlacement);
+    // What the warhead landed ON, thrown out of it: grit off concrete, sparks
+    // off steel, glass off a shopfront. The same material the sound and the
+    // scorch came from, because all three read one hit result.
+    if (contact) {
+      this.fx.debris(
+        x, y, z,
+        contact.nx, contact.ny, contact.nz,
+        contact.impact,
+        () => this.rng.next(),
+      );
+    }
     // Heard a great deal further than a gunshot, and unthrottled relative to
     // one: a detonation is never part of a burst.
     this.alarmCooldown = 0;
@@ -1537,37 +1880,100 @@ export class CombatSystem {
     if (this.options.law) strike(this.options.law, true);
 
     let hitPoliceVehicle = false;
+    const struck = contact?.vehicleId ?? -1;
     // EVERY vehicle, not only the police ones, and measured to the nearest
     // point of the body rather than to its centre. Both of those were wrong:
     // a rocket that landed against a van's bumper measured itself ten metres
     // away from the van, and an ordinary parked car was never asked at all.
     this.options.vehicles?.forEachNear(x, z, radius + VEHICLE_REACH, (view) => {
-      const contact = nearestPointOnOrientedBox(
+      const near = nearestPointOnOrientedBox(
         x, y, z,
         view.x, view.y, view.z, view.yaw,
         view.halfLength, view.halfWidth, view.halfHeight,
         this.contact,
       );
-      if (contact.distance > radius) return;
-      const share = blastFalloff(contact.distance / radius);
-      if (share <= 0) return;
+      const direct = view.id === struck && struck >= 0;
+      if (near.distance > radius) return;
+      const share = blastFalloff(near.distance / radius);
+      if (share <= 0 && !direct) return;
       // Pushed along the line from the blast to the vehicle's centre: pushing
       // from the contact point would send a car struck square on its flank
       // nowhere at all, because that line is only the thickness of the panel.
+      // The MOMENT still comes from the contact point, which is why a blast
+      // beside one wing spins the car and one abeam its centre does not.
       const dx = view.x - x;
       const dz = view.z - z;
       const flat = Math.hypot(dx, dz);
-      this.blastVehicle(
-        view.id,
-        contact.x, contact.y, contact.z,
-        flat > 1e-4 ? dx / flat : 1,
-        flat > 1e-4 ? dz / flat : 0,
-        peak * share,
-        BLAST_IMPULSE * share,
+      let pushX = flat > 1e-4 ? dx / flat : 1;
+      let pushZ = flat > 1e-4 ? dz / flat : 0;
+
+      /*
+       * How much of the shockwave this body can actually catch.
+       *
+       * Measured along the line the blast reaches it on, so a car standing
+       * broadside to a detonation takes far more of it than one nose-on -
+       * which is the difference between a van being rolled onto its side and
+       * being shoved down the street.
+       */
+      const area = presentedArea(
+        view.halfLength, view.halfWidth, view.halfHeight, view.yaw,
+        dx, view.y - y, dz,
       );
+      const exposure = clamp(
+        Math.sqrt(area / BLAST_AREA_REFERENCE),
+        BLAST_AREA_MIN,
+        BLAST_AREA_MAX,
+      );
+      const momentum = blastImpulseFalloff(near.distance / radius);
+      let impulse = BLAST_IMPULSE * exposure * momentum;
+      // Straight up, and added rather than taken out of the shove above. The
+      // share is signed, so a warhead through the roof presses down instead.
+      let lift =
+        BLAST_LIFT *
+        exposure *
+        momentum *
+        blastLift(y, view.y, view.halfHeight, direct);
+      let damage = peak * share;
+      let pointX = near.x;
+      let pointY = near.y;
+      let pointZ = near.z;
+
+      if (direct && contact) {
+        /*
+         * THE ONE BODY THE WARHEAD PHYSICALLY HIT.
+         *
+         * It gets the round's own direct damage on top of the blast, and the
+         * momentum the rocket was still carrying, applied where it actually
+         * arrived rather than at the point of the shell nearest the blast.
+         * Both go into the SAME `applyImpact` call: the traffic layer rate
+         * limits impulses to one per vehicle every 0.22 s, so a second call
+         * for the direct hit would simply be refused and the car would be
+         * pushed by the blast alone.
+         */
+        damage += spec.damage;
+        lift += DIRECT_LIFT * blastLift(y, view.y, view.halfHeight, true);
+        pointX = x;
+        pointY = y;
+        pointZ = z;
+        const travel = Math.hypot(contact.dirX, contact.dirZ);
+        const alongX = travel > 1e-4 ? contact.dirX / travel : pushX;
+        const alongZ = travel > 1e-4 ? contact.dirZ / travel : pushZ;
+        // The two impulses are added as vectors, not as magnitudes: a warhead
+        // arriving along the same line the blast pushes reinforces it, one
+        // arriving across it turns the push.
+        const sumX = pushX * impulse + alongX * DIRECT_IMPULSE;
+        const sumZ = pushZ * impulse + alongZ * DIRECT_IMPULSE;
+        impulse = Math.hypot(sumX, sumZ);
+        if (impulse > 1e-4) {
+          pushX = sumX / impulse;
+          pushZ = sumZ / impulse;
+        }
+      }
+
+      this.blastVehicle(view.id, pointX, pointY, pointZ, pushX, pushZ, damage, impulse, lift);
       if (!view.police) return;
       hitPoliceVehicle = true;
-      this.options.law?.damageVehicle(view.id, peak * share);
+      this.options.law?.damageVehicle(view.id, damage);
     });
 
     for (let i = 0; i < civiliansHurt; i += 1) player.addHeat(HEAT.civilianHurt);
@@ -1735,6 +2141,22 @@ function matchesDigit(event: KeyboardEvent, digit: number): boolean {
     event.code === `Numpad${text}` ||
     event.key === text
   );
+}
+
+/**
+ * What a warhead arrived on, in the visual vocabulary.
+ *
+ * The same classification the hitscan path uses, in one place so a rocket and
+ * a rifle round striking the same shopfront agree it is glass.
+ */
+function warheadSurface(hit: Hit): ImpactKind {
+  if (hit.kind === 'civilian' || hit.kind === 'police') return 'body';
+  if (hit.kind === 'vehicle' || hit.kind === 'policeVehicle') return 'metal';
+  if (hit.kind === 'world') return hit.box ? surfaceImpact(hit.box.surface) : 'world';
+  // Terrain carries no declared material; it is paving, sand or grass and the
+  // stone bucket is what the ground has always thrown.
+  if (hit.kind === 'ground') return 'stone';
+  return 'world';
 }
 
 /**

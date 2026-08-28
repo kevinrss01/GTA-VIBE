@@ -62,6 +62,8 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 
 import { clamp, damp } from '../core/mathx';
 import { hash2 } from '../core/rng';
+import { stanceFor, type OfficerStance } from './locomotion';
+import { OFFICER_RUN_SPEED } from './policy';
 
 /** The baked character officers are drawn as. */
 export const OFFICER_VAT_ID = 'ped-police';
@@ -118,8 +120,43 @@ const WEAPON_LENGTH = 0.21;
  * clear of it and reads as being held in front of the chest.
  */
 const WEAPON_REACH = 0.22;
-/** Above this blend the weapon is in the hand and drawn. */
+/** Above this blend the officer is in the firing stance rather than carrying. */
 const WEAPON_SHOWN = 0.35;
+
+/**
+ * Where the right hand sits when the bake has not loaded, in rig units.
+ *
+ * The mean of the `shoot` clip's measured hand track in
+ * `public/models/pedestrians/ped-police.json`: (0.087, 0.467, -0.009), x
+ * across, y up as a fraction of body height, z forward-negative. It exists so
+ * that a MUZZLE POSITION is available on every code path - including the
+ * headless tests and the procedural fallback - rather than only once a 1.9 MB
+ * download has landed. A shot that has no weapon to come out of is exactly the
+ * defect this is here to prevent.
+ */
+const HAND_FALLBACK_X = 0.087;
+const HAND_FALLBACK_Y = 0.467;
+const HAND_FALLBACK_Z = -0.009;
+
+/**
+ * The world transform of an officer's weapon muzzle.
+ *
+ * THE ONE AUTHORITY. The damage ray, the line-of-sight test, the muzzle flash,
+ * the tracer and the audio position all read this, so a round cannot appear to
+ * come from anywhere except the thing the player can see in the officer's
+ * hand. Before this existed the tracer left the body centre 1.38 m up while
+ * the drawn weapon was 0.84 m up and 0.3 m further forward, which is what
+ * "fires without visibly handling a weapon" looked like.
+ */
+export interface MuzzleTransform {
+  /** Muzzle tip, in world metres. */
+  x: number;
+  y: number;
+  z: number;
+  /** Unit horizontal direction the barrel points, world. */
+  dirX: number;
+  dirZ: number;
+}
 
 /** Comfortable walking speed used to pick a cadence. */
 const PREFERRED_SPEED = 1.5;
@@ -167,6 +204,14 @@ export interface OfficerPose {
   phase: number;
   /** Standing-to-walking blend, 0..1. Owned by the rig. */
   gait: number;
+  /**
+   * Which locomotion clip is playing. Owned by the rig.
+   *
+   * Chosen from the MEASURED speed with hysteresis, so the boundary between
+   * standing, walking and running is a band and not a threshold: an officer
+   * decelerating through it cannot flicker between two clips.
+   */
+  stance: OfficerStance;
   /** Per-officer variation seed, so two officers are not identical. */
   variant: number;
   /** Distance covered in rig units. Drives the baked clip. Owned by the rig. */
@@ -182,6 +227,16 @@ export interface OfficerPose {
    * and not as a pose snapping on.
    */
   aiming: number;
+  /**
+   * The sidearm is out of the holster and in the hand. Owned by the caller.
+   *
+   * Separate from `aiming` because carrying and aiming are different things:
+   * an officer runs with the weapon in their hand at their side long before
+   * they stop and bring it up, and the model has to be drawn for both. It is
+   * also what makes a DRAW visible - for the length of the draw the hands move
+   * and there is nothing in them yet.
+   */
+  armed: boolean;
   /**
    * True once this officer has been put on the ground. Owned by the caller.
    *
@@ -223,6 +278,7 @@ export class OfficerRig {
   private disposed = false;
 
   private readonly hand = { x: 0, y: 0, z: 0 };
+  private readonly muzzle: MuzzleTransform = { x: 0, y: 0, z: 0, dirX: 0, dirZ: -1 };
   private readonly weaponMatrix = new Matrix4();
   private readonly weaponPosition = new Vector3();
   private readonly weaponRotation = new Quaternion();
@@ -354,25 +410,39 @@ export class OfficerRig {
     return pose.fallSign * amount * Math.PI * 0.5;
   }
 
-  /** Advances one officer's walk cycle and distance accumulator. */
+  /**
+   * Advances one officer's walk cycle and distance accumulator.
+   *
+   * CALL THIS AFTER THE BODY HAS BEEN MOVED AND RESOLVED AGAINST THE WORLD.
+   * Everything here is driven by the displacement that actually happened, so
+   * calling it before the move would key the legs off last frame's position.
+   */
   static advance(pose: OfficerPose, dt: number): void {
     // A body has no gait. Advancing one would walk the legs of a corpse.
     if (pose.down) return;
-    const cadence = gaitCadence(pose.speed, PREFERRED_SPEED, BASE_CADENCE, pose.height);
-    pose.gait = damp(pose.gait, pose.speed > 0.16 ? 1 : 0, 6, dt);
-    pose.phase = (pose.phase + cadence * dt * Math.max(pose.gait, 0.14)) % 1;
-    if (pose.phase < 0) pose.phase += 1;
 
     // Projecting the realised displacement onto the heading is what stops a
     // sideways shove - sliding along a wall, say - from spinning the legs.
+    // The clip runs BACKWARDS for a backward step rather than freezing, which
+    // is what a person stepping back off a doorway actually does; freezing it
+    // was itself a slide, because the body still moved.
     const dx = pose.x - pose.lastX;
     const dz = pose.z - pose.lastZ;
     pose.lastX = pose.x;
     pose.lastZ = pose.z;
-    if (dx * dx + dz * dz > MAX_STEP_SQUARED) return;
-    const forward = -dx * Math.sin(pose.heading) - dz * Math.cos(pose.heading);
-    if (forward <= 0) return;
-    pose.walked += forward / Math.max(0.4, pose.girth);
+    const jumped = dx * dx + dz * dz > MAX_STEP_SQUARED;
+    if (!jumped) {
+      const forward = -dx * Math.sin(pose.heading) - dz * Math.cos(pose.heading);
+      pose.walked += forward / Math.max(0.4, pose.girth);
+    }
+
+    // The clip choice follows the MEASURED speed, not the requested one, and
+    // through a hysteresis band so it cannot flicker at the boundary.
+    pose.stance = stanceFor(pose.speed, pose.stance, OFFICER_RUN_SPEED);
+    const cadence = gaitCadence(pose.speed, PREFERRED_SPEED, BASE_CADENCE, pose.height);
+    pose.gait = damp(pose.gait, pose.stance === 'idle' ? 0 : 1, 6, dt);
+    pose.phase = (pose.phase + cadence * dt * Math.max(pose.gait, 0.14)) % 1;
+    if (pose.phase < 0) pose.phase += 1;
   }
 
   /**
@@ -386,6 +456,10 @@ export class OfficerRig {
     if (this.disposed) return;
     if (this.character) this.writeVat(poses, time, this.character);
     else this.writeProc(poses);
+    // Outside both branches: the sidearm is its own mesh and has to be in the
+    // hand whichever body mesh is live, or a failed character download would
+    // silently disarm the whole force.
+    this.writeWeapons(poses, time);
   }
 
   private writeVat(
@@ -443,54 +517,108 @@ export class OfficerRig {
     if (action && action.duration > 1e-3) {
       this.vat.setActionPhase((time / action.duration) % 1);
     }
-    this.writeWeapons(poses, character, time);
   }
 
   /**
-   * Puts a sidearm in the hand of every officer who has one raised.
+   * Where this officer's weapon sits, in world metres. The one authority.
    *
    * The hand's position comes from the bake, in rig units, and goes through
    * exactly the transform the instance matrix applies to the body: scale by
    * girth across and height up, yaw by heading, translate to the officer. Do
    * this any other way and the weapon drifts out of the hand the moment an
    * officer is taller or wider than average.
+   *
+   * Which hand track is read depends on what the officer is DOING: the firing
+   * pose once the stance is up, the walk clip at the officer's own gait phase
+   * while they are merely carrying it, so a running officer's pistol swings
+   * with the arm that is holding it. Both are the same track the body is being
+   * drawn from on this frame.
+   *
+   * `out.x/y/z` is the muzzle TIP, half a weapon length past the grip, which
+   * is where a round leaves and where a flash belongs.
    */
-  private writeWeapons(
-    poses: readonly OfficerPose[],
-    character: PedestrianVatCharacter,
+  muzzleOf(pose: OfficerPose, time: number, out: MuzzleTransform): void {
+    const c = Math.cos(pose.heading);
+    const s = Math.sin(pose.heading);
+    const width = pose.girth;
+    const hand = this.hand;
+    if (!this.handTrack(pose, time, hand)) {
+      hand.x = HAND_FALLBACK_X;
+      hand.y = HAND_FALLBACK_Y;
+      hand.z = HAND_FALLBACK_Z;
+    }
+
+    // The body's own instance transform, applied to one point.
+    const handX = pose.x + width * (c * hand.x + s * hand.z);
+    const handY = pose.y + pose.height * hand.y;
+    const handZ = pose.z + width * (-s * hand.x + c * hand.z);
+
+    // Along the officer's heading, which is where they are shooting: the
+    // forearm-to-hand vector would point the barrel wherever the retargeted
+    // clip happens to leave the wrist, and this pose is a two-handed hold
+    // with the weapon across the body rather than an extended arm.
+    const forwardX = -s;
+    const forwardZ = -c;
+    const reach = WEAPON_REACH + WEAPON_LENGTH * 0.5;
+    out.x = handX + forwardX * reach;
+    out.y = handY;
+    out.z = handZ + forwardZ * reach;
+    out.dirX = forwardX;
+    out.dirZ = forwardZ;
+  }
+
+  /**
+   * The hand position for the clip this officer is currently being drawn with.
+   *
+   * False when the bake has not landed or carries no hand track, which is the
+   * caller's cue to fall back to the measured constant.
+   */
+  private handTrack(
+    pose: OfficerPose,
     time: number,
-  ): void {
+    out: { x: number; y: number; z: number },
+  ): boolean {
+    const character = this.character;
+    if (!character) return false;
+    const action = character.action;
+    if (pose.aiming >= WEAPON_SHOWN && action) {
+      const phase = action.duration > 1e-3 ? (time / action.duration) % 1 : 0;
+      return action.handAt(phase, out);
+    }
+    // Carrying: the walk clip at the officer's own distance-driven phase, so
+    // the weapon is where the swinging hand is and not where a clock says.
+    const walk = character.walk;
+    if (pose.stance === 'idle' && character.idle) {
+      const idle = character.idle;
+      const phase = idle.duration > 1e-3 ? (time / idle.duration) % 1 : 0;
+      return idle.handAt(phase, out);
+    }
+    return walk.handAt(walk.phaseFor(pose.walked), out);
+  }
+
+  /**
+   * Puts a sidearm in the hand of every officer who has one out.
+   *
+   * Drawn whenever the weapon is in the hand at all, not only while it is
+   * raised: an officer who has drawn and is running with it has to be holding
+   * something, or the draw the player just watched produced nothing.
+   */
+  private writeWeapons(poses: readonly OfficerPose[], time: number): void {
     const weapon = this.weapon;
     if (!weapon) return;
-    const action = character.action;
-    const phase = action && action.duration > 1e-3 ? (time / action.duration) % 1 : 0;
     const matrices = weapon.instanceMatrix.array as Float32Array;
     let drawn = 0;
 
     for (const pose of poses) {
       if (drawn >= weapon.instanceMatrix.count) break;
-      if (pose.aiming < WEAPON_SHOWN) continue;
-      const track = action ?? character.idle ?? character.walk;
-      if (!track.handAt(phase, this.hand)) continue;
-
-      const c = Math.cos(pose.heading);
-      const s = Math.sin(pose.heading);
-      const width = pose.girth;
-      // The body's own instance transform, applied to one point.
-      const handX = pose.x + width * (c * this.hand.x + s * this.hand.z);
-      const handY = pose.y + pose.height * this.hand.y;
-      const handZ = pose.z + width * (-s * this.hand.x + c * this.hand.z);
-
-      // Along the officer's heading, which is where they are shooting: the
-      // forearm-to-hand vector would point the barrel wherever the retargeted
-      // clip happens to leave the wrist, and this pose is a two-handed hold
-      // with the weapon across the body rather than an extended arm.
-      const forwardX = -s;
-      const forwardZ = -c;
+      if (!pose.armed || pose.down) continue;
+      this.muzzleOf(pose, time, this.muzzle);
+      // Back off from the tip to the model's own centre, which is what the
+      // instance matrix positions.
       this.weaponPosition.set(
-        handX + forwardX * WEAPON_REACH,
-        handY,
-        handZ + forwardZ * WEAPON_REACH,
+        this.muzzle.x - this.muzzle.dirX * WEAPON_LENGTH * 0.5,
+        this.muzzle.y,
+        this.muzzle.z - this.muzzle.dirZ * WEAPON_LENGTH * 0.5,
       );
       // The model's barrel lies along its own +Z, so a half turn plus the
       // officer's heading puts it down the officer's forward axis.

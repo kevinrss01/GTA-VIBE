@@ -258,8 +258,8 @@ instanced mesh.
 ## Limitations
 
 - **No `run` clip.** `PedestrianVat` reads exactly two clips, `walk` and `idle`,
-  and `src/agents/**` was out of scope for this change. An officer sprinting at
-  6.4 m/s therefore plays the walk cycle at a running rate — legs cycling fast,
+  and `src/agents/**` was out of scope for this change. An officer running at
+  5.4 m/s therefore plays the walk cycle at a running rate — legs cycling fast,
   which is correct in phase and stride length but is a fast walk rather than a
   run. Idle was bought instead of run because officers STAND at their firing
   standoff, and a character holding a rest pose there would look broken. Adding
@@ -349,3 +349,87 @@ the officer. It is pushed 0.22 body heights forward along the officer's own
 heading to clear the torso, so it reads as a weapon held in front of the chest
 in a compressed ready rather than as one in a fist. Fixing that properly needs
 a shooting clip with an extended arm, and Tripo's library does not have one.
+
+## Grounded pursuit, 2026-08-28
+
+The report was that police *slide* toward the player and move at implausible
+speed. Both were true, and both were measurable before anything was changed.
+
+### Measured, before
+
+Instrumenting the shipped `PoliceSystem` and sampling officer motion at 60 Hz:
+
+| | Before | After | Bound |
+| --- | --- | --- | --- |
+| Peak speed | 6.40 m/s | **5.40 m/s** | `OFFICER_RUN_SPEED` |
+| Peak acceleration | **384 m/s²** | **6.4 m/s²** | `OFFICER_BRAKE` |
+| Peak turn rate | 7.1 rad/s | **4.5 rad/s** | `OFFICER_TURN_RATE` |
+
+384 m/s² is 39 g. `updateOfficers` set `speed = wantsToMove ? OFFICER_RUN_SPEED
+: 0` — a step function — so an officer went from a standstill to full run in a
+single frame and back again, and `heading = Math.atan2(-dx, -dz)` was assigned
+rather than rate-limited, so they pivoted instantly and homed straight in.
+
+### The slide was not where it looked
+
+`OfficerRig.advance` was already displacement-driven, which is the right design
+and is why this was not obvious. It advanced the stride by the projection of the
+frame's displacement **onto the officer's heading** — and the obstacle `detour`
+moved the officer at `DETOUR_ANGLE` 1.15 rad (66°) to that heading. `cos(1.15) =
+0.407`, so **59 % of the motion during every detour was unanimated**, and
+`if (forward <= 0) return` froze the clip outright for any backward component
+while the body kept moving. Feet slid exactly when an officer came round an
+obstacle, which is exactly when a player is watching them.
+
+The fix is structural rather than a correction factor: an officer now only ever
+moves **along their own heading**, at a rate bounded by acceleration, and the
+heading itself turns at a bounded rate. Nothing writes a position. The stride
+therefore cannot disagree with the ground covered, and the test asserts it as
+`|Δwalked × girth| ≤ displacement` over 20,000+ frame pairs.
+
+### Rounds now leave the weapon
+
+`fireAtPlayer` fired from `officer.y + OFFICER_EYE * 0.86` = 1.38 m at the body
+centre. The drawn pistol was at ≈0.84 m and 0.3 m further forward — **0.54 m
+from where the muzzle actually was**. `OfficerRig.muzzleOf` is now the single
+authority, and the damage roll, the muzzle flash, the tracer, the audio event
+and a second line-of-sight test all read it. An officer whose eyes clear a low
+wall but whose weapon does not now holds fire.
+
+### Behaviour states
+
+An 11-state table in `src/police/locomotion.ts` — pure, no Three.js, directly
+testable: `idle`, `notice`, `draw`, `pursue`, `close`, `hold`, `aim`, `fire`,
+`reload`, `reposition`, `hit`. Running is used only beyond `OFFICER_RUN_RANGE`
+(12 m, with a 2.5 m hysteresis band so the gait does not flicker), so an officer
+walks the last few metres in, turns, stops and aims rather than charging.
+
+`OFFICER_SPREAD` gives each officer a 1.8 m lateral slot, so a crew takes an
+angle on the player instead of converging on one square metre.
+
+### Deliberate: police on foot are slower than a sprinting player
+
+`OFFICER_RUN_SPEED` 5.4 m/s sits below the player's 6.0 m/s sprint. A suspect
+who commits to running on foot now outruns a foot pursuit and has to be cut off
+by a car, which is the behaviour a human-scale speed implies. It is a design
+consequence of the realism requirement, not an oversight.
+
+### A bug found on the way
+
+`draw` was reachable only from `notice`, so an officer who set out to arrest a
+one- or two-star suspect and was then shot at could never draw and never fire
+back. It is now reachable from `pursue`, `close` and `hold` as well.
+
+### Coverage
+
+`tests/policeOfficers.test.ts`, 39 tests, including the per-frame no-teleport
+bound, the no-slide stride assertion, clip hysteresis, the full draw → aim →
+fire → reload ordering, "fires from the weapon muzzle, not from the middle of
+the officer", "holds fire when a wall is between the weapon and the suspect",
+"never ends a frame inside a solid box", and "stands on a kerb rather than
+sinking through it". Officers are now grounded through `collision.supportAt`
+rather than bare `heightAt`, which is why the kerb test is possible at all.
+
+**Still limited:** vertical grounding is a snap rather than a fall, so walking
+off a raised platform drops instantly. Only the horizontal no-teleport property
+is proven.

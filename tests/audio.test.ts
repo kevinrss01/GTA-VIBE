@@ -36,6 +36,12 @@ import {
   SEA_BED,
   STEP_FAMILIES,
   STEP_MEAN_DB,
+  STEP_BAND_DB,
+  type StepAssetId,
+  type StepFamily,
+  HARD_SURFACE_BODY_DB,
+  stepBody,
+  stepCrunch,
   STEP_SURFACES,
   TERMINAL_STEPS,
   getAudioAsset,
@@ -818,6 +824,88 @@ describe('surface coverage', () => {
   });
 });
 
+describe('footstep timbre: a road must not sound like a verge', () => {
+  /**
+   * The complaint the classifier could not fix.
+   *
+   * `tests/footsteps.test.ts` already proves every one of the 5,000+
+   * carriageway points in the world routes to the `asphalt` family, and the
+   * loudness suite below proves the set is levelled. Walking on a road still
+   * sounded like walking on grass, because both of those are silent about
+   * TIMBRE - and the two shipped asphalt renders were rustles.
+   *
+   * `body` and `crunch` are the two measured numbers that separate a hard
+   * contact from a loose one; see `STEP_BAND_DB`. The pre-fix asphalt pair
+   * measured body +4.2 / +11.6 dB and crunch +3.9 / +2.4 dB, which put it in
+   * the grass and gravel class. Re-measure with
+   * `node tools/generate-world-sfx.mjs --bands` after any re-render.
+   */
+  const HARD_GROUND = ['asphalt', 'pavement', 'concrete', 'stone'] as const;
+  const LOOSE_GROUND = ['grass', 'gravel'] as const;
+
+  it('gives every hard outdoor ground a hard contact', () => {
+    for (const family of HARD_GROUND) {
+      for (const id of STEP_FAMILIES[family]) {
+        expect(stepBody(id), `${id} body`).toBeGreaterThanOrEqual(HARD_SURFACE_BODY_DB);
+        // A hard contact peaks in the contact band, not in the grit band. The
+        // tolerance is +2 dB rather than 0 so a render with genuine road grit
+        // over the thud still passes; a crunch runs several dB the other way.
+        expect(stepCrunch(id), `${id} crunch`).toBeLessThanOrEqual(2);
+      }
+    }
+  });
+
+  it('leaves every loose ground below the hard threshold', () => {
+    // Without this the first test would pass on a threshold low enough to
+    // admit everything, which is how the defect survived a levelling pass.
+    for (const family of LOOSE_GROUND) {
+      for (const id of STEP_FAMILIES[family]) {
+        expect(stepBody(id), `${id} body`).toBeLessThan(HARD_SURFACE_BODY_DB);
+      }
+    }
+  });
+
+  it('separates the two classes with real margin either side', () => {
+    const hard = HARD_GROUND.flatMap((f) => STEP_FAMILIES[f].map(stepBody));
+    const loose = LOOSE_GROUND.flatMap((f) => STEP_FAMILIES[f].map(stepBody));
+    const worstHard = Math.min(...hard);
+    const bestLoose = Math.max(...loose);
+    // The threshold sits in the gap rather than on a sample, so a re-render
+    // that drifts a couple of dB does not flip the suite.
+    expect(worstHard - HARD_SURFACE_BODY_DB, 'hard margin').toBeGreaterThanOrEqual(2);
+    expect(HARD_SURFACE_BODY_DB - bestLoose, 'loose margin').toBeGreaterThanOrEqual(2);
+  });
+
+  it('measures asphalt into the hard class rather than the loose one', () => {
+    // The user-visible statement of the bug, as a distance in the two measured
+    // dimensions: whatever the absolute numbers drift to, a road must land
+    // nearer a sidewalk or an apron than a verge or a gravel yard.
+    //
+    // The nearest neighbour is CONCRETE rather than pavement, and that is the
+    // right answer rather than a near miss - asphalt is a bituminous aggregate,
+    // so it keeps some of the grit a poured slab has and none of the ring a
+    // paving slab has. Asserting "nearest to pavement" would have been pinning
+    // a coincidence.
+    const at = (id: StepAssetId): readonly [number, number] => [stepBody(id), stepCrunch(id)];
+    const distance = (a: readonly [number, number], b: readonly [number, number]): number =>
+      Math.hypot(a[0] - b[0], a[1] - b[1]);
+    const nearestIn = (from: readonly [number, number], families: readonly StepFamily[]): number =>
+      Math.min(...families.flatMap((f) => STEP_FAMILIES[f].map((id) => distance(from, at(id)))));
+    for (const id of STEP_FAMILIES.asphalt) {
+      const here = at(id);
+      expect(nearestIn(here, HARD_GROUND), `${id} hard vs loose`).toBeLessThan(
+        nearestIn(here, LOOSE_GROUND),
+      );
+    }
+  });
+
+  it('records a band measurement for every shipped step', () => {
+    for (const variants of Object.values(STEP_FAMILIES)) {
+      for (const id of variants) expect(STEP_BAND_DB[id], id).toBeDefined();
+    }
+  });
+});
+
 describe('footstep loudness and cadence', () => {
   /**
    * The rebalance, asserted as arithmetic rather than as a listening opinion.
@@ -915,6 +1003,7 @@ describe('footstep loudness and cadence', () => {
       pavement: 'pavement',
       gravel: 'gravel',
       grass: 'grass',
+      stone: 'plazaStone',
     };
     for (const family of families) {
       for (const running of [false, true]) {

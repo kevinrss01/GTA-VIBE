@@ -44,7 +44,13 @@ import type {
   VehicleView,
 } from './types';
 
-export { VEHICLE_INTEGRITY, impactDamage } from './types';
+export {
+  VEHICLE_INTEGRITY,
+  WRITE_OFF_DELTA_V,
+  YIELD_DELTA_V,
+  collisionDamage,
+  crushShare,
+} from './types';
 export type { ImpactReport, VehicleImpact } from './types';
 export type { TrafficCollision } from './TrafficSim';
 

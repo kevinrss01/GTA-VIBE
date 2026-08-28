@@ -192,6 +192,69 @@ export function nearestPointOnOrientedBox(
   return out;
 }
 
+/** An outward unit normal, written in place so a burst does not allocate. */
+export interface SurfaceNormal {
+  nx: number;
+  ny: number;
+  nz: number;
+}
+
+/**
+ * Outward normal of the face of a yaw-rotated box a point lies on.
+ *
+ * A vehicle is an oriented box and a round that arrives on its flank has to
+ * throw its sparks and lay its mark along THAT flank, not back down the line
+ * the round came from. The reversed shot direction was standing in for this,
+ * which is right only for a shot square onto a panel and wrong by up to ninety
+ * degrees for every other one.
+ *
+ * The point is expressed in the box's own frame - same convention as
+ * `rayOrientedBox`, local X across the vehicle and local Z nose to tail - the
+ * nearest face is chosen by how far the point sits inside each slab, and the
+ * winning local axis is rotated back out. A point at a corner is on two faces
+ * at once and gets whichever is marginally nearer, which is the same tie a
+ * corner has in reality.
+ */
+export function orientedBoxNormal(
+  px: number,
+  py: number,
+  pz: number,
+  cx: number,
+  cy: number,
+  cz: number,
+  yaw: number,
+  halfLength: number,
+  halfWidth: number,
+  halfHeight: number,
+  out: SurfaceNormal,
+): SurfaceNormal {
+  const sin = Math.sin(yaw);
+  const cos = Math.cos(yaw);
+  const rx = px - cx;
+  const rz = pz - cz;
+  const lx = rx * cos - rz * sin;
+  const ly = py - cy;
+  const lz = rx * sin + rz * cos;
+
+  // Distance to each slab wall. The smallest is the face the point is on.
+  const gapX = halfWidth - Math.abs(lx);
+  const gapY = halfHeight - Math.abs(ly);
+  const gapZ = halfLength - Math.abs(lz);
+
+  let nlx = 0;
+  let nly = 0;
+  let nlz = 0;
+  if (gapX <= gapY && gapX <= gapZ) nlx = lx >= 0 ? 1 : -1;
+  else if (gapY <= gapZ) nly = ly >= 0 ? 1 : -1;
+  else nlz = lz >= 0 ? 1 : -1;
+
+  // Inverse of the rotation above, matching `nearestPointOnOrientedBox`.
+  out.nx = nlx * cos + nlz * sin;
+  out.ny = nly;
+  out.nz = -nlx * sin + nlz * cos;
+  return out;
+}
+
 /**
  * A standing person: a vertical cylinder from `footY` to `footY + height`.
  *

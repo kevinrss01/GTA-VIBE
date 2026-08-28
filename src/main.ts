@@ -1532,6 +1532,20 @@ async function boot(): Promise<void> {
       get musicEnabled() {
         return audio.musicEnabled;
       },
+      /**
+       * What the mixer last actually PLAYED, for automated QA.
+       *
+       * The surface a footstep resolves to is already assertable headless, and
+       * has been for two workstreams - and the road still sounded like grass,
+       * because the classification and the recording are different questions.
+       * This is the only way to answer the second one from a browser: it names
+       * the asset file that came out of the speakers, not the family the rule
+       * chose, so "walking on a road plays `steps/asphalt-*`" is a measurement
+       * rather than an inference.
+       */
+      get audio(): unknown {
+        return audio.debug;
+      },
       get circuitLength() {
         return plan.circuitLength;
       },
@@ -1573,6 +1587,9 @@ async function boot(): Promise<void> {
           },
           shopOpen: shop.open,
           rockets: combat.rocketsLive,
+          // Live effect pools. A blast is supposed to be bounded, and the only
+          // way to see that from a browser is to watch these stop climbing.
+          fx: combat.effects.stats,
           viewmodelReady: combat.viewmodelReady,
           // Which weapon the viewmodel is actually holding, so a QA pass can
           // tell "still downloading" from "the gun is gone".
@@ -1615,6 +1632,18 @@ async function boot(): Promise<void> {
         },
         teleport(x: number, z: number, heading?: number): void {
           controller.teleport(x, z, heading);
+        },
+        /**
+         * Sets a warhead off at a point, with no launcher and no flight.
+         *
+         * The real `detonate` the rocket calls, so what it does to the cars,
+         * the crowd and the effect pools is the shipped behaviour and not a
+         * mock. It takes no surface - a rocket that flew there would have
+         * carried one - so the scorch falls to the ground under it, which is
+         * exactly what an air burst does.
+         */
+        explode(x: number, y: number, z: number): void {
+          combat.detonate(x, y, z);
         },
       },
       /** Player driving state, for automated QA. */
@@ -1661,6 +1690,17 @@ async function boot(): Promise<void> {
           });
         });
         return found;
+      },
+      /**
+       * Every surface mark currently on the world, for automated QA.
+       *
+       * Where each decal is, which way it faces and how big it is - the only
+       * way to check from a browser that a bullet hole is ON the wall that was
+       * shot and lying in that wall's plane, rather than floating in front of
+       * it or buried behind it. Allocates, so it is for verification only.
+       */
+      impactMarks(): unknown[] {
+        return combat.effects.markReport();
       },
       /** Live crowd state, for automated QA. */
       get crowd(): unknown {

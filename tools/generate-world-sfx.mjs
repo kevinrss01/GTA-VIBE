@@ -21,6 +21,9 @@
  *   node tools/generate-world-sfx.mjs police/siren   # one id, forced
  *   node tools/generate-world-sfx.mjs --probe        # one cheap 3 s loop probe
  *   node tools/generate-world-sfx.mjs --steps        # re-cut/normalise steps
+ *   node tools/generate-world-sfx.mjs --steps asphalt-1  # ...only these
+ *   node tools/generate-world-sfx.mjs --bands        # step band fingerprints
+ *   node tools/generate-world-sfx.mjs --takes 5 steps/stone-1  # best of five
  *
  * Existing files are skipped unless named explicitly, so a rerun costs nothing.
  *
@@ -69,6 +72,36 @@ const NO_BLEED_LOOP = 'absolutely even and continuous, no music, no speech, no o
  */
 const CLIPS = [
   // -- footsteps: the grass pair is unusable and is replaced ----------------
+  // -- footsteps: the asphalt pair sounded like grass and is replaced -------
+  //
+  // The 2026-08-27 set classified and levelled correctly but the two ASPHALT
+  // renders were the wrong SOUND. Measured in five bands, both sat in the
+  // rustle/crunch class rather than the hard-surface class: `asphalt-1` had its
+  // 180-800 Hz body 4.2 dB above its 8 kHz air (a rustle has no body; the
+  // pavement and concrete renders manage 25-27 dB), and `asphalt-2` peaked in
+  // the 0.8-3 kHz band like the gravel pair does. That is why walking on a road
+  // still sounded like walking on grass even though the classifier was right.
+  //
+  // What fixed it in the prompt was naming the DAMPING and excluding the
+  // failure modes by name: asphalt is a bound, slightly porous surface, so a
+  // shoe on it is a dull blunt low contact with almost no ring and only a trace
+  // of grit - not a crunch of loose stones and not a rustle.
+  {
+    id: 'steps/asphalt-1',
+    file: 'steps/asphalt-1.mp3',
+    seconds: 0.5,
+    influence: 0.85,
+    step: true,
+    prompt: `one single shoe stepping down onto worn asphalt road, a dull blunt low thud on hard bitumen with a short dry sandy grit texture over it, damped with no ring and no tail, walking pace, recorded loud and very close, no crunch, no loose gravel, no stones, no rustling, ${NO_BLEED}`,
+  },
+  {
+    id: 'steps/asphalt-2',
+    file: 'steps/asphalt-2.mp3',
+    seconds: 0.5,
+    influence: 0.85,
+    step: true,
+    prompt: `one single boot heel rolling onto dry tarmac and scraping briefly on road dust, a thick low blunt contact with a short gritty rubber drag, dead and damped, walking pace, recorded loud and very close, no crunch, no gravel, no stones, no grass, no rustle, ${NO_BLEED}`,
+  },
   {
     id: 'steps/grass-1',
     file: 'steps/grass-1.mp3',
@@ -84,6 +117,29 @@ const CLIPS = [
     influence: 0.85,
     step: true,
     prompt: `one single footstep landing in longer damp grass and soft earth, a muffled swishing rustle with a soft low thump under it, walking pace, recorded loud and close, ${NO_BLEED}`,
+  },
+  // -- footsteps: cut stone, which used to borrow the pavement pair ---------
+  //
+  // `plazaStone` and `stoneAshlar` are their own materials in the world and the
+  // plaza is its own terrain surface, and all three played a concrete paving
+  // slab. Cut stone is denser and brighter than a poured slab: it keeps far
+  // more 0.8-3 kHz content, which is why the pavement pair reads as wrong
+  // underfoot in the old quarter.
+  {
+    id: 'steps/stone-1',
+    file: 'steps/stone-1.mp3',
+    seconds: 0.5,
+    influence: 0.85,
+    step: true,
+    prompt: `one single leather-soled shoe landing on a worn stone flagstone in an old town square, a hard bright stony knock with a short natural click and no grit, walking pace, recorded loud and very close, no crunch, no gravel, no loose stones, no rustling, ${NO_BLEED}`,
+  },
+  {
+    id: 'steps/stone-2',
+    file: 'steps/stone-2.mp3',
+    seconds: 0.5,
+    influence: 0.85,
+    step: true,
+    prompt: `one single footstep pivoting on a smooth worn limestone slab, a hard bright stone contact with a brief dry sole scuff, dense and solid, walking pace, recorded loud and very close, no crunch, no gravel, no dirt, no rustling, ${NO_BLEED}`,
   },
   // -- footsteps: the airport surfaces --------------------------------------
   {
@@ -287,6 +343,7 @@ const STEP_FILES = [
   'interior-1', 'interior-2',
   'concrete-1', 'concrete-2',
   'terminal-1', 'terminal-2',
+  'stone-1', 'stone-2',
 ];
 
 /**
@@ -321,15 +378,172 @@ async function transientStart(path) {
   return 0;
 }
 
-async function normaliseSteps() {
-  const report = [];
+/**
+ * Five-band fingerprint of one footstep, and why the set needs one.
+ *
+ * The 2026-08-27 pass levelled the footsteps and fixed the classifier, and the
+ * road still sounded like grass - because loudness and classification say
+ * nothing about TIMBRE. A footstep on a hard surface is a fast low contact: its
+ * 180-800 Hz band stands well above its 8 kHz air, and it does not peak in the
+ * 0.8-3 kHz band. A rustle and a crunch do the opposite. Two derived numbers
+ * separate them:
+ *
+ *   body   = mean(180-800 Hz) - mean(8 kHz+)   a hard contact has 12 dB or more
+ *   crunch = mean(0.8-3 kHz) - mean(180-800)   a hard contact stays at or below 0
+ *
+ * Measured with `--bands` and pinned in `src/audio/manifest.ts` as
+ * `STEP_BAND_DB`, so `tests/audio.test.ts` fails if a re-render drifts back
+ * into the rustle class. The filters are second order rather than steep on
+ * purpose: this is a class test, not a crossover, and a gentle slope keeps the
+ * number stable against small differences in where the transient lands.
+ */
+const BANDS = [
+  ['lo', 'lowpass=f=180'],
+  ['lowMid', 'highpass=f=180,lowpass=f=800'],
+  ['mid', 'highpass=f=800,lowpass=f=3000'],
+  ['high', 'highpass=f=3000,lowpass=f=8000'],
+  ['air', 'highpass=f=8000'],
+];
+
+async function bandMean(path, filter) {
+  const { stderr } = await run('ffmpeg', [
+    '-hide_banner', '-nostats', '-i', path, '-af', `${filter},volumedetect`, '-f', 'null', '-',
+  ]);
+  const match = /mean_volume: (-?[\d.]+)/.exec(stderr);
+  return match ? Number(match[1]) : null;
+}
+
+/**
+ * Renders a footstep several times and keeps the best take.
+ *
+ * The generator is stochastic, and a footstep has to satisfy three measured
+ * constraints at once that a single take frequently misses:
+ *
+ *   - it must LEVEL. The set is held inside 4 dB of post-trim mean by
+ *     `tests/audio.test.ts`, and the trim is `min(byMean, byPeak)` - so a take
+ *     whose peak is already at -0.4 dBFS but whose mean is -27 dB cannot be
+ *     brought up to the -22 dB target at all, however good it sounds.
+ *   - it must be in the HARD class: body >= 10 dB (see `--bands`).
+ *   - it must not be a CRUNCH: crunch <= +2 dB.
+ *
+ * Re-rolling by hand until three numbers line up is the same work with worse
+ * provenance, so the selection lives here and the chosen take's measurements
+ * go into the manifest. Cost is linear in the take count and is reported.
+ */
+const TAKE_TARGET_MEAN_DB = -22;
+const TAKE_BODY_DB = 10;
+const TAKE_CRUNCH_DB = 2;
+
+async function stepTake(clip, key, index) {
+  const path = join(AUDIO_DIR, clip.file);
+  const kept = `${path}.take${index}`;
+  await generate(clip, key);
+  await rename(path, kept);
+  return kept;
+}
+
+/** Cuts, levels and measures a candidate take in place, without shipping it. */
+async function scoreTake(path) {
+  const start = await transientStart(path);
+  const temp = `${path}.cut`;
+  const fadeOutAt = Math.max(0, STEP_WINDOW - STEP_FADE_OUT);
+  await run('ffmpeg', [
+    '-y', '-ss', start.toFixed(4), '-t', STEP_WINDOW.toFixed(4), '-i', path,
+    '-af', `afade=t=in:st=0:d=${STEP_FADE_IN},afade=t=out:st=${fadeOutAt.toFixed(4)}:d=${STEP_FADE_OUT}`,
+    '-c:a', 'libmp3lame', '-b:a', '128k', '-ar', '44100', '-f', 'mp3', temp,
+  ]);
+  const measured = await measure(temp);
+  const bands = {};
+  for (const [name, filter] of BANDS) bands[name] = await bandMean(temp, filter);
+  await unlink(temp);
+  const trimDb = Math.min(
+    TAKE_TARGET_MEAN_DB - measured.meanDb,
+    STEP_PEAK_CEILING_DB - measured.peakDb,
+    10,
+  );
+  const body = bands.lowMid - bands.air;
+  const crunch = bands.mid - bands.lowMid;
+  // Distance from the three targets, in dB, with no credit for overshooting a
+  // constraint that is already satisfied.
+  const penalty =
+    Math.abs(measured.meanDb + trimDb - TAKE_TARGET_MEAN_DB) +
+    Math.max(0, TAKE_BODY_DB - body) +
+    Math.max(0, crunch - TAKE_CRUNCH_DB);
+  return {
+    effectiveMeanDb: Number((measured.meanDb + trimDb).toFixed(1)),
+    body: Number(body.toFixed(1)),
+    crunch: Number(crunch.toFixed(1)),
+    penalty: Number(penalty.toFixed(2)),
+  };
+}
+
+async function renderTakes(clips, key, takes) {
+  let credits = 0;
+  for (const clip of clips) {
+    if (clip.step !== true) throw new Error(`--takes is for footsteps; ${clip.id} is not one`);
+    const scored = [];
+    for (let i = 0; i < takes; i += 1) {
+      const path = await stepTake(clip, key, i);
+      credits += clip.seconds * CREDITS_PER_SECOND;
+      const score = await scoreTake(path);
+      scored.push({ path, ...score });
+      console.error(
+        `${clip.id} take ${i}: mean ${score.effectiveMeanDb} dB, body ${score.body} dB, ` +
+          `crunch ${score.crunch} dB, penalty ${score.penalty}`,
+      );
+    }
+    scored.sort((a, b) => a.penalty - b.penalty);
+    const best = scored[0];
+    await rename(best.path, join(AUDIO_DIR, clip.file));
+    for (const take of scored.slice(1)) await unlink(take.path);
+    console.error(`${clip.id}: kept the take with penalty ${best.penalty}`);
+  }
+  console.error(`takes cost ${credits.toFixed(2)} credits`);
+}
+
+async function measureBands() {
+  const out = {};
   for (const name of STEP_FILES) {
+    const path = join(AUDIO_DIR, 'steps', `${name}.mp3`);
+    if (!(await exists(path))) continue;
+    const row = {};
+    for (const [key, filter] of BANDS) row[key] = await bandMean(path, filter);
+    row.body = Number((row.lowMid - row.air).toFixed(1));
+    row.crunch = Number((row.mid - row.lowMid).toFixed(1));
+    out[`steps/${name}`] = row;
+    console.error(
+      `steps/${name}: body ${row.body >= 0 ? '+' : ''}${row.body} dB, ` +
+        `crunch ${row.crunch >= 0 ? '+' : ''}${row.crunch} dB`,
+    );
+  }
+  console.log(JSON.stringify(out, null, 2));
+}
+
+async function normaliseSteps(only) {
+  const report = [];
+  // Cutting is DESTRUCTIVE and in place. Re-running it over an already-cut file
+  // re-encodes it and re-derives its trim from the re-encode, so a re-render of
+  // one pair must not drag the other fourteen through a second generation loss.
+  const wanted = only.length > 0 ? STEP_FILES.filter((n) => only.includes(n)) : STEP_FILES;
+  if (only.length > 0 && wanted.length !== only.length) {
+    throw new Error(`Unknown step: ${only.filter((n) => !STEP_FILES.includes(n)).join(', ')}`);
+  }
+  for (const name of wanted) {
     const path = join(AUDIO_DIR, 'steps', `${name}.mp3`);
     if (!(await exists(path))) {
       console.error(`skip   steps/${name} (not rendered)`);
       continue;
     }
     const before = await measure(path);
+    // ALREADY CUT IS NOT A NO-OP. The cut is destructive and in place, and a
+    // second pass re-seeks the transient inside the already-trimmed file, so it
+    // walks the window forward and throws away the head of the step - measured
+    // once by accident, and the file came back 418 bytes shorter and 1.6 dB
+    // louder. Anything at or under the window has been through this already.
+    if (before.duration <= STEP_WINDOW + 0.005) {
+      console.error(`skip   steps/${name} (already ${before.duration.toFixed(3)}s)`);
+      continue;
+    }
     const start = await transientStart(path);
     const temp = join(AUDIO_DIR, 'steps', `${name}.cut.mp3`);
     const fadeOutAt = Math.max(0, STEP_WINDOW - STEP_FADE_OUT);
@@ -552,8 +766,13 @@ async function renderAll(clips, key, forced) {
 async function main() {
   const args = process.argv.slice(2);
 
+  if (args.includes('--bands')) {
+    await measureBands();
+    return;
+  }
+
   if (args.includes('--steps')) {
-    await normaliseSteps();
+    await normaliseSteps(args.filter((a) => !a.startsWith('--')));
     return;
   }
 
@@ -566,9 +785,16 @@ async function main() {
     return;
   }
 
-  const only = new Set(args);
+  const takesAt = args.indexOf('--takes');
+  const takes = takesAt >= 0 ? Number(args[takesAt + 1]) : 0;
+  const only = new Set(args.filter((a, i) => !a.startsWith('--') && i !== takesAt + 1));
   const wanted = only.size > 0 ? CLIPS.filter((c) => only.has(c.id)) : CLIPS;
   if (wanted.length === 0) throw new Error(`No clip matches ${[...only].join(', ')}`);
+  if (takes > 0) {
+    if (!Number.isInteger(takes) || takes < 2) throw new Error('--takes needs an integer of 2 or more');
+    await renderTakes(wanted, key, takes);
+    return;
+  }
   await renderAll(wanted, key, only.size > 0);
 }
 

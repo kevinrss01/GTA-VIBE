@@ -1,7 +1,35 @@
 {
   "version": "0.0.1",
   "configurations": [
-    { "name": "meridian-bay", "runtimeExecutable": "npm", "runtimeArgs": ["run", "dev"], "port": 5173 },
-    { "name": "meridian-preview", "runtimeExecutable": "npm", "runtimeArgs": ["run", "preview"], "port": 4183 }
+    {
+      "name": "meridian-bay",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "dev"
+      ],
+      "port": 5173
+    },
+    {
+      "name": "meridian-preview",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "preview"
+      ],
+      "port": 4183
+    },
+    {
+      "name": "meridian-realism",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": [
+        "vite",
+        "preview",
+        "--port",
+        "4187",
+        "--strictPort"
+      ],
+      "port": 4187
+    }
   ]
 }

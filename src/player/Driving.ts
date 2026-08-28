@@ -24,7 +24,7 @@ import type { CityGround } from '../world/CityGround';
 import type { CollisionWorld, VehicleBoxSink, VehicleContact } from './Collision';
 import type { FirstPersonController } from './FirstPersonController';
 import type { TrafficSystem } from '../traffic/TrafficSystem';
-import { impactDamage } from '../traffic/types';
+import { collisionDamage, crushShare } from '../traffic/types';
 import type { VehicleHandle, VehicleView } from '../traffic/types';
 
 /** How close the player must be to a car to be offered it. */
@@ -107,6 +107,15 @@ const VEHICLE_QUERY_RADIUS = 12;
  * locked together, which is the only thing a higher number would buy.
  */
 const CAR_RESTITUTION = 0.15;
+/**
+ * What the striking car pays, as a share of what its own delta-v would
+ * otherwise cost it.
+ *
+ * The nose is the end of a car designed to be crushed, and it is pointed at
+ * the impact; the panel it lands on rarely is. Slight on purpose - this is a
+ * bias, not an exemption, and driving into things still wrecks the car.
+ */
+const STRIKER_SHARE = 0.85;
 /**
  * Closing speed, m/s, below which touching another car is a nudge.
  *
@@ -545,11 +554,13 @@ export class Driving {
       const shed = Math.abs(before) - Math.abs(this.speed);
       if (shed > 1.5) {
         // Hitting the city itself: same hook, different material, so audio can
-        // tell a wall from a wing. The shell pays for it as well, at 40 per
-        // cent of the momentum the scrub took, because that scrub is a
-        // deliberately blunt instrument - it charges a glancing scrape along a
-        // building most of the car's speed, and charging the full impulse for
-        // that would write a car off on a kerb.
+        // tell a wall from a wing. The shell pays for it as well, and the
+        // speed the building took is exactly the delta-v `collisionDamage`
+        // wants - a wall does not give and there is no second shell to share
+        // it with. The old 40 per cent factor was there to stop a scrape
+        // writing a car off; the yield threshold does that properly now, and
+        // charging a fraction of the real severity on top would only make the
+        // number impossible to reason about.
         const roadY = ground.sample(this.x, this.z).y;
         this.options.traffic.reportImpact(this.x, roadY + 0.6, this.z, shed / 12, 'world');
         // Charged to the end that was leading, so scraping a wall in reverse
@@ -559,7 +570,7 @@ export class Driving {
         const lead = handle.view.halfLength * Math.sign(before || 1);
         this.options.traffic.applyDamage(
           handle.id,
-          impactDamage(shed * chassis.mass * 0.4),
+          collisionDamage({ deltaV: shed }),
           this.x + fx * lead,
           roadY + 0.6,
           this.z + fz * lead,
@@ -682,7 +693,24 @@ export class Driving {
     const mass = handle.chassis.mass;
     const otherMass = traffic.chassisOf(contact.id)?.mass ?? mass;
     const impulse = (1 + CAR_RESTITUTION) * closing * ((mass * otherMass) / (mass + otherMass));
-    const damage = impactDamage(impulse);
+    // The impulse is shared and the damage is not: each shell is charged for
+    // its OWN velocity change, through the geometry of its own contact. Being
+    // run into by a box truck and running into one are the same newton-seconds
+    // and nothing like the same crash.
+    const theirDamage = collisionDamage({
+      deltaV: impulse / otherMass,
+      crush: crushShare({
+        centreX: other.x,
+        centreZ: other.z,
+        yaw: other.yaw,
+        x: contact.x,
+        z: contact.z,
+        dirX: nx,
+        dirZ: nz,
+        length: other.halfLength * 2,
+        width: other.halfWidth * 2,
+      }),
+    });
     if (
       !traffic.applyImpact(contact.id, {
         x: contact.x,
@@ -691,7 +719,7 @@ export class Driving {
         dirX: nx,
         dirZ: nz,
         impulse,
-        damage,
+        damage: theirDamage,
       })
     ) {
       return false;
@@ -701,13 +729,13 @@ export class Driving {
     const deltaV = impulse / mass;
     this.speed -= deltaV * (nx * fx + nz * fz);
     this.speed = clamp(this.speed, -REVERSE_SPEED, TOP_SPEED);
-    // The striker's own shell takes slightly less than the car it hit: the
-    // front structure is what it was designed to crush.
     // On the panel that made the contact: the hit point is out along the line
-    // from this car's centre, so it lands on the corner that struck.
+    // from this car's centre, so it lands on the corner that struck. That line
+    // passes through the centre of mass, so all of the delta-v crushes and
+    // none of it spins - `crushShare` would return 1 here and is left out.
     traffic.applyDamage(
       handle.id,
-      damage * 0.85,
+      collisionDamage({ deltaV }) * STRIKER_SHARE,
       this.x + nx * handle.view.halfLength,
       contact.y,
       this.z + nz * handle.view.halfLength,

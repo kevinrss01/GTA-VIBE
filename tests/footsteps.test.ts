@@ -99,6 +99,12 @@ describe('footstep family from authoritative metadata', () => {
     { what: 'the airfield verge', terrain: 'grass', material: null, built: false, indoors: false, family: 'grass' },
     { what: 'the apron', terrain: 'concrete', material: null, built: false, indoors: false, family: 'concrete' },
     { what: 'Harbour Walk', terrain: 'boardwalk', material: null, built: false, indoors: false, family: 'boardwalk' },
+    // Cut stone is its own family rather than a paving slab: the plaza terrain
+    // and the two stone MATERIALS all used to borrow the pavement pair, and a
+    // stone square underfoot is measurably brighter than a poured slab.
+    { what: 'the plaza', terrain: 'plaza', material: null, built: false, indoors: false, family: 'stone' },
+    { what: 'a laid stone floor', terrain: 'concrete', material: 'plazaStone', built: true, indoors: true, family: 'stone' },
+    { what: 'an ashlar threshold', terrain: 'pavement', material: 'stoneAshlar', built: true, indoors: true, family: 'stone' },
     // Built floors: the collider's material decides, not the ground under it.
     { what: 'the terminal concourse', terrain: 'concrete', material: 'tileFloor', built: true, indoors: true, family: 'terminal' },
     { what: 'a club timber floor', terrain: 'pavement', material: 'timberDark', built: true, indoors: true, family: 'boardwalk' },

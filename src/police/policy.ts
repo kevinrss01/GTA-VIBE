@@ -159,8 +159,98 @@ export const DISMOUNT_RANGE = 16;
 /** A car stops chasing on wheels once the player is this close on foot. */
 export const CAR_HOLD_RANGE = 9;
 
-/** Speed an officer runs at, m/s. Faster than the player's 6.0 sprint. */
-export const OFFICER_RUN_SPEED = 6.4;
+/**
+ * ============================ ON-FOOT LOCOMOTION ============================
+ *
+ * Everything below is one number: how fast a human body can change what it is
+ * doing. It exists because the officers used to have no such number at all.
+ * `updateOfficers` set `speed = wantsToMove ? OFFICER_RUN_SPEED : 0` and
+ * `heading = atan2(-dx, -dz)`, so an officer went from standing to a full run
+ * in ONE FRAME and pivoted to face the player with no angular limit. Measured
+ * on the old code at 60 Hz: peak acceleration 384 m/s², peak turn rate 7.1
+ * rad/s against a player merely walking a 2 m circle. That instantaneous jump
+ * between two velocities, with the walk cycle unable to follow it, is what a
+ * player sees as an officer SLIDING toward them.
+ *
+ * The numbers are human, not generous: an officer must be beatable on foot,
+ * because the alternative - the old 6.4 m/s, faster than an Olympic 800 m
+ * pace, held indefinitely while wearing a duty belt - is the "implausible
+ * speed" half of the same complaint. What catches a runner is the cars.
+ */
+
+/** Speed an officer walks at, m/s. A brisk purposeful walk, not a stroll. */
+export const OFFICER_WALK_SPEED = 1.6;
+/**
+ * Speed an officer runs at, m/s.
+ *
+ * 5.4 m/s is 19.4 km/h: a hard run that a fit adult in uniform can hold for
+ * the length of a chase. It is deliberately BELOW the player's 6.0 m/s sprint,
+ * so a suspect who commits to running on foot outpaces the men chasing them
+ * and has to be cut off by a car instead. The old 6.4 made every foot chase
+ * unwinnable and looked wrong doing it.
+ */
+export const OFFICER_RUN_SPEED = 5.4;
+/**
+ * Bounds on how fast the desired speed may be reached, m/s².
+ *
+ * A standing start to 5.4 m/s in about 1.2 s, and a stop from it in about
+ * 0.85 s. Stopping is quicker than starting because it is: braking is a
+ * heel strike, accelerating is not.
+ */
+export const OFFICER_ACCEL = 4.5;
+export const OFFICER_BRAKE = 6.4;
+/**
+ * Bound on how fast an officer turns, rad/s.
+ *
+ * 4.5 rad/s is a 90 degree pivot in 0.35 s - fast, but a movement rather than
+ * a snap. Everything an officer does is issued as a DESIRED heading and passed
+ * through this, so there is no path by which a heading can jump.
+ */
+export const OFFICER_TURN_RATE = 4.5;
+/** Beyond this an officer runs; inside it they walk. */
+export const OFFICER_RUN_RANGE = 12;
+/** Hysteresis band on that switch, so an officer does not stutter across it. */
+export const OFFICER_RUN_HYSTERESIS = 2.5;
+/**
+ * How far apart officers converging on the same suspect aim, in metres.
+ *
+ * Each officer is given a lateral slot off the direct line, so a crew arrives
+ * as two people taking an angle on you rather than as two people occupying the
+ * same square metre and running straight down your throat.
+ */
+export const OFFICER_SPREAD = 1.8;
+
+/** How close an officer closes to before stopping to shoot. */
+export const FIRING_STANDOFF = 7;
+/** How close an officer closes to when trying to make an arrest. */
+export const ARREST_STANDOFF = 1.6;
+/** Extra distance at which an officer drops from a run to a controlled walk. */
+export const CLOSE_MARGIN = 4;
+
+/** Seconds an officer spends registering the suspect before acting. */
+export const OFFICER_NOTICE_TIME = 0.45;
+/** Seconds the sidearm takes to come out of the holster and into the hand. */
+export const OFFICER_DRAW_TIME = 0.55;
+/** Rounds in an officer's magazine before it has to be changed. */
+export const OFFICER_MAGAZINE = 9;
+/** Seconds a magazine change takes, weapon down. */
+export const OFFICER_RELOAD_TIME = 2.1;
+/** Seconds an officer is staggered by taking a round. */
+export const OFFICER_HIT_RECOVER = 0.55;
+/** Seconds one repositioning move around an obstacle lasts. */
+export const OFFICER_REPOSITION_TIME = 1.6;
+/** Seconds without sight of the suspect before an officer stands easy. */
+export const OFFICER_LOSE_PATIENCE = 6;
+/**
+ * How far off their heading an officer may be and still fire, in radians.
+ *
+ * A shot leaves the weapon, and the weapon points where the officer is facing.
+ * Twelve degrees is the slop between "aimed at you" and "aimed at the weapon
+ * model's forward axis"; wider than that and the tracer would visibly leave
+ * the barrel sideways.
+ */
+export const OFFICER_FIRE_CONE = 0.21;
+
 /** Top speed a pursuit car will ask for, m/s. */
 export const PURSUIT_SPEED = 16;
 

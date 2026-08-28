@@ -65,8 +65,11 @@ import {
   TYRE_GRIP_LOSS,
   TYRE_PULL,
   VEHICLE_INTEGRITY,
-  impactDamage,
+  collisionDamage,
+  crushShare,
+  vehicleCondition,
   type TrafficObstacle,
+  type VehicleCondition,
   type VehicleControl,
   type VehicleImpact,
   type VehicleKind,
@@ -256,6 +259,34 @@ const SETTLE_SECONDS = 0.4;
 const LOOSE_LIMIT = 18;
 /** Restitution of a free body against the world. Sheet metal, not rubber. */
 const WALL_RESTITUTION = 0.25;
+
+/**
+ * Gravity for a body a blast has thrown, m/s^2.
+ *
+ * Real gravity rather than a tuned number: the arc is the readable part of a
+ * car being thrown, and 9.81 is what makes the hang time match the height. A
+ * 3 m/s lift is 0.61 s in the air and 0.46 m up, which is a car visibly leaving
+ * the road and coming down again rather than a hop.
+ */
+const BLAST_GRAVITY = 9.81;
+
+/**
+ * How much of the landing speed a body keeps when it comes down.
+ *
+ * Low: a car landing on its suspension is nearly perfectly inelastic, and a
+ * ball-like second bounce is the single thing that would make a thrown car read
+ * as weightless. One small settle, then it is on the road.
+ */
+const LANDING_RESTITUTION = 0.12;
+
+/**
+ * Vertical delta-v, m/s, under which a lift is not worth leaving the ground for.
+ *
+ * Below this the ballistic arc is shorter than the suspension travel that would
+ * absorb it, so it is spent on the body spring instead and the car stays welded
+ * to the terrain - which keeps every ordinary collision on the road.
+ */
+const LIFT_TRIGGER = 0.6;
 /** Body height a loose car collides with, matching `Driving`'s own box. */
 const LOOSE_BODY_HEIGHT = 1.4;
 /** Closing speed, m/s, below which an ambient car touching a driven one is a nudge. */
@@ -432,6 +463,7 @@ interface MutableView {
   destroyed: boolean;
   readonly regions: MutableRegions;
   readonly handling: MutableHandling;
+  condition: VehicleCondition;
   smoke: number;
   fire: number;
   overturned: boolean;
@@ -477,6 +509,21 @@ export interface Vehicle {
    */
   vx: number;
   vz: number;
+  /**
+   * Height above the ground the body is riding at, and the rate it is changing.
+   *
+   * A car is normally welded to the terrain: `settleBody` samples the ground
+   * under each axle and assigns `y` outright, every frame, so anything that
+   * wrote `y` directly would be overwritten before it was ever drawn. `hop` is
+   * the layer above that assignment, and it is what makes a blast able to LIFT
+   * a car rather than only shove it along the road.
+   *
+   * Zero for every vehicle that is not currently in the air, which is nearly
+   * all of them nearly all of the time, so the branch that skips the ballistic
+   * integration is one comparison for the fleet.
+   */
+  hop: number;
+  hopRate: number;
   yawRate: number;
   rollRate: number;
   /**
@@ -1177,6 +1224,7 @@ export class TrafficSim {
       destroyed: false,
       regions: { front: 0, rear: 0, left: 0, right: 0, glass: 0, tyres: [0, 0, 0, 0] },
       handling: { power: 1, grip: 1, pull: 0, destroyed: false },
+      condition: 'pristine',
       smoke: 0,
       fire: 0,
       overturned: false,
@@ -1209,6 +1257,8 @@ export class TrafficSim {
       wheelSpin: 0,
       vx: 0,
       vz: 0,
+      hop: 0,
+      hopRate: 0,
       yawRate: 0,
       rollRate: 0,
       crashPitch: 0,
@@ -2392,7 +2442,11 @@ export class TrafficSim {
     const impulse = Math.max(0, hit.impulse);
     const jx = hit.dirX * impulse;
     const jz = hit.dirZ * impulse;
+    // A blast is the only caller that fills this in; a collision leaves it
+    // undefined and therefore zero. See `VehicleImpact.lift`.
+    const jy = hit.lift ?? 0;
     const deltaV = impulse / mass;
+    const liftV = jy / mass;
 
     this.damage(vehicle, hit.damage, hit.x, hit.y, hit.z, true);
     this.report(hit.x, hit.y, hit.z, deltaV / 12, 'vehicle');
@@ -2416,7 +2470,11 @@ export class TrafficSim {
     }
 
     if (vehicle.control === 'ambient' || vehicle.control === 'parked') {
-      if (deltaV < LOOSE_TRIGGER) {
+      // A blast straight down through the roof, or straight up under the sill,
+      // has almost no horizontal delta-v and would otherwise be spent on the
+      // driver's speed as though it were a kerbside scrape. A lift big enough
+      // to leave the road frees the body on its own account.
+      if (deltaV < LOOSE_TRIGGER && Math.abs(liftV) < LIFT_TRIGGER) {
         if (vehicle.control === 'ambient') {
           // Felt, not freed: spend it on the driver's own speed and let them
           // carry on. Anything else turns a kerbside scrape into a recovery.
@@ -2438,6 +2496,11 @@ export class TrafficSim {
 
     vehicle.vx += jx / mass;
     vehicle.vz += jz / mass;
+    // Off the ground, if there is enough of a lift in it to be worth an arc.
+    // Only upward: a blast arriving through the roof presses a grounded car
+    // into the road, which the road already answers, and it still rolls the
+    // body through the couple below. `integrateFree` owns the way back down.
+    if (liftV >= LIFT_TRIGGER) vehicle.hopRate += liftV;
 
     // Yaw. A box's moment of inertia about its vertical axis is m(L2 + W2)/12.
     const length = vehicle.blueprint.length;
@@ -2462,8 +2525,16 @@ export class TrafficSim {
     const halfTrack = chassis.track * 0.5;
     const comHeight = vehicle.blueprint.height * 0.45;
     const rollInertia = mass * (halfTrack * halfTrack + comHeight * comHeight);
+    // A LIFT UNDER ONE SILL IS A COUPLE, and it is what actually overturns a
+    // car. The lateral term above tips a body by pushing the top of it sideways
+    // over the far tyres; this one lifts one side of it directly, with the
+    // half-track as the arm, which is the far larger effect for a blast that
+    // goes off beside a car rather than into it. Without this a rocket could
+    // only ever slide a car along the road.
+    const armAcross = (hit.x - vehicle.x) * rightX + (hit.z - vehicle.z) * rightZ;
+    const liftCouple = jy * clamp(armAcross, -halfTrack * 2, halfTrack * 2);
     vehicle.rollRate = clamp(
-      vehicle.rollRate - (lateral * lever) / rollInertia,
+      vehicle.rollRate - (lateral * lever) / rollInertia + liftCouple / rollInertia,
       -MAX_ROLL_RATE,
       MAX_ROLL_RATE,
     );
@@ -2670,6 +2741,15 @@ export class TrafficSim {
     handling.grip = Math.max(0.3, 1 - flats * TYRE_GRIP_LOSS);
     handling.pull = pull * TYRE_PULL;
     view.destroyed = destroyed;
+    // DESTROYED IS THE LAST STAGE, NOT AN EARLY ONE. Everything short of a
+    // spent shell keeps an engine, so a car that has been in a crash - even a
+    // bad one - is still a car somebody can drive away.
+    view.condition = vehicleCondition({
+      damage: vehicle.damage,
+      destroyed,
+      power: handling.power,
+      flats,
+    });
   }
 
   /**
@@ -2745,6 +2825,8 @@ export class TrafficSim {
   private resetBody(vehicle: Vehicle): void {
     vehicle.vx = 0;
     vehicle.vz = 0;
+    vehicle.hop = 0;
+    vehicle.hopRate = 0;
     vehicle.yawRate = 0;
     vehicle.rollRate = 0;
     vehicle.crashPitch = 0;
@@ -2820,10 +2902,14 @@ export class TrafficSim {
 
     // Drag, resolved in the body frame: rolling along the axis, scrubbing
     // across it. See ROLL_DECEL / SCRUB_DECEL for why they differ so much.
+    // AIRBORNE MEANS NO TYRES, and therefore no rolling or scrubbing drag: a
+    // car a blast has thrown must carry its speed through the arc, or it lands
+    // where it took off and the throw reads as a hop.
+    const airborne = vehicle.hop > 0 || vehicle.hopRate > 0;
     let along = vehicle.vx * fx + vehicle.vz * fz;
     let across = vehicle.vx * rx + vehicle.vz * rz;
-    const rollDrop = ROLL_DECEL * dt;
-    const scrubDrop = SCRUB_DECEL * dt;
+    const rollDrop = airborne ? 0 : ROLL_DECEL * dt;
+    const scrubDrop = airborne ? 0 : SCRUB_DECEL * dt;
     const wasAlong = along;
     along = Math.abs(along) <= rollDrop ? 0 : along - Math.sign(along) * rollDrop;
     across = Math.abs(across) <= scrubDrop ? 0 : across - Math.sign(across) * scrubDrop;
@@ -2834,9 +2920,29 @@ export class TrafficSim {
     // sits in a potential with minima upright and inverted, so it either rocks
     // back or goes over. Pitch is a bounded spring: an end-over-end needs four
     // times the energy of a roll on this wheelbase and never happens in a city.
+    // The arc. Integrated before the attitude so `onTyres` below is answered
+    // for the position the body is actually in this frame.
+    if (airborne) {
+      vehicle.hopRate -= BLAST_GRAVITY * dt;
+      vehicle.hop += vehicle.hopRate * dt;
+      if (vehicle.hop <= 0) {
+        // Landed. One small settle rather than a bounce; see LANDING_RESTITUTION.
+        const landing = -vehicle.hopRate;
+        vehicle.hop = 0;
+        vehicle.hopRate = landing > 1 ? landing * LANDING_RESTITUTION : 0;
+        if (vehicle.hopRate <= 0.2) vehicle.hopRate = 0;
+        // Coming down on the suspension scrubs speed off in a way the air did
+        // not, and it is what stops a thrown car sliding for ever after it
+        // lands. Charged once, on contact, rather than as extra drag.
+        vehicle.vx *= 0.7;
+        vehicle.vz *= 0.7;
+      }
+    }
+
     vehicle.yawRate = damp(vehicle.yawRate, 0, SPIN_DAMPING, dt);
     vehicle.rollRate -= TIP_TORQUE * Math.sin(2 * vehicle.crashRoll) * dt;
-    const onTyres = Math.abs(vehicle.crashRoll) < ROLL_CONTACT_ANGLE;
+    // In the air nothing is on its tyres, whatever angle it is at.
+    const onTyres = !airborne && Math.abs(vehicle.crashRoll) < ROLL_CONTACT_ANGLE;
     vehicle.rollRate = damp(
       vehicle.rollRate,
       0,
@@ -2895,12 +3001,18 @@ export class TrafficSim {
         // sideways into a wall has no leading end, `Math.sign` returns zero,
         // and the damage is spread over the shell - which is the honest answer.
         const reach = vehicle.blueprint.length * 0.5 * Math.sign(wasAlong);
+        const hitX = vehicle.x + fx * reach;
+        const hitZ = vehicle.z + fz * reach;
+        // The city does not give, so the speed the wall took IS the delta-v -
+        // no reduced mass, no share with a second shell. That is why driving
+        // into a building costs so much more than meeting a car at the same
+        // speed, and it is the whole of the difference between the two.
         this.damage(
           vehicle,
-          impactDamage(lost * vehicle.blueprint.chassis.mass),
-          vehicle.x + fx * reach,
+          this.contactDamage(vehicle, lost, hitX, hitZ, -dx, -dz),
+          hitX,
           vehicle.y + 0.6,
-          vehicle.z + fz * reach,
+          hitZ,
           true,
         );
         this.report(vehicle.x, vehicle.y + 0.6, vehicle.z, lost / 12, 'world');
@@ -2923,6 +3035,8 @@ export class TrafficSim {
     this.settleBody(vehicle, dt, cameraDistance);
 
     return (
+      vehicle.hop <= 0 &&
+      vehicle.hopRate <= 0 &&
       speed < REST_SPEED &&
       Math.abs(vehicle.yawRate) < REST_SPIN &&
       Math.abs(vehicle.rollRate) < REST_SPIN
@@ -3029,6 +3143,8 @@ export class TrafficSim {
         vehicle.yawRate = 0;
         vehicle.vx = 0;
         vehicle.vz = 0;
+        vehicle.hop = 0;
+        vehicle.hopRate = 0;
         vehicle.speed = 0;
         vehicle.parkedAtRest = true;
       }
@@ -3137,6 +3253,8 @@ export class TrafficSim {
     vehicle.yawRate = 0;
     vehicle.vx = 0;
     vehicle.vz = 0;
+    vehicle.hop = 0;
+    vehicle.hopRate = 0;
     vehicle.speed = 0;
     if (overturned || vehicle.integrity <= 0 || vehicle.abandoned) {
       // Nothing here has a driver: a car on its roof, a write-off, or one the
@@ -3281,6 +3399,13 @@ export class TrafficSim {
    * pushed along it. The reduced mass is what makes the exchange believable in
    * both directions: a lorry meeting a hatchback barely notices, and the same
    * arithmetic run the other way throws the hatchback.
+   *
+   * THE IMPULSE IS SHARED AND THE DAMAGE IS NOT. Both cars feel the same
+   * newton-seconds - Newton's third law - but what those cost each shell
+   * depends on its own mass and on where the hit landed on it, so the two
+   * figures are worked out separately from the one exchange. The lorry that
+   * shrugs the collision off is undamaged by it for the same reason it barely
+   * moves: its delta-v is small.
    */
   private exchangeImpulse(
     a: Vehicle,
@@ -3297,7 +3422,6 @@ export class TrafficSim {
     const px = (a.x + b.x) * 0.5;
     const pz = (a.z + b.z) * 0.5;
     const py = Math.min(a.y, b.y) + 0.55;
-    const wear = impactDamage(impulse);
     this.applyImpact(a.id, {
       x: px,
       y: py,
@@ -3305,7 +3429,7 @@ export class TrafficSim {
       dirX: -nx,
       dirZ: -nz,
       impulse,
-      damage: wear,
+      damage: this.contactDamage(a, impulse / ma, px, pz, -nx, -nz),
     });
     this.applyImpact(b.id, {
       x: px,
@@ -3314,7 +3438,35 @@ export class TrafficSim {
       dirX: nx,
       dirZ: nz,
       impulse,
-      damage: wear,
+      damage: this.contactDamage(b, impulse / mb, px, pz, nx, nz),
+    });
+  }
+
+  /**
+   * What one contact costs one shell: its own delta-v, through its own
+   * geometry. See `collisionDamage` and `crushShare`.
+   */
+  private contactDamage(
+    vehicle: Vehicle,
+    deltaV: number,
+    x: number,
+    z: number,
+    dirX: number,
+    dirZ: number,
+  ): number {
+    return collisionDamage({
+      deltaV,
+      crush: crushShare({
+        centreX: vehicle.x,
+        centreZ: vehicle.z,
+        yaw: vehicle.yaw,
+        x,
+        z,
+        dirX,
+        dirZ,
+        length: vehicle.blueprint.length,
+        width: vehicle.blueprint.width,
+      }),
     });
   }
 
@@ -3366,6 +3518,11 @@ export class TrafficSim {
       vehicle.groundPitch = 0;
       vehicle.groundRoll = 0;
     }
+
+    // The ground is where the wheels WOULD be. A body a blast has thrown rides
+    // above it, and every branch above assigns `y` outright, so the lift has to
+    // be added after all three of them rather than inside one.
+    if (vehicle.hop > 0) vehicle.y += vehicle.hop;
 
     // Suspension: a critically damped spring per axis. The targets are the
     // static deflections a real body takes under these accelerations.
@@ -3469,6 +3626,8 @@ export class TrafficSim {
     vehicle.restTimer = 0;
     vehicle.vx = 0;
     vehicle.vz = 0;
+    vehicle.hop = 0;
+    vehicle.hopRate = 0;
     vehicle.yawRate = 0;
     vehicle.rollRate = 0;
     vehicle.desiredSpeed = this.desiredSpeedFor(vehicle, found.info);

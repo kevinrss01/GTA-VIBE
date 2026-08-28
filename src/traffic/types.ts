@@ -77,15 +77,158 @@ export type VehicleState = 'ambient' | 'player' | 'loose' | 'parked';
 export const VEHICLE_INTEGRITY = 260;
 
 /**
- * Structural damage from a collision impulse, in the scale above.
+ * Velocity change, m/s, a shell absorbs without yielding anything.
  *
- * Calibrated against one number: a 15 m/s closing hit between two 1400 kg cars
- * transfers about 12 kN.s, and that is the crash a car does not drive away
- * from. Everything else follows - a 3 m/s parking shunt costs a fifth of the
- * shell, a 25 m/s head-on writes off both.
+ * The bumper beam and its crush cans are designed to eat a low-speed shunt and
+ * spring back, which is why a car park is not a scrapyard. 2 m/s of delta-v is
+ * a 7 km/h barrier hit - the regulatory bumper test is slower still - and
+ * below it nothing structural has happened.
  */
-export function impactDamage(impulse: number): number {
-  return Math.max(0, impulse) * (VEHICLE_INTEGRITY / 12000);
+export const YIELD_DELTA_V = 2;
+
+/**
+ * Velocity change, m/s, that costs a shell all of `VEHICLE_INTEGRITY` at once.
+ *
+ * 8.5 m/s is a 31 km/h barrier-equivalent crash: past the delta-v where
+ * restraint systems fire and injury risk climbs steeply, and comfortably the
+ * point at which nobody drives the car home.
+ */
+export const WRITE_OFF_DELTA_V = 8.5;
+
+/**
+ * Share of the shell a hit right at `YIELD_DELTA_V` costs in paint alone.
+ *
+ * Not structure: this is the scrape down the wing that a shunt leaves and the
+ * crush cans do not. Small enough that a car park cannot write a car off in
+ * any plausible number of bumps, large enough that a car which has been used
+ * badly looks it.
+ */
+export const SCUFF_SHARE = 0.01;
+
+/** One collision, from the point of view of the single shell being damaged. */
+export interface CollisionSeverity {
+  /**
+   * This vehicle's own velocity change, m/s: `impulse / mass`, the number
+   * `applyImpact` already computes to move it. Never negative.
+   */
+  readonly deltaV: number;
+  /**
+   * The share of that delta-v the structure has to absorb, 0 to 1. See
+   * `crushShare`; 1 - a square, central hit - when the caller cannot say.
+   */
+  readonly crush?: number;
+}
+
+/**
+ * Structural damage from one collision, in the `VEHICLE_INTEGRITY` scale.
+ *
+ * SEVERITY IS DELTA-V, NOT IMPULSE. The same 12 kN.s writes off a hatchback
+ * and barely marks a box truck, so an impulse on its own cannot say how badly
+ * one particular shell was hurt - but the velocity change it caused THAT shell
+ * can, and it is what crash reconstruction uses for exactly this reason: it is
+ * the barrier-equivalent velocity, the speed at which driving into a rigid
+ * wall would have done the same damage.
+ *
+ * Two properties matter, and the previous mapping - damage linear in impulse,
+ * from zero - had neither:
+ *
+ *  - A DEADBAND. Below `YIELD_DELTA_V` the crush structure absorbs the whole
+ *    event, so an ordinary parking shunt costs paint and nothing else.
+ *  - A SUPERLINEAR RESPONSE. Past that point the shell has to absorb energy,
+ *    which goes as the SQUARE of the excess, so a serious crash is worth far
+ *    more than the several small ones that carry the same total impulse.
+ *
+ * Calibrated against the collisions this game actually produces. Two 1400 kg
+ * cars with `CAR_RESTITUTION` 0.15 give each car a delta-v of 1.15 * closing
+ * / 2, and a square hit crushes all of it:
+ *
+ *   closing    delta-v   damage   of the shell   condition afterwards
+ *   3 m/s      1.7       1.9      0.7 %          pristine, drivable
+ *   5 m/s      2.9       7        3 %            pristine, drivable
+ *   8 m/s      4.6       44       17 %           scuffed, drivable
+ *   8 m/s x 3  -         133      51 %           damaged, drivable
+ *   8 m/s x 6  -         265      102 %          wrecked
+ *   12 m/s     6.9       150      58 %           damaged, drivable
+ *   15 m/s     8.6       273      105 %          wrecked
+ *   22 m/s     12.7      701      270 %          wrecked outright
+ *
+ * A vehicle hitting immovable geometry passes the speed it lost to it, which
+ * is the same quantity: hitting a wall at 8 m/s is an 8 m/s delta-v, worth
+ * far more than an 8 m/s closing speed shared between two cars that both give.
+ */
+export function collisionDamage(hit: CollisionSeverity): number {
+  const crush = hit.crush === undefined ? 1 : clamp01(hit.crush);
+  const absorbed = Math.max(0, hit.deltaV) * crush;
+  if (absorbed <= 0) return 0;
+  const elastic = Math.min(absorbed, YIELD_DELTA_V) / YIELD_DELTA_V;
+  const scuff = VEHICLE_INTEGRITY * SCUFF_SHARE * elastic * elastic;
+  const excess = Math.max(0, absorbed - YIELD_DELTA_V);
+  if (excess <= 0) return scuff;
+  const span = WRITE_OFF_DELTA_V - YIELD_DELTA_V;
+  const reach = excess / span;
+  return scuff + VEHICLE_INTEGRITY * reach * reach;
+}
+
+/** Where a collision landed on one vehicle, and which way it pushed. */
+export interface ImpactGeometry {
+  /** The vehicle's centre and heading. */
+  readonly centreX: number;
+  readonly centreZ: number;
+  readonly yaw: number;
+  /** World contact point. */
+  readonly x: number;
+  readonly z: number;
+  /** Direction the impulse pushes the vehicle. Need not be normalized. */
+  readonly dirX: number;
+  readonly dirZ: number;
+  /** Plan dimensions of the shell, metres. */
+  readonly length: number;
+  readonly width: number;
+}
+
+/**
+ * The share of a vehicle's delta-v that crushes structure, 0 to 1.
+ *
+ * A square hit through the centre of mass has nowhere else to go: all of it
+ * deforms the body. A hit whose line of action misses the centre spends part
+ * of itself spinning the car instead, and that part costs the shell nothing -
+ * which is the whole difference between a rear-corner tap that slews the car
+ * round and the same speed taken flat on the boot.
+ *
+ * The moment arm `d` is the perpendicular distance from the centre to the line
+ * of action. A rigid box of mass m has yaw inertia m(L2 + W2)/12, so the
+ * effective mass resisting the hit at that point is m / (1 + 12d2/(L2 + W2)) -
+ * mass cancels, leaving pure geometry. Damage goes as absorbed ENERGY and
+ * energy as delta-v squared, so the share applied to a delta-v is the square
+ * root of that effective-mass ratio.
+ *
+ * On the 4.56 m x 1.82 m saloon in the catalogue: flat on the boot, 1.00;
+ * clipped on a rear corner from behind, 0.84; shoved sideways at the nose,
+ * 0.53. At the delta-v of an 8 m/s urban collision that last one costs less
+ * than a tenth of what the same speed costs square on: a car that has been
+ * spun round rather than stoved in.
+ */
+export function crushShare(contact: ImpactGeometry): number {
+  const spread = contact.length * contact.length + contact.width * contact.width;
+  const speed = Math.hypot(contact.dirX, contact.dirZ);
+  if (!(spread > 0) || !(speed > 0)) return 1;
+  // The vehicle's own axes: -Z forward, +X to the driver's right, after yaw.
+  const fx = -Math.sin(contact.yaw);
+  const fz = -Math.cos(contact.yaw);
+  const rx = Math.cos(contact.yaw);
+  const rz = -Math.sin(contact.yaw);
+  const dx = contact.x - contact.centreX;
+  const dz = contact.z - contact.centreZ;
+  const along = dx * fx + dz * fz;
+  const across = dx * rx + dz * rz;
+  const dirAlong = (contact.dirX * fx + contact.dirZ * fz) / speed;
+  const dirAcross = (contact.dirX * rx + contact.dirZ * rz) / speed;
+  const lever = Math.abs(along * dirAcross - across * dirAlong);
+  return Math.sqrt(1 / (1 + (12 * lever * lever) / spread));
+}
+
+function clamp01(value: number): number {
+  return value < 0 ? 0 : value > 1 ? 1 : value;
 }
 
 // -- localized damage -------------------------------------------------------
@@ -171,6 +314,55 @@ export interface VehicleHandling {
 }
 
 /**
+ * How badly used one shell is, as a stage rather than a number.
+ *
+ * The fraction alone cannot answer the question anything outside actually
+ * asks - can this car still be driven, and does it look like it has been in a
+ * crash - because a car with a dead engine and 40 % of its shell left is in a
+ * worse state than one with 60 % gone spread evenly over four panels. The
+ * stages combine both accounts:
+ *
+ *  - `pristine`  off the forecourt.
+ *  - `scuffed`   paint and panels, nothing that changes how it drives.
+ *  - `damaged`   visibly in a crash, down on power or on a soft tyre.
+ *  - `crippled`  still moves, but barely: no engine, flats, or a shell most
+ *                of the way gone.
+ *  - `wrecked`   a write-off. `handling.destroyed`, and it never drives again.
+ */
+export type VehicleCondition = 'pristine' | 'scuffed' | 'damaged' | 'crippled' | 'wrecked';
+
+/** Shell fraction at which a car stops looking new. One parking shunt is less. */
+export const SCUFFED_AT = 0.05;
+/** Shell fraction at which it is visibly a crashed car. */
+export const DAMAGED_AT = 0.3;
+/** Shell fraction at which it is only just still a car. */
+export const CRIPPLED_AT = 0.65;
+/** Engine power at or below which the car is crippled whatever the shell says. */
+export const CRIPPLED_POWER = 0.35;
+
+/** The inputs the stage is a function of. All published on a `VehicleView`. */
+export interface ConditionInputs {
+  /** Shell lost, 0 to 1. */
+  readonly damage: number;
+  readonly destroyed: boolean;
+  /** `VehicleHandling.power`. */
+  readonly power: number;
+  /** Tyre wear summed over the four corners, so 1 is one flat tyre. */
+  readonly flats: number;
+}
+
+/** The stage above, from the two accounts the damage model keeps. */
+export function vehicleCondition(state: ConditionInputs): VehicleCondition {
+  if (state.destroyed) return 'wrecked';
+  if (state.damage >= CRIPPLED_AT || state.power <= CRIPPLED_POWER || state.flats >= 2) {
+    return 'crippled';
+  }
+  if (state.damage >= DAMAGED_AT || state.power < 1 || state.flats >= 1) return 'damaged';
+  if (state.damage >= SCUFFED_AT) return 'scuffed';
+  return 'pristine';
+}
+
+/**
  * One collision, as the thing that detected it describes it.
  *
  * The direction and the contact point are what separate a shunt from a spin:
@@ -185,9 +377,35 @@ export interface VehicleImpact {
   /** Unit direction the impulse pushes the vehicle. */
   readonly dirX: number;
   readonly dirZ: number;
+  /**
+   * Impulse straight up, newton-seconds. Optional, and zero by default.
+   *
+   * SEPARATE FROM `impulse` RATHER THAN A THIRD COMPONENT OF THE DIRECTION,
+   * deliberately. Making the direction three-dimensional would redistribute a
+   * fixed magnitude between the horizontal and the vertical, so adding lift to
+   * a blast would silently weaken its shove and change every horizontal number
+   * that was already calibrated. This adds instead of dividing: the horizontal
+   * behaviour of every existing caller is untouched by definition.
+   *
+   * A COLLISION HAS NONE and must not pass one - two cars meeting on a road
+   * exchange momentum in the plane, and a car that hops when it is rear-ended
+   * is a bug. A BLAST does: overpressure passing under a sill is what lifts,
+   * rolls and overturns a car rather than merely sliding it. Negative is
+   * downward, which is what a warhead arriving through the roof does.
+   */
+  readonly lift?: number;
   /** Impulse magnitude, newton-seconds. Scale from mass * closing speed. */
   readonly impulse: number;
-  /** Structural damage, in the `VEHICLE_INTEGRITY` scale. */
+  /**
+   * Structural damage, in the `VEHICLE_INTEGRITY` scale.
+   *
+   * SEPARATE FROM THE IMPULSE ABOVE, and deliberately so: the impulse decides
+   * where the car goes and this decides what it costs. A caller resolving a
+   * collision fills the first from momentum and the second from
+   * `collisionDamage`, and changing how hard cars are cannot change how they
+   * move. Anything with no structural meaning - a shove from a blast wave -
+   * passes an impulse with no damage.
+   */
   readonly damage: number;
 }
 
@@ -265,6 +483,8 @@ export interface VehicleView {
   readonly regions: VehicleDamageRegions;
   /** What that damage does to the driving. See `VehicleHandling`. */
   readonly handling: VehicleHandling;
+  /** The same two accounts as one legible stage. See `VehicleCondition`. */
+  readonly condition: VehicleCondition;
   /** Engine smoke, 0 none to 1 pouring. Rises with engine-bay damage. */
   readonly smoke: number;
   /** Fire, 0 out to 1 fully alight. Only ever non-zero on a write-off. */

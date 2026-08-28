@@ -21,8 +21,18 @@ export type {
   VehicleView,
 } from './types';
 // The damage scale, so combat and the police can talk about a write-off in the
-// same units the simulation uses rather than each carrying their own number.
-export { VEHICLE_INTEGRITY, impactDamage } from './types';
+// same units the simulation uses rather than each carrying their own number,
+// and the collision model itself so that anything resolving a crash charges it
+// the same way the traffic system does.
+export {
+  VEHICLE_INTEGRITY,
+  WRITE_OFF_DELTA_V,
+  YIELD_DELTA_V,
+  collisionDamage,
+  crushShare,
+  vehicleCondition,
+} from './types';
+export type { CollisionSeverity, ImpactGeometry, VehicleCondition } from './types';
 // The localized-damage scale, for anything that wants to reason about a region
 // or a threshold rather than read the fraction back off a view.
 export {

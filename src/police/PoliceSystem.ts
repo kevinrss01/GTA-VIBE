@@ -82,20 +82,53 @@ export interface PursuitAudioUnit {
   readonly vx: number;
   readonly vz: number;
 }
-import { makeOfficer, OfficerRig, type OfficerPose } from './OfficerRig';
+import { makeOfficer, OfficerRig, type MuzzleTransform, type OfficerPose } from './OfficerRig';
+import {
+  desiredSpeed,
+  headingOf,
+  isTravelling,
+  nextBehaviour,
+  approachSpeed,
+  rotateX,
+  rotateZ,
+  shortestTurn,
+  shouldRun,
+  steerAround,
+  turnToward,
+  type OfficerBehaviour,
+  type OfficerSense,
+} from './locomotion';
 import {
   ABANDON_DISTANCE,
   ARREST_HEALTH,
   ARREST_RANGE,
+  ARREST_STANDOFF,
   CAR_HOLD_RANGE,
+  CLOSE_MARGIN,
   COMMANDEER_DISTANCE,
   DISMOUNT_RANGE,
+  FIRING_STANDOFF,
   MAX_OFFICERS,
   MAX_UNITS,
+  OFFICER_ACCEL,
+  OFFICER_BRAKE,
+  OFFICER_DRAW_TIME,
+  OFFICER_FIRE_CONE,
   OFFICER_FIRE_RANGE,
+  OFFICER_HIT_RECOVER,
+  OFFICER_LOSE_PATIENCE,
+  OFFICER_MAGAZINE,
+  OFFICER_NOTICE_TIME,
+  OFFICER_RELOAD_TIME,
+  OFFICER_REPOSITION_TIME,
+  OFFICER_RUN_HYSTERESIS,
+  OFFICER_RUN_RANGE,
   OFFICER_RUN_SPEED,
   OFFICER_SHOT_DAMAGE,
   OFFICER_SHOT_INTERVAL,
+  OFFICER_SPREAD,
+  OFFICER_TURN_RATE,
+  OFFICER_WALK_SPEED,
   PURSUIT_SPEED,
   SIGHT_RANGE_CAR,
   SIGHT_RANGE_FOOT,
@@ -116,10 +149,6 @@ const OFFICER_RADIUS = 0.34;
 const OFFICER_HEIGHT = 1.8;
 /** Eye height an officer sees and shoots from. */
 const OFFICER_EYE = 1.6;
-/** How close an officer closes to before stopping to shoot. */
-const FIRING_STANDOFF = 7;
-/** How close an officer closes to when trying to make an arrest. */
-const ARREST_STANDOFF = 1.6;
 /** Vehicle integrity. Roughly three rifle magazines, or one determined minute. */
 const VEHICLE_INTEGRITY = 260;
 /** Seconds a wrecked or stood-down unit lingers before rejoining traffic. */
@@ -146,7 +175,52 @@ const REVERSE_SPEED = 4.5;
 /** Seconds without getting any closer before a unit is written off. */
 const LOST_PATIENCE = 22;
 /** Seconds an officer presses into something before going round it. */
-const BLOCKED_PATIENCE = 1;
+const BLOCKED_PATIENCE = 0.45;
+/** Seconds between whisker sweeps. Held between them, so the choice is stable. */
+const AVOID_INTERVAL = 0.15;
+/** How far ahead a whisker looks, as seconds of travel plus a body radius. */
+const AVOID_LOOKAHEAD = 0.35;
+/** Shortest whisker, in metres, so a stopped officer still probes ahead. */
+const AVOID_MIN_PROBE = 0.8;
+
+/**
+ * How much of the firing stance each behaviour asks for, 0..1.
+ *
+ * `OfficerRig` reads this as a blend over the gait AND uses it to choose which
+ * hand track the weapon hangs off, so it is the one place that says what an
+ * officer's arms are doing. `hold` is a low ready - weapon out, pointed at the
+ * suspect, not yet a shot; `reload` deliberately drops below the rig's stance
+ * threshold so the weapon visibly comes down for the magazine change.
+ */
+function stanceBlend(behaviour: OfficerBehaviour, armed: boolean): number {
+  switch (behaviour) {
+    case 'aim':
+    case 'fire':
+      return 1;
+    case 'hold':
+      return armed ? 0.55 : 0;
+    case 'reload':
+      return 0.22;
+    case 'draw':
+      return 0.15;
+    default:
+      return 0;
+  }
+}
+
+/** The behaviour timings, gathered once so the transition table reads clean. */
+const BEHAVIOUR_TIMING = {
+  notice: OFFICER_NOTICE_TIME,
+  draw: OFFICER_DRAW_TIME,
+  reload: OFFICER_RELOAD_TIME,
+  recover: OFFICER_HIT_RECOVER,
+  reposition: OFFICER_REPOSITION_TIME,
+  losePatience: OFFICER_LOSE_PATIENCE,
+  closeMargin: CLOSE_MARGIN,
+} as const;
+
+/** The two gaits, as the locomotion module wants them. */
+const OFFICER_SPEEDS = { walk: OFFICER_WALK_SPEED, run: OFFICER_RUN_SPEED } as const;
 
 // -- bodies -----------------------------------------------------------------
 //
@@ -186,10 +260,6 @@ const BODY_KEEP_RANGE = 42;
 const MAX_BODIES = 6;
 /** Below this a sliding body has stopped. */
 const SLIDE_STOP = 0.05;
-/** How long one detour lasts, and how far off the direct line it goes. */
-const DETOUR_SECONDS = 2.4;
-const DETOUR_ANGLE = 1.15;
-
 /** Kinds acceptable as an unmarked unit when no patrol car is free. */
 const UNMARKED_KINDS: ReadonlySet<VehicleKind> = new Set<VehicleKind>([
   'sedan',
@@ -207,15 +277,39 @@ interface Officer extends OfficerPose {
   unit: Unit;
   health: number;
   state: OfficerState;
-  aim: number;
+  /** What this officer is doing. The whole of the on-foot decision. */
+  behaviour: OfficerBehaviour;
+  /** Seconds spent in `behaviour`. Drives every timed transition. */
+  behaviourFor: number;
+  /**
+   * The speed the legs are being COMMANDED to run at, m/s.
+   *
+   * Distinct from `speed`, which is the speed the body actually achieved after
+   * the world had its say. The rig is driven by `speed`; the integrator by
+   * this. Conflating them is how a body pressed into a wall keeps a running
+   * animation.
+   */
+  drive: number;
+  /** Chasing at a run rather than a walk. Held across frames for hysteresis. */
+  running: boolean;
+  /** Rounds left before a magazine change. */
+  rounds: number;
+  /** Took a round since the last tick. Consumed by the state machine. */
+  struck: boolean;
   shotTimer: number;
   sightTimer: number;
+  /** Seconds since this officer last had eyes on the player. */
+  unseen: number;
+  /** A clear line from the MUZZLE to the player, refreshed with the sight. */
+  clearShot: boolean;
   /** Seconds spent pressing into something instead of getting closer. */
   blocked: number;
-  /** Seconds left of a detour around whatever is in the way. */
-  detour: number;
-  /** Which way this officer goes round: alternates each time. */
-  detourSide: 1 | -1;
+  /** Held deflection off the direct line, in radians. See `steerAround`. */
+  avoidTurn: number;
+  /** Countdown to the next whisker sweep. */
+  avoidTimer: number;
+  /** Which way this officer prefers to go round. Flips when both sides fail. */
+  avoidSide: 1 | -1;
   /** Seconds the arrest conditions have held continuously. */
   held: number;
   seesPlayer: boolean;
@@ -366,6 +460,9 @@ export class PoliceSystem implements LawTargets {
    */
   private effects: PoliceEffects | null = null;
 
+  /** Reused by every shot and every muzzle line-of-sight test. Never retained. */
+  private readonly muzzle: MuzzleTransform = { x: 0, y: 0, z: 0, dirX: 0, dirZ: -1 };
+
   private readonly scratchTarget: {
     id: number;
     x: number;
@@ -417,6 +514,9 @@ export class PoliceSystem implements LawTargets {
     const officer = this.officers.find((o) => o.id === id);
     if (!officer || officer.state === 'down' || amount <= 0) return 'none';
     officer.health -= amount;
+    // Consumed by the behaviour machine on the next tick, which is what turns
+    // being shot into a visible stagger rather than a health number changing.
+    officer.struck = true;
     this.makeHostile();
     if (officer.health > 0) return 'hurt';
     officer.health = 0;
@@ -512,21 +612,61 @@ export class PoliceSystem implements LawTargets {
    * rather than that a counter went up.
    */
   get officerPoses(): readonly {
+    id: number;
     x: number;
     y: number;
     z: number;
     heading: number;
     aiming: number;
+    /** The behaviour state, so a transition can be asserted by name. */
+    behaviour: OfficerBehaviour;
+    /** Metres per second actually covered last frame, not the commanded speed. */
+    speed: number;
+    stance: string;
+    armed: boolean;
+    rounds: number;
+    /**
+     * Distance the walk clip has been advanced by, in rig units.
+     *
+     * Exposed because it is the ONE number that proves the feet are not
+     * sliding: it may only ever grow by the displacement the body actually
+     * made, divided by girth. See `tests/policeOfficers.test.ts`.
+     */
+    walked: number;
+    girth: number;
   }[] {
     return this.officers
       .filter((officer) => officer.state === 'chasing')
       .map((officer) => ({
+        id: officer.id,
         x: officer.x,
         y: officer.y,
         z: officer.z,
         heading: officer.heading,
         aiming: Number(officer.aiming.toFixed(3)),
+        behaviour: officer.behaviour,
+        speed: officer.speed,
+        stance: officer.stance,
+        armed: officer.armed,
+        rounds: officer.rounds,
+        walked: officer.walked,
+        girth: officer.girth,
       }));
+  }
+
+  /**
+   * The world transform of one officer's weapon muzzle, or null.
+   *
+   * The SAME call the damage ray, the tracer and the flash go through, exposed
+   * so automated QA can assert that a round really did leave the thing in the
+   * officer's hand rather than their sternum. Writes into `out`; nothing is
+   * allocated and nothing is retained.
+   */
+  muzzleOf(id: number, out: MuzzleTransform): boolean {
+    const officer = this.officers.find((o) => o.id === id);
+    if (!officer || officer.state !== 'chasing') return false;
+    this.rig.muzzleOf(officer, this.now, out);
+    return true;
   }
 
   /**
@@ -699,13 +839,22 @@ export class PoliceSystem implements LawTargets {
         unit,
         health: ACTOR_HEALTH,
         state: 'riding',
-        aim: 0,
+        behaviour: 'idle',
+        behaviourFor: 0,
+        drive: 0,
+        running: false,
+        rounds: OFFICER_MAGAZINE,
+        struck: false,
         aiming: 0,
+        armed: false,
         shotTimer: 0,
         sightTimer: 0,
+        unseen: 0,
+        clearShot: false,
         blocked: 0,
-        detour: 0,
-        detourSide: i % 2 === 0 ? 1 : -1,
+        avoidTurn: 0,
+        avoidTimer: 0,
+        avoidSide: i % 2 === 0 ? 1 : -1,
         held: 0,
         seesPlayer: false,
         vx: 0,
@@ -722,6 +871,7 @@ export class PoliceSystem implements LawTargets {
         girth: look.girth,
         phase: this.rng.next(),
         gait: 0,
+        stance: 'idle',
         variant: look.variant,
         walked: this.rng.next() * 4,
         lastX: unit.x,
@@ -961,10 +1111,19 @@ export class PoliceSystem implements LawTargets {
     const offset = view.halfWidth + 0.75;
     officer.x = unit.x + rx * offset * side;
     officer.z = unit.z + rz * offset * side;
-    officer.y = this.options.heightAt(officer.x, officer.z);
+    officer.y = this.groundAt(officer.x, officer.z, this.options.heightAt(officer.x, officer.z));
     officer.heading = unit.yaw;
     officer.speed = 0;
+    officer.drive = 0;
     officer.state = 'chasing';
+    // Out of the car is where the behaviour starts, not where it resumes: an
+    // officer who has just stepped onto the pavement has not seen anybody yet.
+    officer.behaviour = 'idle';
+    officer.behaviourFor = 0;
+    officer.unseen = OFFICER_LOSE_PATIENCE;
+    officer.blocked = 0;
+    officer.avoidTurn = 0;
+    officer.avoidTimer = 0;
     // Getting out of a car is a teleport, not a stride: reseed the walk
     // accumulator's reference point so the first frame on foot does not
     // advance the clip by the width of the car.
@@ -999,7 +1158,9 @@ export class PoliceSystem implements LawTargets {
         officer.y = this.options.heightAt(unit.x, unit.z);
         officer.heading = unit.yaw;
         officer.speed = 0;
+        officer.drive = 0;
         officer.seesPlayer = false;
+        officer.struck = false;
         // Nobody aims from inside a moving car; the weapon comes up after they
         // get out. Snapped rather than damped because a riding officer is not
         // drawn as a person at all.
@@ -1010,73 +1171,72 @@ export class PoliceSystem implements LawTargets {
       const dx = ctx.playerX - officer.x;
       const dz = ctx.playerZ - officer.z;
       const distance = Math.hypot(dx, dz);
+      const bearing = distance > 1e-4 ? headingOf(dx, dz) : officer.heading;
+
+      // -- what this officer can see ------------------------------------------
       officer.sightTimer -= dt;
       if (officer.sightTimer <= 0) {
         officer.sightTimer = SIGHT_INTERVAL;
         officer.seesPlayer =
           distance < SIGHT_RANGE_FOOT &&
           this.canSee(officer.x, officer.y + OFFICER_EYE, officer.z, ctx);
+        // A SECOND line, from the muzzle. An officer whose eyes clear a low
+        // wall but whose weapon does not must hold fire rather than shoot
+        // through it, which is the whole of "shots respect line of sight".
+        officer.clearShot = officer.seesPlayer && this.muzzleClear(officer, ctx);
       }
+      officer.unseen = officer.seesPlayer ? 0 : officer.unseen + dt;
 
       // An officer either closes in to make an arrest or holds at shooting
       // range. A hurt suspect is always worth cuffing rather than shooting,
       // which is what makes the last few points of health a real decision.
-      const wantsArrest =
-        !ctx.driving && (!hostile || player.health <= ARREST_HEALTH);
+      const wantsArrest = !ctx.driving && (!hostile || player.health <= ARREST_HEALTH);
       const standoff = wantsArrest ? ARREST_STANDOFF : FIRING_STANDOFF;
-      const wantsToMove = distance > standoff;
-      const speed = wantsToMove ? OFFICER_RUN_SPEED : 0;
 
-      if (wantsToMove && distance > 0.01) {
-        const step = speed * dt;
-        // Officers steer straight at the player and slide along whatever they
-        // touch. Sliding alone cannot get round a building, so an officer who
-        // has been pressing into something for a second peels off at an angle
-        // for a few seconds and tries again from there. It is not a path
-        // planner; it is enough to get round a corner, and the alternative -
-        // a second navigation graph for four people - is not worth the code.
-        let ux = dx / distance;
-        let uz = dz / distance;
-        if (officer.detour > 0) {
-          officer.detour -= dt;
-          const angle = DETOUR_ANGLE * officer.detourSide;
-          const cos = Math.cos(angle);
-          const sin = Math.sin(angle);
-          const rx = ux * cos - uz * sin;
-          const rz = ux * sin + uz * cos;
-          ux = rx;
-          uz = rz;
-        }
-        const moved = this.options.collision.move(
-          officer.x,
-          officer.z,
-          ux * step,
-          uz * step,
-          officer.y,
-          OFFICER_HEIGHT,
-          OFFICER_RADIUS,
-        );
-        const travelled = Math.hypot(moved.x - officer.x, moved.z - officer.z);
-        officer.x = moved.x;
-        officer.z = moved.z;
-        officer.y = this.options.heightAt(officer.x, officer.z);
-        officer.speed = dt > 0 ? travelled / dt : 0;
-        officer.heading = Math.atan2(-dx, -dz);
+      officer.shotTimer -= dt;
+      // Hands are for cuffs at arm's length, not for a sidearm.
+      const mayFire =
+        hostile &&
+        officer.clearShot &&
+        distance < OFFICER_FIRE_RANGE &&
+        player.alive &&
+        !(wantsArrest && distance <= ARREST_RANGE * 1.7);
 
-        if (travelled < step * 0.45) {
-          officer.blocked += dt;
-          if (officer.blocked > BLOCKED_PATIENCE && officer.detour <= 0) {
-            officer.detour = DETOUR_SECONDS;
-            officer.detourSide = officer.detourSide === 1 ? -1 : 1;
-            officer.blocked = 0;
-          }
-        } else if (officer.detour <= 0) {
-          officer.blocked = 0;
-        }
-      } else {
-        officer.speed = damp(officer.speed, 0, 10, dt);
-        officer.heading = Math.atan2(-dx, -dz);
+      // -- decide -------------------------------------------------------------
+      const previous = officer.behaviour;
+      officer.behaviourFor += dt;
+      const sense: OfficerSense = {
+        state: previous,
+        elapsed: officer.behaviourFor,
+        distance,
+        standoff,
+        seesPlayer: officer.seesPlayer,
+        unseen: officer.unseen,
+        armedIntent: hostile && !wantsArrest,
+        armed: officer.armed,
+        settled: officer.aiming > 0.9,
+        aimTime: officerAimTime(stars),
+        rounds: officer.rounds,
+        shotReady: officer.shotTimer <= 0,
+        onTarget: Math.abs(shortestTurn(officer.heading, bearing)) <= OFFICER_FIRE_CONE,
+        canShoot: mayFire,
+        hurt: officer.struck,
+        blocked: officer.blocked > BLOCKED_PATIENCE,
+      };
+      officer.struck = false;
+      const next = nextBehaviour(sense, BEHAVIOUR_TIMING);
+      if (next !== previous) {
+        officer.behaviour = next;
+        officer.behaviourFor = 0;
+        this.onBehaviourChange(officer, previous, next, stars, ctx);
       }
+
+      // -- move ---------------------------------------------------------------
+      this.stepOfficer(officer, dt, dx, dz, distance, standoff, bearing, ctx);
+
+      // The stance follows the behaviour, damped so a weapon comes up and down
+      // over about a third of a second rather than snapping.
+      officer.aiming = damp(officer.aiming, stanceBlend(officer.behaviour, officer.armed), 8, dt);
       OfficerRig.advance(officer, dt);
 
       // -- arrest ------------------------------------------------------------
@@ -1098,32 +1258,161 @@ export class PoliceSystem implements LawTargets {
         this.options.onArrest?.();
         return;
       }
+    }
+  }
 
-      // -- open fire ---------------------------------------------------------
-      officer.shotTimer -= dt;
-      const canShoot =
-        hostile &&
-        officer.seesPlayer &&
-        distance < OFFICER_FIRE_RANGE &&
-        player.alive &&
-        // Hands are for cuffs at arm's length, not for a sidearm.
-        !(wantsArrest && distance <= ARREST_RANGE * 1.7);
-      if (!canShoot) {
-        officer.aim = 0;
-        // The stance comes down over about a third of a second, so an officer
-        // who loses sight of the player lowers their weapon rather than
-        // snapping upright.
-        officer.aiming = damp(officer.aiming, 0, 9, dt);
-        continue;
+  /**
+   * One officer's locomotion for one frame.
+   *
+   * THE INVARIANT. The body is displaced by `drive * dt` along its CURRENT
+   * heading and by nothing else. `drive` changes by at most `accel * dt`, and
+   * `heading` by at most `OFFICER_TURN_RATE * dt`. Collision may only subtract
+   * from the result. There is therefore no path by which an officer exceeds
+   * the run speed, jumps in velocity, or teleports - and no path by which the
+   * body moves in a direction the walk cycle is not facing, which is what
+   * stops the feet sliding.
+   */
+  private stepOfficer(
+    officer: Officer,
+    dt: number,
+    dx: number,
+    dz: number,
+    distance: number,
+    standoff: number,
+    bearing: number,
+    ctx: PoliceContext,
+  ): void {
+    const travelling = isTravelling(officer.behaviour);
+    let desiredHeading = bearing;
+    let wanted = 0;
+
+    if (travelling && distance > 1e-3) {
+      // Each officer takes their own lateral slot off the direct line, so a
+      // crew converges as two people taking an angle rather than as two people
+      // running down the same metre of pavement into the suspect's face.
+      const slot = ((officer.id % 3) - 1) * OFFICER_SPREAD;
+      const acrossX = -dz / distance;
+      const acrossZ = dx / distance;
+      const aimX = ctx.playerX + acrossX * slot - officer.x;
+      const aimZ = ctx.playerZ + acrossZ * slot - officer.z;
+      const reach = Math.hypot(aimX, aimZ) || 1;
+      const ux = aimX / reach;
+      const uz = aimZ / reach;
+
+      officer.avoidTimer -= dt;
+      if (officer.avoidTimer <= 0) {
+        officer.avoidTimer = AVOID_INTERVAL;
+        const probe = OFFICER_RADIUS + Math.max(AVOID_MIN_PROBE, officer.drive * AVOID_LOOKAHEAD);
+        const swept = steerAround(ux, uz, officer.avoidSide, (cx, cz) =>
+          !this.options.collision.isStuck(
+            officer.x + cx * probe,
+            officer.z + cz * probe,
+            officer.y,
+            OFFICER_HEIGHT,
+            OFFICER_RADIUS,
+          ),
+        );
+        officer.avoidTurn = swept.turn;
+        // Both sides refused: commit to the other way round next sweep rather
+        // than grinding into the same corner for the rest of the chase.
+        if (swept.blocked) officer.avoidSide = officer.avoidSide === 1 ? -1 : 1;
       }
-      officer.aim += dt;
-      // ...and goes up over the same time it takes them to line the shot up,
-      // so the pose is fully raised exactly when the first round leaves.
-      officer.aiming = damp(officer.aiming, 1, 7, dt);
-      if (officer.aim < officerAimTime(stars) || officer.shotTimer > 0) continue;
+      // The deflection is held as an ANGLE and re-applied to the current direct
+      // line, so it stays meaningful as the officer walks along it.
+      desiredHeading = headingOf(
+        rotateX(ux, uz, officer.avoidTurn),
+        rotateZ(ux, uz, officer.avoidTurn),
+      );
+
+      officer.running = shouldRun(
+        distance,
+        ctx.playerSpeed,
+        officer.running,
+        OFFICER_RUN_RANGE,
+        OFFICER_RUN_HYSTERESIS,
+        OFFICER_WALK_SPEED,
+      );
+      wanted = desiredSpeed(
+        officer.behaviour,
+        distance,
+        standoff,
+        officer.running,
+        OFFICER_SPEEDS,
+      );
+    } else {
+      officer.running = false;
+    }
+
+    officer.heading = turnToward(officer.heading, desiredHeading, OFFICER_TURN_RATE, dt);
+    officer.drive = approachSpeed(officer.drive, wanted, OFFICER_ACCEL, OFFICER_BRAKE, dt);
+
+    const step = officer.drive * dt;
+    if (step > 1e-6) {
+      const fx = -Math.sin(officer.heading);
+      const fz = -Math.cos(officer.heading);
+      const moved = this.options.collision.move(
+        officer.x,
+        officer.z,
+        fx * step,
+        fz * step,
+        officer.y,
+        OFFICER_HEIGHT,
+        OFFICER_RADIUS,
+      );
+      const travelled = Math.hypot(moved.x - officer.x, moved.z - officer.z);
+      officer.x = moved.x;
+      officer.z = moved.z;
+      // A body pressed into a wall is not still running. Bleeding the command
+      // down to what was achieved keeps the animation honest and gives the
+      // whisker sweep something to react to.
+      if (travelled < step) officer.drive = travelled / dt;
+      officer.blocked = travelled < step * 0.45 ? officer.blocked + dt : 0;
+      officer.speed = travelled / dt;
+    } else {
+      officer.speed = 0;
+      if (!travelling) officer.blocked = 0;
+    }
+    officer.y = this.groundAt(officer.x, officer.z, this.options.heightAt(officer.x, officer.z));
+  }
+
+  /** Acts on a behaviour transition. Everything with an edge lives here. */
+  private onBehaviourChange(
+    officer: Officer,
+    from: OfficerBehaviour,
+    to: OfficerBehaviour,
+    stars: number,
+    ctx: PoliceContext,
+  ): void {
+    // The weapon is in the hand at the END of the draw, so the draw itself is
+    // a visible movement of empty hands rather than a pistol appearing.
+    if (from === 'draw') officer.armed = true;
+    if (from === 'reload') officer.rounds = OFFICER_MAGAZINE;
+    if (to === 'reposition') {
+      // Commit to the other way round, and re-sweep on the next frame.
+      officer.avoidSide = officer.avoidSide === 1 ? -1 : 1;
+      officer.avoidTimer = 0;
+      officer.blocked = 0;
+    }
+    if (to === 'fire') {
+      officer.rounds = Math.max(0, officer.rounds - 1);
       officer.shotTimer = OFFICER_SHOT_INTERVAL * (0.85 + this.rng.next() * 0.35);
       this.fireAtPlayer(officer, stars, ctx);
     }
+  }
+
+  /**
+   * The surface an officer's feet are on: the terrain, or a kerb or step
+   * within one step height of it.
+   *
+   * Measured from the TERRAIN rather than from where the officer's feet
+   * already are, deliberately: it means an officer can walk up onto a kerb and
+   * back off it, but can never be carried up a flight of steps one support at
+   * a time to somewhere they could not have walked to. `heightAt` alone - what
+   * this replaced - put every officer at street level regardless of what they
+   * were standing on.
+   */
+  private groundAt(x: number, z: number, terrainY: number): number {
+    return this.options.collision.supportAt(x, z, terrainY, terrainY).y;
   }
 
   // -- bodies ---------------------------------------------------------------
@@ -1150,14 +1439,19 @@ export class PoliceSystem implements LawTargets {
     officer.state = 'down';
     officer.down = true;
     officer.downFor = 0;
-    officer.aim = 0;
+    officer.behaviour = 'hit';
+    officer.behaviourFor = 0;
     officer.aiming = 0;
+    officer.armed = false;
     officer.gait = 0;
+    officer.stance = 'idle';
     officer.held = 0;
     officer.blocked = 0;
-    officer.detour = 0;
+    officer.avoidTurn = 0;
+    officer.struck = false;
     officer.seesPlayer = false;
     officer.speed = 0;
+    officer.drive = 0;
 
     const dirX = blow?.dirX ?? 0;
     const dirZ = blow?.dirZ ?? 0;
@@ -1204,12 +1498,12 @@ export class PoliceSystem implements LawTargets {
       );
       officer.x = moved.x;
       officer.z = moved.z;
-      officer.y = this.options.heightAt(officer.x, officer.z);
+      officer.y = this.groundAt(officer.x, officer.z, this.options.heightAt(officer.x, officer.z));
     } else if (officer.vx !== 0 || officer.vz !== 0) {
       officer.vx = 0;
       officer.vz = 0;
       // One last sample, so a body that came to rest on a kerb is on the kerb.
-      officer.y = this.options.heightAt(officer.x, officer.z);
+      officer.y = this.groundAt(officer.x, officer.z, this.options.heightAt(officer.x, officer.z));
     }
 
     if (officer.downFor <= CASUALTY_TIME) return false;
@@ -1245,27 +1539,51 @@ export class PoliceSystem implements LawTargets {
     }
   }
 
+  /**
+   * Whether the WEAPON, not the eyes, has a clear line to the player.
+   *
+   * An officer shooting over a bonnet or round a low wall has sight of the
+   * player from 1.6 m and no shot at all from the 0.85 m the weapon is
+   * actually at. Testing the same ray from both heights is why an officer now
+   * holds fire instead of putting rounds through the thing they are behind.
+   */
+  private muzzleClear(officer: Officer, ctx: PoliceContext): boolean {
+    this.rig.muzzleOf(officer, this.now, this.muzzle);
+    return this.canSee(this.muzzle.x, this.muzzle.y, this.muzzle.z, ctx);
+  }
+
+  /**
+   * One round, leaving the weapon the player can see in the officer's hand.
+   *
+   * EVERYTHING COMES FROM THE MUZZLE TRANSFORM. The flash is drawn at the
+   * barrel, the tracer starts at the barrel, the audio is positioned at the
+   * barrel and the damage roll is the same event. Before this the tracer left
+   * the body centre at 1.38 m while the drawn weapon was 0.84 m up and 0.3 m
+   * further forward - a round that came out of the officer's chest, which is
+   * what "fires without visibly handling a weapon" meant.
+   */
   private fireAtPlayer(officer: Officer, stars: number, ctx: PoliceContext): void {
-    const muzzleY = officer.y + OFFICER_EYE * 0.86;
+    const muzzle = this.muzzle;
+    this.rig.muzzleOf(officer, this.now, muzzle);
     const targetY = ctx.playerY + 1.1;
     const hits = this.rng.next() < officerAccuracy(stars);
     const effects = this.effects;
     if (effects) {
-      effects.muzzle(officer.x, muzzleY, officer.z, 0.8);
+      effects.muzzle(muzzle.x, muzzle.y, muzzle.z, 0.8);
       // A miss is drawn passing the player rather than stopping at them, which
       // is the only way a near miss reads as a near miss.
       const spreadX = hits ? 0 : (this.rng.next() - 0.5) * 2.4;
       const spreadY = hits ? 0 : (this.rng.next() - 0.5) * 1.2;
       effects.tracer(
-        officer.x,
-        muzzleY,
-        officer.z,
+        muzzle.x,
+        muzzle.y,
+        muzzle.z,
         ctx.playerX + spreadX,
         targetY + spreadY,
         ctx.playerZ + spreadX * 0.4,
       );
     }
-    this.options.onOfficerShot?.(officer.x, muzzleY, officer.z);
+    this.options.onOfficerShot?.(muzzle.x, muzzle.y, muzzle.z);
     // The officer's own position is passed with the damage so the HUD can
     // point the player at whoever is shooting at them.
     if (hits) this.options.player.hurt(OFFICER_SHOT_DAMAGE, officer.x, officer.z);

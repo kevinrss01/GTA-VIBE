@@ -64,7 +64,9 @@ export type StepAssetId =
   | 'steps/concrete-1'
   | 'steps/concrete-2'
   | 'steps/terminal-1'
-  | 'steps/terminal-2';
+  | 'steps/terminal-2'
+  | 'steps/stone-1'
+  | 'steps/stone-2';
 
 /** One-shots the game triggers by name. */
 export type OneShotId = 'door-open' | 'door-close' | 'ui-tick';
@@ -294,6 +296,12 @@ const GENERATED_ON = '2026-08-17';
 
 const WORLD_GENERATED_ON = '2026-08-27';
 
+/**
+ * The asphalt pair, re-rendered because it was the wrong SOUND rather than the
+ * wrong level. See the note above `STEP_SPECS`.
+ */
+const ASPHALT_GENERATED_ON = '2026-08-28';
+
 const LOOP_PARAMS = { duration_seconds: 15, prompt_influence: 0.4, loop: true } as const;
 const STEP_PARAMS = { duration_seconds: 0.7, prompt_influence: 0.75, loop: false } as const;
 /** The steps rendered in this session asked for a shorter, harder-adhering hit. */
@@ -463,8 +471,12 @@ interface StepSpec {
   /** Measured mean level of the shipped 0.32 s file, in dBFS. */
   readonly meanDb: number;
   readonly trimDb: number;
-  /** Set on the four surfaces rendered in this session rather than the first. */
-  readonly regenerated?: boolean;
+  /**
+   * The date this step was re-rendered, absent for the original 2026-08-17 set.
+   * A re-render always used `REGENERATED_STEP_PARAMS` and cost 1.6667 credits,
+   * so its presence carries the parameters and the price as well as the date.
+   */
+  readonly regenerated?: string;
   readonly postProcess?: string;
 }
 
@@ -509,6 +521,23 @@ const STEP_CUT =
   '-af "afade=t=in:st=0:d=0.005,afade=t=out:st=0.25:d=0.07" ' +
   '-c:a libmp3lame -b:a 128k -ar 44100 <file>.mp3';
 
+/**
+ * The four 2026-08-28 renders were CHOSEN rather than accepted.
+ *
+ * A footstep has to satisfy three measured constraints at once - it must level
+ * to the set's -22 dBFS mean under a -1.5 dBFS peak guard, it must be in the
+ * hard class, and it must not peak in the grit band - and a single take from a
+ * stochastic generator frequently misses one. Measured over five takes of
+ * `asphalt-1`, body ran from -0.1 dB to +29.9 dB: take 0 was a rustle and take 2
+ * was the shipped file. Re-rolling by hand until three numbers line up is the
+ * same work with worse provenance, so the selection is in the tool.
+ */
+const STEP_TAKE =
+  STEP_CUT +
+  ' Selected as the best of five takes of the same prompt by measured fit to the ' +
+  'set: post-trim mean -22 dBFS, band body >= 10 dB, band crunch <= +2 dB. ' +
+  'node tools/generate-world-sfx.mjs --takes 5 <id>';
+
 const STEP_SPECS: readonly StepSpec[] = [
   {
     id: 'steps/pavement-1',
@@ -526,21 +555,46 @@ const STEP_SPECS: readonly StepSpec[] = [
     meanDb: -24.3,
     trimDb: -0.7,
   },
+  // THE ASPHALT PAIR WAS THE WRONG SOUND, NOT THE WRONG LEVEL.
+  //
+  // The classifier had already been fixed and measured: every one of the 5,000+
+  // carriageway points in the world resolves to the `asphalt` family, and
+  // `tests/footsteps.test.ts` asserts it. Walking on a road still sounded like
+  // walking on grass because the two RECORDINGS were rustles.
+  //
+  // Measured in five bands (mean level of the band-passed 0.32 s file), a
+  // footstep on a hard surface has BODY - its 180-800 Hz band stands well above
+  // its 8 kHz air - and does not peak in the 0.8-3 kHz crunch band. The shipped
+  // renders did neither:
+  //
+  //   asphalt-1  body  +4.2 dB   crunch +3.9 dB    grass-1  body -12.4 dB
+  //   asphalt-2  body +11.6 dB   crunch +2.4 dB    gravel-1 body  +4.7 dB
+  //   pavement-1 body +25.5 dB   crunch -14.5 dB
+  //
+  // The replacements measure body +29.9/+28.9 dB and crunch -9.5/+1.2 dB, which
+  // puts them in the pavement and concrete class where they belong: a hard
+  // contact on the landing, road grit on the push-off.
+  // `tests/audio.test.ts` pins those two numbers so a future re-render cannot
+  // quietly drift back into the rustle class.
   {
     id: 'steps/asphalt-1',
     file: 'asphalt-1',
     prompt:
-      'one single footstep on worn asphalt road surface, walking pace, close dry recording, no reverb, no music, no other sound',
-    meanDb: -31.9,
-    trimDb: 7.3,
+      'one single shoe stepping down onto worn asphalt road, a dull blunt low thud on hard bitumen with a short dry sandy grit texture over it, damped with no ring and no tail, walking pace, recorded loud and very close, no crunch, no loose gravel, no stones, no rustling, close dry recording, no reverb, no music, no speech, no other sound',
+    meanDb: -28.4,
+    trimDb: 3.0,
+    regenerated: ASPHALT_GENERATED_ON,
+    postProcess: STEP_TAKE,
   },
   {
     id: 'steps/asphalt-2',
     file: 'asphalt-2',
     prompt:
-      'one single scuffing footstep on worn gritty asphalt road surface, walking pace, close dry recording, no reverb, no music, no other sound',
-    meanDb: -18.6,
-    trimDb: -3.4,
+      'one single boot heel rolling onto dry tarmac and scraping briefly on road dust, a thick low blunt contact with a short gritty rubber drag, dead and damped, walking pace, recorded loud and very close, no crunch, no gravel, no stones, no grass, no rustle, close dry recording, no reverb, no music, no speech, no other sound',
+    meanDb: -19.5,
+    trimDb: -2.5,
+    regenerated: ASPHALT_GENERATED_ON,
+    postProcess: STEP_TAKE,
   },
   {
     id: 'steps/boardwalk-1',
@@ -581,7 +635,7 @@ const STEP_SPECS: readonly StepSpec[] = [
       'one single footstep pressing down into short dry grass over firm soil, a crisp rustle of grass blades with a dull earth thud underneath it, walking pace, recorded loud and close, close dry recording, no reverb, no music, no speech, no other sound',
     meanDb: -31.4,
     trimDb: 9.4,
-    regenerated: true,
+    regenerated: WORLD_GENERATED_ON,
     postProcess:
       STEP_CUT +
       ' Then boosted 6 dB offline, the same remedy wpn/rifle and imp/flesh needed: ' +
@@ -597,7 +651,7 @@ const STEP_SPECS: readonly StepSpec[] = [
       'one single footstep landing in longer damp grass and soft earth, a muffled swishing rustle with a soft low thump under it, walking pace, recorded loud and close, close dry recording, no reverb, no music, no speech, no other sound',
     meanDb: -25.0,
     trimDb: 3.0,
-    regenerated: true,
+    regenerated: WORLD_GENERATED_ON,
   },
   {
     id: 'steps/interior-1',
@@ -622,7 +676,7 @@ const STEP_SPECS: readonly StepSpec[] = [
       'one single heavy hard-soled work boot stamping down on a bare poured concrete apron, one loud flat hard slap at full volume with a little grit under the sole, recorded very close with the microphone at the shoe, close dry recording, no reverb, no music, no speech, no other sound',
     meanDb: -22.5,
     trimDb: -0.7,
-    regenerated: true,
+    regenerated: WORLD_GENERATED_ON,
   },
   {
     id: 'steps/concrete-2',
@@ -631,7 +685,28 @@ const STEP_SPECS: readonly StepSpec[] = [
       'one single boot step scuffing on a bare dusty concrete apron outdoors, a hard flat contact ending in a short gritty scrape, walking pace, recorded loud and close, close dry recording, no reverb, no music, no speech, no other sound',
     meanDb: -29.0,
     trimDb: 6.4,
-    regenerated: true,
+    regenerated: WORLD_GENERATED_ON,
+  },
+  // Cut stone, which used to borrow the pavement pair; see `STEP_FAMILIES`.
+  {
+    id: 'steps/stone-1',
+    file: 'stone-1',
+    prompt:
+      'one single leather-soled shoe landing on a worn stone flagstone in an old town square, a hard bright stony knock with a short natural click and no grit, walking pace, recorded loud and very close, no crunch, no gravel, no loose stones, no rustling, close dry recording, no reverb, no music, no speech, no other sound',
+    meanDb: -21.4,
+    trimDb: -0.9,
+    regenerated: ASPHALT_GENERATED_ON,
+    postProcess: STEP_TAKE,
+  },
+  {
+    id: 'steps/stone-2',
+    file: 'stone-2',
+    prompt:
+      'one single footstep pivoting on a smooth worn limestone slab, a hard bright stone contact with a brief dry sole scuff, dense and solid, walking pace, recorded loud and very close, no crunch, no gravel, no dirt, no rustling, close dry recording, no reverb, no music, no speech, no other sound',
+    meanDb: -21.0,
+    trimDb: -1.0,
+    regenerated: ASPHALT_GENERATED_ON,
+    postProcess: STEP_TAKE,
   },
   {
     id: 'steps/terminal-1',
@@ -640,7 +715,7 @@ const STEP_SPECS: readonly StepSpec[] = [
       'one single loud sharp footstep on a hard polished tiled floor, a bright flat slap of a leather sole at full volume with a very short tail, recorded extremely close, no music, no speech, no other sound',
     meanDb: -17.8,
     trimDb: -4.2,
-    regenerated: true,
+    regenerated: WORLD_GENERATED_ON,
   },
   {
     id: 'steps/terminal-2',
@@ -649,7 +724,7 @@ const STEP_SPECS: readonly StepSpec[] = [
       'one single hard leather heel striking a polished marble floor, one loud crisp high click at full volume with a very short tail, recorded extremely close with the microphone right at the shoe, no music, no speech, no other sound',
     meanDb: -22.1,
     trimDb: -0.5,
-    regenerated: true,
+    regenerated: WORLD_GENERATED_ON,
   },
 ];
 
@@ -669,6 +744,78 @@ const STEP_BYTES = 6313;
  * set from it. Re-measure with `tools/generate-world-sfx.mjs --steps` if a step
  * is ever re-rendered.
  */
+/**
+ * Measured band levels of each shipped step file, in dBFS, and the reason this
+ * table exists at all.
+ *
+ * The 2026-08-27 pass fixed the CLASSIFIER (every carriageway point resolves to
+ * the asphalt family) and the LOUDNESS (a 3 dB spread across the set), and a
+ * road still sounded like grass - because neither of those says anything about
+ * TIMBRE. Two derived numbers do:
+ *
+ *   body   = lowMid - air   how far the 180-800 Hz contact stands over the air
+ *   crunch = mid - lowMid   whether the hit peaks in the 0.8-3 kHz grit band
+ *
+ * A shoe on a hard surface is a fast low contact: body well positive, crunch at
+ * or below zero. A rustle or a crunch inverts both. Measured over the shipped
+ * set the two classes separate cleanly and with margin - the weakest hard
+ * surface reaches +14.4 dB of body and the firmest loose one only +4.7 dB - so
+ * `HARD_SURFACE_BODY_DB` sits in the gap at 10 dB rather than on a sample.
+ *
+ * Kept as data, like `STEP_MEAN_DB`, because it is measured rather than
+ * derivable: re-measure with `tools/generate-world-sfx.mjs --bands` whenever a
+ * step is re-rendered. `tests/audio.test.ts` asserts the class from it.
+ */
+export interface StepBands {
+  /** 180-800 Hz: the contact itself. */
+  readonly lowMid: number;
+  /** 0.8-3 kHz: grit, crunch and scrape. */
+  readonly mid: number;
+  /** 8 kHz and above: rustle and air. */
+  readonly air: number;
+}
+
+export const STEP_BAND_DB: Readonly<Record<StepAssetId, StepBands>> = {
+  'steps/pavement-1': { lowMid: -25.1, mid: -39.6, air: -50.6 },
+  'steps/pavement-2': { lowMid: -25.3, mid: -34.0, air: -57.9 },
+  'steps/asphalt-1': { lowMid: -30.0, mid: -39.5, air: -59.9 },
+  'steps/asphalt-2': { lowMid: -23.3, mid: -22.1, air: -52.2 },
+  'steps/boardwalk-1': { lowMid: -32.4, mid: -38.1, air: -74.7 },
+  'steps/boardwalk-2': { lowMid: -25.0, mid: -33.4, air: -66.2 },
+  'steps/gravel-1': { lowMid: -27.0, mid: -26.2, air: -31.7 },
+  'steps/gravel-2': { lowMid: -39.3, mid: -37.8, air: -35.3 },
+  'steps/grass-1': { lowMid: -47.2, mid: -41.5, air: -34.8 },
+  'steps/grass-2': { lowMid: -53.3, mid: -53.8, air: -55.8 },
+  'steps/interior-1': { lowMid: -36.3, mid: -50.7, air: -57.1 },
+  'steps/interior-2': { lowMid: -31.6, mid: -49.3, air: -78.5 },
+  'steps/concrete-1': { lowMid: -25.1, mid: -28.8, air: -42.8 },
+  'steps/concrete-2': { lowMid: -31.6, mid: -36.2, air: -46.0 },
+  'steps/terminal-1': { lowMid: -36.9, mid: -36.1, air: -40.4 },
+  'steps/terminal-2': { lowMid: -23.7, mid: -28.3, air: -52.2 },
+  'steps/stone-1': { lowMid: -24.9, mid: -24.6, air: -47.3 },
+  'steps/stone-2': { lowMid: -24.7, mid: -23.7, air: -48.3 },
+};
+
+/**
+ * How far a hard surface's contact must stand over its own air, in dB.
+ *
+ * In the gap between the two measured classes rather than on either edge: the
+ * weakest hard surface measures +14.4 dB and the strongest loose one +4.7 dB.
+ */
+export const HARD_SURFACE_BODY_DB = 10;
+
+/** `lowMid - air`. Positive and large is a hard contact; negative is a rustle. */
+export function stepBody(id: StepAssetId): number {
+  const bands = STEP_BAND_DB[id];
+  return Number((bands.lowMid - bands.air).toFixed(1));
+}
+
+/** `mid - lowMid`. At or below zero is a hard contact; positive is grit. */
+export function stepCrunch(id: StepAssetId): number {
+  const bands = STEP_BAND_DB[id];
+  return Number((bands.mid - bands.lowMid).toFixed(1));
+}
+
 export const STEP_MEAN_DB: Readonly<Record<StepAssetId, number>> = Object.fromEntries(
   STEP_SPECS.map((spec) => [spec.id, spec.meanDb]),
 ) as Readonly<Record<StepAssetId, number>>;
@@ -687,9 +834,9 @@ const STEPS: readonly AudioAsset[] = STEP_SPECS.map((spec) => ({
     provider: 'elevenlabs' as const,
     modelId: SFX_MODEL,
     prompt: spec.prompt,
-    date: spec.regenerated === true ? WORLD_GENERATED_ON : GENERATED_ON,
-    credits: spec.regenerated === true ? 1.6667 : 2.3333,
-    parameters: spec.regenerated === true ? REGENERATED_STEP_PARAMS : STEP_PARAMS,
+    date: spec.regenerated ?? GENERATED_ON,
+    credits: spec.regenerated === undefined ? 2.3333 : 1.6667,
+    parameters: spec.regenerated === undefined ? STEP_PARAMS : REGENERATED_STEP_PARAMS,
   },
   postProcess: spec.postProcess ?? STEP_CUT,
 }));
@@ -1853,7 +2000,7 @@ export const PRELOAD_ASSET_IDS: readonly AudioAssetId[] = AUDIO_ASSETS.filter(
 // ---------------------------------------------------------------------------
 
 /**
- * The eight footstep MATERIALS the game owns recordings for.
+ * The nine footstep MATERIALS the game owns recordings for.
  *
  * This is the vocabulary the mixer actually speaks. It is deliberately not
  * `SurfaceId`: that type classifies TERRAIN, and a footstep is decided by what
@@ -1871,7 +2018,8 @@ export type StepFamily =
   | 'grass'
   | 'interior'
   | 'concrete'
-  | 'terminal';
+  | 'terminal'
+  | 'stone';
 
 /** Two variants per family so the runtime can alternate and avoid a metronome. */
 export const STEP_FAMILIES: Readonly<Record<StepFamily, readonly [StepAssetId, StepAssetId]>> = {
@@ -1886,6 +2034,15 @@ export const STEP_FAMILIES: Readonly<Record<StepFamily, readonly [StepAssetId, S
   concrete: ['steps/concrete-1', 'steps/concrete-2'],
   /** A polished public floor: the terminal, a marble lobby. A bright click. */
   terminal: ['steps/terminal-1', 'steps/terminal-2'],
+  /**
+   * Cut stone laid outdoors: the plaza, an ashlar facade's own footing.
+   *
+   * Denser and brighter than a poured paving slab, which is what it used to
+   * borrow. Measured, stone keeps 9 to 15 dB more 0.8-3 kHz relative to its
+   * contact band than the pavement pair does; that difference is the whole
+   * reason it is worth two more recordings rather than a remap.
+   */
+  stone: ['steps/stone-1', 'steps/stone-2'],
 };
 
 /**
@@ -1907,7 +2064,7 @@ export const SURFACE_STEP_FAMILY: Readonly<Record<SurfaceId, StepFamily>> = {
   asphalt: 'asphalt',
   pavement: 'pavement',
   boardwalk: 'boardwalk',
-  plaza: 'pavement',
+  plaza: 'stone',
   grass: 'grass',
   sand: 'gravel',
   gravel: 'gravel',
@@ -1948,7 +2105,7 @@ export const MATERIAL_STEP_FAMILY: Readonly<Partial<Record<MaterialKey, StepFami
   kerb: 'pavement',
   pavement: 'pavement',
   pavementDark: 'pavement',
-  plazaStone: 'pavement',
+  plazaStone: 'stone',
   roofTile: 'pavement',
   brickRed: 'pavement',
   brickBuff: 'pavement',
@@ -1964,7 +2121,7 @@ export const MATERIAL_STEP_FAMILY: Readonly<Partial<Record<MaterialKey, StepFami
   concrete: 'concrete',
   concreteBoard: 'concrete',
   tileFloor: 'terminal',
-  stoneAshlar: 'terminal',
+  stoneAshlar: 'stone',
   metalDark: 'terminal',
   metalLight: 'terminal',
   paintedMetal: 'terminal',

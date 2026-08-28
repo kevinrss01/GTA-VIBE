@@ -134,6 +134,64 @@ describe('a rocket in flight', () => {
     }
   });
 
+  /*
+   * The detonation has to say whether it CAME FROM a probe hit.
+   *
+   * The combat layer latches the probe's surface normal and material between
+   * the probe and the arrival, and the only thing that makes that safe is
+   * knowing which arrivals the latch describes. A fuse running out in mid-air
+   * describes nothing, and a caller that could not tell the two apart would
+   * scorch the sky with the last wall the rocket flew past.
+   */
+  it('says whether it arrived on something or merely ran out of fuse', () => {
+    const arrivals: { contact: boolean; z: number }[] = [];
+    const rockets = new Projectiles({
+      probe: (_ox, _oy, oz, _dx, _dy, dz, maxT) => {
+        const t = (5 - oz) / (dz || 1);
+        return t >= 0 && t <= maxT ? t : -1;
+      },
+      onDetonate: (_x, _y, z, _dx, _dy, _dz, contact) => arrivals.push({ contact, z }),
+    });
+    rockets.launch(0, 1.5, 0, 0, 0, 1, SPEED);
+    for (let i = 0; i < 60; i += 1) rockets.update(STEP);
+    expect(arrivals).toHaveLength(1);
+    expect(arrivals[0]?.contact).toBe(true);
+    expect(arrivals[0]?.z ?? 0).toBeCloseTo(5, 2);
+
+    // Nothing to hit: the same rocket, the same weapon, no surface.
+    const spent: boolean[] = [];
+    const timedOut = new Projectiles({
+      probe: () => -1,
+      onDetonate: (_x, _y, _z, _dx, _dy, _dz, contact) => spent.push(contact),
+    });
+    timedOut.launch(0, 1.5, 0, 0, 0, 1, SPEED);
+    for (let i = 0; i < 600; i += 1) timedOut.update(STEP);
+    expect(spent).toEqual([false]);
+  });
+
+  it('reports the direction it was travelling when it arrived', () => {
+    const arrivals: { dx: number; dy: number; dz: number }[] = [];
+    const rockets = new Projectiles({
+      probe: (_ox, _oy, oz, _dx, _dy, dz, maxT) => {
+        const t = (12 - oz) / (dz || 1);
+        return t >= 0 && t <= maxT ? t : -1;
+      },
+      onDetonate: (_x, _y, _z, dx, dy, dz) => arrivals.push({ dx, dy, dz }),
+    });
+    rockets.launch(0, 1.5, 0, 0, 0, 1, SPEED);
+    for (let i = 0; i < 120; i += 1) rockets.update(STEP);
+
+    const hit = arrivals[0];
+    expect(hit).toBeDefined();
+    if (!hit) return;
+    // A unit vector, pointing where the rocket was going - mostly down +Z and
+    // a little downward, because the motor does not quite hold it level.
+    expect(Math.hypot(hit.dx, hit.dy, hit.dz)).toBeCloseTo(1, 6);
+    expect(hit.dz).toBeGreaterThan(0.99);
+    expect(hit.dy).toBeLessThan(0);
+    expect(hit.dy).toBeGreaterThan(-0.1);
+  });
+
   it('clears the sky on demand without detonating anything', () => {
     const detonations: unknown[] = [];
     const rockets = new Projectiles({ probe: () => -1, onDetonate: () => detonations.push(1) });

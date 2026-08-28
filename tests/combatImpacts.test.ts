@@ -998,3 +998,49 @@ describe('the vehicle broad phase', () => {
     combat.dispose();
   });
 });
+
+// -- DEFECT: bullet holes were welded to cars that then drove off -------------
+
+describe('a round on a panel', () => {
+  it('leaves a mark on a wall and only sparks on a car', () => {
+    const wall: ColliderBox[] = [
+      { minX: 8, maxX: 12, minZ: -6, maxZ: 6, bottom: 0, top: 6, solid: true, surface: 'concrete' },
+    ];
+    const onWall = build({
+      player: armed('pistol'),
+      camera: eastwardCamera(0, 1.68, 0),
+      boxes: wall,
+    });
+    expect(onWall.fireOnce()).toBe(true);
+    const wallMarks = onWall.effects.markReport();
+    expect(wallMarks).toHaveLength(1);
+    // Standing up on the face the round arrived on.
+    expect(wallMarks[0]?.nx ?? 0).toBeCloseTo(-1, 6);
+    onWall.dispose();
+
+    const fleet = new CentreFleet();
+    fleet.add({
+      id: 7, police: false, x: 10, y: 0.75, z: 0, yaw: 0,
+      halfLength: 2.44, halfWidth: 0.96, halfHeight: 0.75,
+    });
+    const onCar = build({
+      player: armed('pistol'),
+      camera: eastwardCamera(0, 0.75, 0),
+      fleet,
+    });
+    expect(onCar.fireOnce()).toBe(true);
+    // The round registered - the car took damage...
+    expect(fleet.shots.some((shot) => shot.id === 7)).toBe(true);
+    onCar.effects.update(1 / 60, 0, 2, 0);
+    // ...and threw sparks off the panel...
+    expect(onCar.effects.stats.glows).toBeGreaterThan(1);
+    /*
+     * ...but left no decal, because a decal is welded to the world and a car
+     * is not part of the world. One that drives away would leave its bullet
+     * holes hanging in the middle of the street for the mark's whole life,
+     * which is a worse artefact than not drawing them.
+     */
+    expect(onCar.effects.markReport()).toHaveLength(0);
+    onCar.dispose();
+  });
+});
