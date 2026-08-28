@@ -502,12 +502,21 @@ export class Flying {
     if (!flight) return null;
     const stopped = flight.onGround && groundSpeedOf(flight) < HINT_IDLE_SPEED;
     const jammed = this.jamSeconds >= JAM_SECONDS * 0.25;
-    return {
-      hints: FLIGHT_HUD_CONTROLS,
-      hold: stopped || jammed || this.hintAge < HINT_HOLD_SECONDS,
-      warning: jammed ? 'Blocked — something solid ahead' : null,
-    };
+    // Written into a reused object rather than a fresh literal: this is read
+    // once a frame for as long as the player is flying, and the HUD compares
+    // fields rather than identity, so a new object every frame would be pure
+    // garbage. `hints` is a module constant, so its identity is stable and the
+    // HUD can use that to skip rebuilding the rows.
+    this.hint.hold = stopped || jammed || this.hintAge < HINT_HOLD_SECONDS;
+    this.hint.warning = jammed ? 'Blocked — something solid ahead' : null;
+    return this.hint;
   }
+
+  private readonly hint: {
+    hints: readonly ControlHint[];
+    hold: boolean;
+    warning: string | null;
+  } = { hints: FLIGHT_HUD_CONTROLS, hold: false, warning: null };
 
   /**
    * Takes the nearest aircraft. False when there is nothing here to take, so

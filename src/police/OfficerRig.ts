@@ -540,7 +540,13 @@ export class OfficerRig {
 
       extra[a] = CAP;
       extra[a + 1] = BOOTS;
-      extra[a + 2] = 0;
+      // FULLY OPAQUE, and it must never be zero. `iExtra.z` is the crowd's
+      // dissolve, and the procedural shader discards a fragment whenever the
+      // stipple noise exceeds it - so a zero here discards every pixel and the
+      // officer is invisible while still shooting and still arresting. The
+      // police own their officers outright and never spawn or retire one in
+      // view, so they have no dissolve to run: they are always solid.
+      extra[a + 2] = 1;
       extra[a + 3] = 0;
 
       n += 1;

@@ -83,7 +83,7 @@ export class Hud {
   private readonly flightHintEl: HTMLElement;
   private readonly flightWarningEl: HTMLElement;
   private readonly flightRowsEl: HTMLElement;
-  private flightHintKey = '';
+  private flightHints: readonly ControlHint[] | null = null;
   private flightWarning: string | null = null;
   private flightHintsVisible = false;
   private readonly crosshair: HTMLElement;
@@ -343,9 +343,16 @@ export class Hud {
       return;
     }
 
-    const key = state.hints.map((hint) => `${hint.keys}|${hint.action}`).join('\n');
-    if (key !== this.flightHintKey) {
-      this.flightHintKey = key;
+    /*
+     * Compared by IDENTITY, not by a rebuilt string. This runs once a frame for
+     * as long as the player is flying, and the hint list is a module constant
+     * resolved once per platform - so mapping it into fresh strings and joining
+     * them, only to discover it had not changed, was a per-frame allocation
+     * that bought nothing. A caller that really does swap the list gets new
+     * rows because the array identity differs.
+     */
+    if (state.hints !== this.flightHints) {
+      this.flightHints = state.hints;
       this.flightRowsEl.replaceChildren(...state.hints.map(hintRow));
     }
     if (state.warning !== this.flightWarning) {

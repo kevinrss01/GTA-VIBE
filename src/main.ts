@@ -669,6 +669,15 @@ async function boot(): Promise<void> {
       // falls forwards and one shot in the chest goes over backwards.
       pedestrians.downAt(x, y, z, undefined, dirX, dirZ);
     },
+    // A hit that wounded without killing. The crowd's stagger leaves them
+    // UPRIGHT and still targetable - a flinch and a stumble along the round's
+    // line - which is what makes a wound read differently from a death. The
+    // combat layer withheld this until the crowd had an upright reaction to
+    // offer, because the earlier one put a grazed pedestrian flat on the
+    // pavement and briefly out of reach.
+    staggerAt: (x: number, z: number, dirX: number, dirZ: number) => {
+      pedestrians.staggerAt(x, z, undefined, dirX, dirZ);
+    },
     // Gunfire is an event the crowd hears, not just something that happens to
     // one person. Raised once per trigger pull and once per detonation, and
     // safe for a round that hit nothing at all.

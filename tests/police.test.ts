@@ -746,3 +746,58 @@ describe('police response', () => {
     police.dispose();
   });
 });
+
+/*
+ * The officers have to be VISIBLE, which is not the same as being simulated.
+ *
+ * `iExtra.z` is the crowd's dissolve, added so people can be spawned and
+ * retired without popping, and the procedural shader discards a fragment
+ * whenever the stipple noise exceeds it. The police share that shader but not
+ * that lifecycle - they own their officers outright and never fade one in or
+ * out - so an officer must always be written fully opaque. Writing the zero
+ * that slot used to hold discards every pixel: officers that still walk, still
+ * shoot and still arrest, and cannot be seen at all.
+ */
+describe('the officer rig is visible', () => {
+  it('writes a fully opaque dissolve for every officer it draws', async () => {
+    const { OfficerRig } = await import('../src/police/OfficerRig');
+    // `load: false` keeps this on the procedural fallback, which is the branch
+    // a headless run exercises and the one the defect was in.
+    const rig = new OfficerRig(8, false, false);
+    const poses = Array.from({ length: 4 }, (_, i) => ({
+      x: i * 3,
+      y: 0,
+      z: 0,
+      heading: 0,
+      speed: 1.2,
+      height: 1.8,
+      girth: 1,
+      phase: 0.25 * i,
+      gait: 1,
+      variant: i,
+      walked: 0,
+      lastX: i * 3,
+      lastZ: 0,
+      aiming: 0,
+      down: false,
+      downFor: 0,
+      fallSign: 1,
+    }));
+    rig.write(poses, 0);
+
+    const proc = rig.meshes.find((mesh) => mesh.name === 'police-officers-proc');
+    expect(proc).toBeDefined();
+    const mesh = proc as unknown as {
+      count: number;
+      geometry: { getAttribute(name: string): { array: Float32Array } };
+    };
+    expect(mesh.count).toBe(poses.length);
+
+    const extra = mesh.geometry.getAttribute('iExtra').array;
+    for (let i = 0; i < mesh.count; i += 1) {
+      // The shader's own threshold: below it, the stipple can discard.
+      expect(extra[i * 4 + 2]).toBeGreaterThanOrEqual(0.996);
+    }
+    rig.dispose();
+  });
+});
