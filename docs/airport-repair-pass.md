@@ -832,3 +832,25 @@ directory, `npm ci`, `npm run build` — clean.
 This one predates the repair pass entirely. It was only ever going to surface by
 actually deploying, which is the argument for doing so rather than trusting a
 local build.
+
+### The deploy
+
+```
+Build Completed in /vercel/output [19s]
+Deployment completed
+status  ● Ready
+```
+
+`https://gta-vibe-ibibvqgy1-perso-6eecfc5e.vercel.app`, production, 34 s.
+
+The remote build ran `tsc --noEmit && vite build` and emitted
+`index-5I_3t3zS.js`, `three-BiQ7IOEf.js` and `index-yIq21Bm0.css` — the same
+hashes as the local build, so the two trees are identical.
+
+**The URL answers 302 to `vercel.com/sso-api`.** That is Vercel Deployment
+Protection, a project setting, not a build failure: the site is up and gated to
+the team. Turning it off is an account-level change and was not made.
+
+`npm audit` reports 5 vulnerabilities (3 moderate, 1 high, 1 critical) in the
+dependency tree during install. They are pre-existing, unrelated to this pass,
+and were not touched.
