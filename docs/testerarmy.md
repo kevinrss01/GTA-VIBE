@@ -13,6 +13,13 @@ in this repository.
 | **Baseline** — *Meridian Bay smoke: the city is alive and you can move through it* | `3c3c8951-73f9-451c-9d3d-b8edfdc4efa5` |
 | *Last Call — the first mission briefs, points and can be started* | `b9317604-a3e9-4029-ab94-74a6967961e2` |
 
+A second project holds the tooling-workstream coverage:
+
+| What | Id |
+| --- | --- |
+| Project — *Youtube videos GTA - TOOLS* | `c152f076-e9b6-4708-a104-cdcd1c06b5cc` |
+| *GTA Vibe - realism pass: surfaces, police, crashes, rockets* | `a11dbdf0-098b-43f2-a0cd-28347cbf8f1a` |
+
 The project URL is the GitHub repository, because the dashboard requires a
 public HTTP(S) URL and this game has no deployment. Runs are therefore **local**
 against a production preview on this machine.
@@ -187,3 +194,32 @@ It is now 13 steps and **ordered so the checks that need no travel come first** 
 the abandoned-car check happens near the spawn point, before the long drive, so
 a run that exhausts its budget on the way south still returns signal on one of
 the headline repairs.
+
+## The 2026-08-28 realism-pass run, and the step that broke it
+
+Run artefacts: `.testerarmy/2026-08-28T11-23-30-173Z/`. Result **FAILED**, with
+`issues: []` — no product defect was recorded.
+
+| Step | Result |
+| --- | --- |
+| 1. Start the game and capture the mouse | passed |
+| 2-3. Walk boardwalk to road to pavement | passed |
+| 4. Assert the city is alive | passed — *"console logs are clean"* |
+| 5. Approach a car, get in, drive, bump another | **failed: `STEP_TOOL_LIMIT_EXHAUSTED`** |
+
+**That is a fixture defect, not a product one, and it was mine.** The step packed
+four separate jobs into one instruction — find a stopped car, walk to it, press
+E, drive it into another — and the agent spent its whole per-step action budget
+before finishing. The skill's own guidance says to give each step one clear job
+and to split actions from checks; this step did neither.
+
+The saved test has been re-scoped into single-intent steps and **not re-run**,
+because the run for this workstream had already been spent. The behaviour step 5
+was probing was verified directly instead, in a production build through
+`window.__meridian`: a 2.41 m/s bump costs 0.71 % of the shell and leaves the
+car `pristine` and drivable. See [`realism-pass.md`](./realism-pass.md).
+
+**The lesson worth keeping:** a step that reads as one sentence to a person can
+still be four jobs to an agent driving a game. In a game in particular, "walk up
+to X and do Y" is a search plus a manoeuvre plus an interaction, and the search
+alone can exhaust the budget.
