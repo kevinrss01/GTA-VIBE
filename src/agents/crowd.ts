@@ -1717,6 +1717,11 @@ export class Crowd {
       // lying on the ground may not.
       const paused = other.state === 'pause';
       if (!paused && other.state !== 'walk') continue;
+      // NEVER IN THE ROAD. A walker hailed while they are on a crossing would
+      // stop dead on the carriageway and stay there for the whole
+      // conversation, which is both a hazard and the one place the crowd's own
+      // rules are strictest about.
+      if (!paused && (this.graph.links[other.link]?.crossing ?? true)) continue;
       const reach = paused ? CHAT_RADIUS : CHAT_RECRUIT_RADIUS;
       const dx = other.x - ped.x;
       const dz = other.z - ped.z;

@@ -739,17 +739,17 @@ export class Minimap {
       this.expandedCache.height !== height ||
       !this.cacheCoversWindow(whole)
     ) {
-      // `buildExpandedCache` reads the overlay canvas's own size, so the two
-      // are kept in step by sizing the overlay to match before rebuilding.
-      this.expandedWidth = width;
-      this.expandedHeight = height;
-      this.overlayCanvas.width = width;
-      this.overlayCanvas.height = height;
-      this.buildExpandedCache(whole);
+      /*
+       * Painted at the CALLER's size, and the overlay's own layout is left
+       * alone. The two views share one cache, so whichever painted last owns
+       * it and the other rebuilds on its next frame - which is correct, and is
+       * why neither may write the other's dimensions.
+       */
+      this.buildExpandedCache(width, height, whole);
     }
     ctx.clearRect(0, 0, width, height);
     ctx.drawImage(this.expandedCache, 0, 0);
-    const project = this.expandedProjector(whole);
+    const project = this.expandedProjector(whole, width);
     const point = project(this.playerX, this.playerZ);
     this.drawPlayer(ctx, point.x, point.y, this.dpr * 1.35, 30);
     this.drawMarkers(ctx, project, this.dpr);
@@ -770,14 +770,15 @@ export class Minimap {
       this.expandedCache.height !== height ||
       !this.cacheCoversWindow(window)
     ) {
-      this.buildExpandedCache(window);
+      this.buildExpandedCache(width, height, window);
     }
     ctx.clearRect(0, 0, width, height);
     ctx.drawImage(this.expandedCache, 0, 0);
     // The cache may be up to RECENTRE_FRACTION out of date, so the marker is
     // placed against the window it was actually painted for. Anything else and
     // the arrow drifts off the street it is standing on.
-    const point = this.expandedProjector(this.cachedWindow ?? window)(this.playerX, this.playerZ);
+    const project = this.expandedProjector(this.cachedWindow ?? window, width);
+    const point = project(this.playerX, this.playerZ);
     // A shade larger than on the dial: the marker has a whole city around it
     // here and would otherwise be lost among the streets.
     this.drawPlayer(ctx, point.x, point.y, this.dpr * 1.35, 30);
@@ -1161,18 +1162,26 @@ export class Minimap {
     );
   }
 
-  /** Projects world metres into the cached raster's pixels. */
-  private expandedProjector(window: MapWindow): (x: number, z: number) => MapPoint {
-    const scale = this.expandedWidth / window.width;
+  /**
+   * Projects world metres into a raster of `width` pixels.
+   *
+   * The width is a PARAMETER rather than `this.expandedWidth` because the same
+   * cache serves two canvases of different sizes - the `M` overlay and the
+   * pause menu's Map tab - and reading it off the object meant whichever of
+   * them painted last decided where the other one put its player marker.
+   */
+  private expandedProjector(
+    window: MapWindow,
+    width: number,
+  ): (x: number, z: number) => MapPoint {
+    const scale = width / window.width;
     return (x: number, z: number): MapPoint => ({
       x: (x - window.minX) * scale,
       y: (z - window.minZ) * scale,
     });
   }
 
-  private buildExpandedCache(window: MapWindow): void {
-    const width = this.expandedWidth;
-    const height = this.expandedHeight;
+  private buildExpandedCache(width: number, height: number, window: MapWindow): void {
     if (width <= 0 || height <= 0) return;
     this.expandedCache.width = width;
     this.expandedCache.height = height;
@@ -1188,7 +1197,7 @@ export class Minimap {
     this.paintCity(ctx, width, height, window);
     this.cachedWindow = window;
 
-    const project = this.expandedProjector(window);
+    const project = this.expandedProjector(window, width);
     ctx.textBaseline = 'middle';
 
     // Painted smallest first so the district names, which carry the map, win
