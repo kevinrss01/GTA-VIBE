@@ -758,6 +758,92 @@ describe('police response', () => {
  * that slot used to hold discards every pixel: officers that still walk, still
  * shoot and still arrest, and cannot be seen at all.
  */
+// -- what the police say ------------------------------------------------------
+
+describe('police voice cues', () => {
+  /** Runs a pursuit and collects every cue it emitted, by kind. */
+  function pursue(seconds: number, extra: Partial<PoliceContext> = {}): {
+    counts: Record<string, number>;
+    perFrame: number;
+    /** Most speakers alive at once: officers on foot, or units for a hail. */
+    speakers: number;
+  } {
+    const player = new PlayerState();
+    const fleet = new StubFleet(8);
+    const police = makeSystem({ player, fleet });
+    const at = onTheRoad();
+    const dt = 1 / 30;
+    const counts: Record<string, number> = {};
+    let perFrame = 0;
+    let speakers = 0;
+    for (let i = 0; i < Math.round(seconds / dt); i += 1) {
+      pinStars(player, 3);
+      police.update(dt, context(at.x, at.z, { ...extra, time: i * dt }));
+      const cues = police.voiceCues;
+      perFrame = Math.max(perFrame, cues.length);
+      for (const cue of cues) counts[cue.kind] = (counts[cue.kind] ?? 0) + 1;
+      const stats = police.stats;
+      speakers = Math.max(speakers, extra.driving ? stats.units : stats.officers);
+    }
+    return { counts, perFrame, speakers };
+  }
+
+  it('opens the radio once when a pursuit starts', () => {
+    const { counts } = pursue(40);
+    // RADIO_COOLDOWN is 12 s, and the pursuit only starts once.
+    expect(counts['radio'] ?? 0).toBeGreaterThan(0);
+    expect(counts['radio'] ?? 0).toBeLessThanOrEqual(4);
+  });
+
+  it('has an officer on foot challenge the player once they are close', () => {
+    const { counts } = pursue(90);
+    expect(counts['challenge'] ?? 0).toBeGreaterThan(0);
+  });
+
+  it('tells a driver to pull over instead of to get down', () => {
+    const { counts } = pursue(90, { driving: true, playerSpeed: 6 });
+    expect(counts['pullover'] ?? 0).toBeGreaterThan(0);
+    expect(counts['challenge'] ?? 0).toBe(0);
+  });
+
+  it('spaces the orders instead of chanting them', () => {
+    /*
+     * OFFICER_VOICE_COOLDOWN is eight seconds per officer, which is the number
+     * that matters: a cordon carries a crew per car, and without it four
+     * officers standing over the player produce an order every frame.
+     */
+    const { counts, speakers } = pursue(90);
+    const orders = (counts['challenge'] ?? 0) + (counts['pullover'] ?? 0);
+    // One order per speaker per cooldown is the ceiling the constants set.
+    expect(orders).toBeLessThanOrEqual(Math.ceil(90 / 8) * speakers);
+    // And nothing like the one-per-frame a state-driven version would give.
+    expect(orders).toBeLessThan(90);
+  });
+
+  it('says nothing at all once the player is clean', () => {
+    const player = new PlayerState();
+    const fleet = new StubFleet(8);
+    const police = makeSystem({ player, fleet });
+    const at = onTheRoad();
+    run(police, player, 3, 40, at);
+    player.clearHeat();
+    let said = 0;
+    const dt = 1 / 30;
+    for (let i = 0; i < 300; i += 1) {
+      police.update(dt, context(at.x, at.z, { time: 40 + i * dt }));
+      said += police.voiceCues.length;
+    }
+    expect(said).toBe(0);
+  });
+
+  it('drains the list every frame rather than growing it', () => {
+    const { perFrame } = pursue(90);
+    // A cue is an EVENT. Four units of crew could legally all qualify on one
+    // frame; a list that was never cleared would run to hundreds.
+    expect(perFrame).toBeLessThan(12);
+  });
+});
+
 describe('the officer rig is visible', () => {
   it('writes a fully opaque dissolve for every officer it draws', async () => {
     const { OfficerRig } = await import('../src/police/OfficerRig');

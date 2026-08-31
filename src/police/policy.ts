@@ -203,6 +203,14 @@ export const OFFICER_VOICE_RANGE = 26;
 export const OFFICER_VOICE_COOLDOWN = 8;
 /** Seconds before any unit may key the radio again. */
 export const RADIO_COOLDOWN = 12;
+/**
+ * How near a unit has to be to hail a driver over its PA.
+ *
+ * Further than a shout, because it IS one through a loudhailer at somebody
+ * sitting inside a car - but still well short of `SIGHT_RANGE_CAR`, or a
+ * pursuit would be narrated from the far side of the district.
+ */
+export const UNIT_VOICE_RANGE = 45;
 
 /** Close enough to lay hands on. */
 export const ARREST_RANGE = 2.4;

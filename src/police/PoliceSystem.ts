@@ -96,6 +96,7 @@ import {
   OFFICER_VOICE_COOLDOWN,
   OFFICER_VOICE_RANGE,
   RADIO_COOLDOWN,
+  UNIT_VOICE_RANGE,
   OFFICER_RUN_SPEED,
   OFFICER_SHOT_DAMAGE,
   OFFICER_SHOT_INTERVAL,
@@ -261,6 +262,8 @@ interface Unit {
   officers: Officer[];
   marked: boolean;
   seesPlayer: boolean;
+  /** Seconds until this unit may hail the player again over its PA. */
+  voiceTimer: number;
 }
 
 /** The slice of `TrafficSystem` a pursuit needs. */
@@ -701,6 +704,7 @@ export class PoliceSystem implements LawTargets {
       id: this.nextUnitId,
       handle,
       state: 'driving',
+      voiceTimer: 0,
       x: point.x,
       z: point.z,
       yaw: laneHeading(spot.lane),
@@ -1451,6 +1455,34 @@ export class PoliceSystem implements LawTargets {
     }
     this.wasPursued = this.pursuedNow;
 
+    /*
+     * A CAR TELLS YOU TO PULL OVER; A MAN ON FOOT TELLS YOU TO GET DOWN.
+     *
+     * The two orders come from different places for a structural reason, not
+     * for flavour: a unit only ever sets `holding` and lets its crew out when
+     * the player is NOT driving (see `updateUnit`), so while there is a chase
+     * on there is nobody on foot to shout anything. The order has to come off
+     * the car's own PA, from further out - a loudhailer carries, and a driver
+     * is inside a car with the windows up.
+     */
+    if (ctx.driving) {
+      for (const unit of this.units) {
+        unit.voiceTimer = Math.max(0, unit.voiceTimer - dt);
+        if (unit.state === 'wrecked' || unit.state === 'standdown') continue;
+        if (!unit.seesPlayer || unit.voiceTimer > 0) continue;
+        const distance = Math.hypot(ctx.playerX - unit.x, ctx.playerZ - unit.z);
+        if (distance > UNIT_VOICE_RANGE) continue;
+        unit.voiceTimer = OFFICER_VOICE_COOLDOWN;
+        this.cues.push({
+          kind: 'pullover',
+          x: unit.x,
+          y: unit.handle.view.y + 1.2,
+          z: unit.z,
+        });
+      }
+      return;
+    }
+
     for (const officer of this.officers) {
       officer.voiceTimer = Math.max(0, officer.voiceTimer - dt);
       if (officer.state !== 'chasing' || officer.down || !officer.seesPlayer) continue;
@@ -1459,7 +1491,7 @@ export class PoliceSystem implements LawTargets {
       if (distance > OFFICER_VOICE_RANGE) continue;
       officer.voiceTimer = OFFICER_VOICE_COOLDOWN;
       this.cues.push({
-        kind: ctx.driving ? 'pullover' : 'challenge',
+        kind: 'challenge',
         x: officer.x,
         // Mouth height, not foot height: the line is spatialised on the person.
         y: officer.y + 1.6,

@@ -60,6 +60,9 @@ export type MaterialKey =
   | 'glass'
   | 'glassDark'
   | 'glassShop'
+  | 'shopWall'
+  | 'shopFitting'
+  | 'shopGoods'
   | 'windowFrame'
   | 'doorPainted'
   | 'shutter'
@@ -184,9 +187,57 @@ const SPECS: Readonly<Record<MaterialKey, Spec>> = {
     opacity: 0.72,
     physical: { clearcoat: 1, ior: 1.5 },
   },
-  // Shopfront glazing reads as a dark interior with a strong surface sheen; it
-  // is opaque so we never pay for sorting on hundreds of shopfronts.
-  glassShop: { color: 0x1d2429, roughness: 0.16, metalness: 0.15 },
+  /*
+   * Shopfront glazing.
+   *
+   * TRANSPARENT NOW, AND THAT IS THE POINT. It used to be an opaque near-black
+   * pane "so we never pay for sorting on hundreds of shopfronts", which was a
+   * correct trade while there was nothing behind it - and it is exactly what
+   * made every ground floor in the city read as a row of dead black holes.
+   * There is a shop behind it now (see `emitShopfront`), so the glass has to
+   * let it through.
+   *
+   * The cost is bounded because the pane is still nearly opaque and still
+   * carries its own colour: at 0.62 the interior reads as an interior seen
+   * through tinted glass rather than as a diorama in a box, and the sheen from
+   * the low roughness still dominates at the grazing angles a passer-by sees
+   * most shopfronts at. `envMapIntensity` is raised so the pane picks up the
+   * sky rather than going flat, which is the other half of a window looking
+   * like glass.
+   */
+  glassShop: {
+    color: 0x2a3238,
+    roughness: 0.12,
+    metalness: 0.2,
+    transparent: true,
+    opacity: 0.62,
+    envMapIntensity: 1.5,
+  },
+  /*
+   * What is behind that glass.
+   *
+   * A shop interior seen from the street is almost entirely its back wall, a
+   * counter and whatever is stacked on it, lit by something warm and out of
+   * sight. The low emissive is that unseen light: without it every shop is a
+   * black room whatever colour the wall is, because no light in this scene
+   * reaches through a 1 m opening in a facade.
+   */
+  shopWall: {
+    color: 0xb9a488,
+    roughness: 0.92,
+    emissive: 0x3a2a16,
+    emissiveIntensity: 0.55,
+  },
+  /** Counters, shelving and the back of a display case. */
+  shopFitting: { color: 0x5c4632, roughness: 0.8, emissive: 0x241a0d, emissiveIntensity: 0.4 },
+  /**
+   * Whatever is stacked on the shelves.
+   *
+   * One key rather than a palette: a display is read as SHAPES at street
+   * distance, and the per-instance colour variety that would matter is already
+   * carried by the shelves being at different heights in different bays.
+   */
+  shopGoods: { color: 0xa8563f, roughness: 0.7, emissive: 0x30170f, emissiveIntensity: 0.35 },
   windowFrame: { color: 0x4a4842, roughness: 0.62, metalness: 0.15 },
   doorPainted: { color: 0x3f5a55, roughness: 0.55 },
   shutter: { color: 0x6d7f73, roughness: 0.72 },

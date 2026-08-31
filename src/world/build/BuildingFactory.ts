@@ -87,6 +87,16 @@ const WINDOW_BUDGET = 130;
 /** Nothing this file emits may oversail the parcel by more than this. */
 const MAX_OVERSAIL = 0.82;
 
+/**
+ * How deep the room behind a shopfront pane is, in metres.
+ *
+ * Deep enough to hold a counter and read as a room at a glance, shallow enough
+ * that it is still inside the wall and threshold zone of every archetype here
+ * and can never meet an enterable building's real interior. See
+ * `shopInterior`.
+ */
+const SHOP_DEPTH = 0.85;
+
 /** Nothing this file emits may stand more than this above the roof line. */
 const MAX_ABOVE_ROOF = 2.75;
 
@@ -738,6 +748,111 @@ function emitWindow(b: Building, side: Side, role: SideRole, hole: Opening): voi
   }
 }
 
+/**
+ * A shallow room behind a shopfront pane.
+ *
+ * THIS IS WHAT STOPS THE CITY BEING A ROW OF BLACK HOLES. A ground floor of
+ * flat dark quads is the single most recognisable "untextured demo" tell there
+ * is - it is item 12 on the ranked list in `docs/art-direction.md`, "removes
+ * dead black windows" - and no amount of frame, mullion or awning detail fixes
+ * it, because the eye goes to the biggest surface and the biggest surface is
+ * the glass.
+ *
+ * A DIORAMA, NOT AN INTERIOR. The box is `SHOP_DEPTH` deep and closed on every
+ * side, so it can never be seen into from anywhere but the front and can never
+ * meet a real interior: enterable buildings put their rooms well beyond the
+ * wall thickness, and 0.85 m is inside the threshold zone of every archetype in
+ * this file. Its cost is nine quads on a mesh that is already being written,
+ * which is triangles rather than draw calls.
+ *
+ * The contents are deterministic in the bay's own coordinates, so the same
+ * shopfront is the same shop on every build, and no two bays in a terrace hold
+ * their shelves at the same height.
+ */
+function shopInterior(
+  b: Building,
+  side: Side,
+  a0: number,
+  a1: number,
+  y0: number,
+  y1: number,
+  front: number,
+): void {
+  const width = a1 - a0;
+  const height = y1 - y0;
+  if (width < 0.5 || height < 0.5) return;
+  const back = front - SHOP_DEPTH;
+  const roll = hash2(a0, y0, 83);
+  const roll2 = hash2(a1, y1, 137);
+
+  // The room: back wall, floor, ceiling and two returns. Closed on purpose -
+  // an open box shows the inside of the building's own shell through the glass
+  // at any angle off the perpendicular.
+  sideQuad(b.w, 'shopWall', side, a0, a1, y0, y1, back);
+  sideBox(b.w, 'shopWall', side, a0, a1, y0 - 0.03, y0, back, front);
+  sideBox(b.w, 'shopWall', side, a0, a1, y1, y1 + 0.03, back, front);
+  sideBox(b.w, 'shopWall', side, a0 - 0.03, a0, y0, y1, back, front);
+  sideBox(b.w, 'shopWall', side, a1, a1 + 0.03, y0, y1, back, front);
+
+  // A counter across the front third, or a display plinth: the silhouette that
+  // says "shop" from the pavement rather than "lit room".
+  const counterTop = y0 + height * (0.32 + roll * 0.12);
+  sideBox(
+    b.w,
+    'shopFitting',
+    side,
+    a0 + 0.06,
+    a1 - 0.06,
+    y0,
+    counterTop,
+    back + SHOP_DEPTH * 0.5,
+    front - 0.06,
+  );
+
+  /*
+   * A strip light against the ceiling.
+   *
+   * The one thing that makes the box read as a LIT room rather than a painted
+   * recess. Nothing else in the scene can light it: no light in this game
+   * reaches through a 1 m opening in a facade, and the emissive on `shopWall`
+   * is a floor rather than a source. Recessed 8 cm so the strip itself is only
+   * seen from the pavement, not from an angle that would show it as a bar.
+   */
+  sideBox(
+    b.w,
+    'signEmissiveWarm',
+    side,
+    a0 + 0.12,
+    a1 - 0.12,
+    y1 - 0.07,
+    y1 - 0.03,
+    back + 0.08,
+    front - 0.25,
+  );
+
+  // Shelving on the back wall, and stock on it. Two bands, because one reads
+  // as a ledge and three read as a warehouse.
+  for (let i = 0; i < 2; i += 1) {
+    const shelfY = y0 + height * (0.55 + i * 0.24) + roll2 * 0.06;
+    if (shelfY + 0.12 > y1) break;
+    sideBox(b.w, 'shopFitting', side, a0 + 0.08, a1 - 0.08, shelfY, shelfY + 0.04, back, back + 0.26);
+    // Stock, in three blocks of different widths so a shelf is not a bar.
+    const span = width - 0.24;
+    let at = a0 + 0.12;
+    for (let j = 0; j < 3; j += 1) {
+      const w = span * (0.14 + hash2(at, shelfY, 191 + j) * 0.16);
+      if (at + w > a1 - 0.12) break;
+      const h = 0.1 + hash2(at, shelfY, 211 + j) * 0.14;
+      // Two tones, alternating on a hash: a shelf of one colour reads as a
+      // painted block, and a second material key would cost a draw call on
+      // every building in the city for something seen through tinted glass.
+      const stock = hash2(at, shelfY, 251 + j) < 0.45 ? 'shopFitting' : 'shopGoods';
+      sideBox(b.w, stock, side, at, at + w, shelfY + 0.04, shelfY + 0.04 + h, back + 0.03, back + 0.21);
+      at += w + span * (0.06 + hash2(at, shelfY, 233 + j) * 0.1);
+    }
+  }
+}
+
 /** Shop glazing, its stall riser and the fascia band that carries the sign. */
 function emitShopfront(b: Building, side: Side, hole: Opening, floorY: number, top: number): void {
   revealFor(b.w, b.palette.wall, side, hole, 0, 0.16);
@@ -755,6 +870,7 @@ function emitShopfront(b: Building, side: Side, hole: Opening, floorY: number, t
   if (hole.half > 1.1) {
     sideQuad(b.w, 'windowFrame', side, hole.along - 0.045, hole.along + 0.045, hole.y0 + bar, hole.y1 - bar, back);
   }
+  shopInterior(b, side, a0 + bar, a1 - bar, hole.y0 + bar, hole.y1 - bar, back - 0.05);
   sideQuad(b.w, 'glassShop', side, a0 + bar, a1 - bar, hole.y0 + bar, hole.y1 - bar, back - 0.03);
 
   // Stall riser under the glazing.
@@ -914,13 +1030,64 @@ function emitPartyWall(b: Building, side: Side): void {
   punchedPanel(b.w, b.palette.wall, side, side.start, cut, b.groundY, b.roofY, 0, bay);
   for (const hole of bay) {
     revealFor(b.w, b.palette.wall, side, hole, 0, 0.1);
-    sideQuad(b.w, b.palette.trim, side, hole.along - hole.half, hole.along + hole.half, hole.y0, hole.y1, -0.1);
+    ghostSign(b, side, hole);
   }
 
   if (stepped) {
     sideQuad(b.w, b.palette.wall, side, cut, side.end, b.groundY, b.roofY, step);
     sideBox(b.w, b.palette.wall, side, cut - 0.01, cut + 0.01, b.groundY, b.roofY, 0, step, SF.START | SF.END);
   }
+}
+
+/**
+ * The faded painted advertisement on a party wall's blind bay.
+ *
+ * WHY THIS IS NOT ONE QUAD. It used to be: the recessed panel was filled
+ * edge to edge in the building's trim colour, which on a four-storey flank is
+ * a two-by-six-metre rectangle of flat grey in the middle of a coloured
+ * facade. At street level it does not read as a ghost sign, it reads as a
+ * texture that failed to load - and it is the single largest untextured
+ * surface anywhere in the city.
+ *
+ * A border and two bands in colours the building already carries is enough to
+ * read as PAINT: real ghost signs are a framed field with lettering in bands,
+ * and at the distance a flank is seen from, the bands are the lettering. No
+ * text of any kind is drawn, here or anywhere else in the city - see the art
+ * brief - so nothing has to be invented, translated or licensed.
+ *
+ * Costs six quads and no new material key, so it is free in draw calls.
+ */
+function ghostSign(b: Building, side: Side, hole: Opening): void {
+  const a0 = hole.along - hole.half;
+  const a1 = hole.along + hole.half;
+  const height = hole.y1 - hole.y0;
+  const border = Math.min(0.18, hole.half * 0.22);
+  const out = -0.1;
+
+  // The painted field, then a border inset from it.
+  sideQuad(b.w, b.palette.shutter, side, a0, a1, hole.y0, hole.y1, out);
+  sideQuad(b.w, b.palette.trim, side, a0, a1, hole.y1 - border, hole.y1, out - 0.01);
+  sideQuad(b.w, b.palette.trim, side, a0, a1, hole.y0, hole.y0 + border, out - 0.01);
+  sideQuad(b.w, b.palette.trim, side, a0, a0 + border, hole.y0, hole.y1, out - 0.01);
+  sideQuad(b.w, b.palette.trim, side, a1 - border, a1, hole.y0, hole.y1, out - 0.01);
+
+  // Two bands where the lettering would be, at the proportions a painted sign
+  // actually uses: a tall line high in the field and a shorter one under it.
+  const inset = border + Math.min(0.22, hole.half * 0.16);
+  const roll = hash2(a0, hole.y1, 97);
+  const topY = hole.y0 + height * (0.58 + roll * 0.06);
+  const lowY = hole.y0 + height * (0.3 + roll * 0.05);
+  sideQuad(b.w, b.palette.trim, side, a0 + inset, a1 - inset, topY, topY + height * 0.16, out - 0.02);
+  sideQuad(
+    b.w,
+    b.palette.trim,
+    side,
+    a0 + inset,
+    a1 - inset - hole.half * 0.5,
+    lowY,
+    lowY + height * 0.1,
+    out - 0.02,
+  );
 }
 
 /**

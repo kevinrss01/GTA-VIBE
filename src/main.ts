@@ -1232,6 +1232,7 @@ async function boot(): Promise<void> {
     furnishings.update(state.x, state.z);
 
     sky.follow(state.x, state.y, state.z);
+    sky.setTime(elapsed);
     lighting.update(state.x, state.y + 1.6, state.z);
     interactions.update(state.x, state.y, state.z, state.yaw);
     minimap.update(state.x, state.z, state.yaw);
