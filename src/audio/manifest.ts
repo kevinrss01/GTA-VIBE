@@ -208,6 +208,55 @@ export type DialogueAssetId =
   | 'dlg/sable-landed-1';
 
 /**
+ * The voices of the street: what the police shout, and what the crowd is in the
+ * middle of saying.
+ *
+ * SEPARATE FROM `DialogueAssetId` on purpose. Dialogue is a scripted beat with
+ * a subtitle, played once, at a moment the mission chose. These are BARKS: they
+ * have no script position, no subtitle, they are picked at random from a pool,
+ * they are spatialised on the person who says them, and half of them are meant
+ * to be half-heard as the player walks past. Mixing the two would put a
+ * pedestrian complaining about the rent on the same code path as Sable's
+ * briefing.
+ *
+ * Written for this game, about invented people, in stock library voices; none
+ * is an impersonation and none carries a real brand or place name.
+ */
+export type CrowdVoiceAssetId =
+  | 'vox/pol-stop-1'
+  | 'vox/pol-stop-2'
+  | 'vox/pol-stop-3'
+  | 'vox/pol-halt-1'
+  | 'vox/pol-halt-2'
+  | 'vox/pol-halt-3'
+  | 'vox/pol-pullover-1'
+  | 'vox/pol-pullover-2'
+  | 'vox/pol-radio-1'
+  | 'vox/pol-radio-2'
+  | 'vox/pol-radio-3'
+  | 'vox/pol-lost-1'
+  | 'vox/pol-lost-2'
+  | 'vox/chat-a-1'
+  | 'vox/chat-a-2'
+  | 'vox/chat-b-1'
+  | 'vox/chat-b-2'
+  | 'vox/chat-c-1'
+  | 'vox/chat-c-2'
+  | 'vox/chat-d-1'
+  | 'vox/chat-d-2'
+  | 'vox/chat-e-1'
+  | 'vox/chat-e-2'
+  | 'vox/chat-f-1'
+  | 'vox/chat-f-2'
+  | 'vox/chat-g-1'
+  | 'vox/chat-g-2'
+  | 'vox/react-shove-1'
+  | 'vox/react-shove-2'
+  | 'vox/react-gun-1'
+  | 'vox/react-gun-2'
+  | 'vox/react-gun-3';
+
+/**
  * The distant traffic layer. Deliberately not an `AmbienceBedId`: like the sea,
  * it sums on top of whichever land bed is playing at a level taken from the
  * world (here, how much traffic is actually moving nearby) rather than
@@ -250,6 +299,7 @@ export type AudioAssetId =
   | ImpactAssetId
   | BodyAssetId
   | DialogueAssetId
+  | CrowdVoiceAssetId
   | StreetLayerId;
 
 /** Provenance for a generated asset. Never contains a key or a signed URL. */
@@ -1715,6 +1765,124 @@ export const DIALOGUE_LINES: Readonly<Record<DialogueAssetId, { speaker: string;
     DIALOGUE_SPECS.map((spec) => [spec.id, { speaker: spec.speaker, text: spec.text, duration: spec.duration }]),
   ) as Readonly<Record<DialogueAssetId, { speaker: string; text: string; duration: number }>>;
 
+// ---------------------------------------------------------------------------
+// Crowd and police voices
+// ---------------------------------------------------------------------------
+
+const CROWD_VOICE_GENERATED_ON = '2026-08-31';
+
+/**
+ * Ten library voices, chosen from the account's own 658 rather than assumed.
+ *
+ * Three for the police and seven for everybody else, and that asymmetry is the
+ * point: a pursuit that arrives in eight different voices reads as a crowd
+ * rather than as the police, while a CITY whose every pedestrian sounds the
+ * same reads as one person following you around. `Lily` and `Callum` are
+ * deliberately absent - they are Sable and Teo, and the street must not sound
+ * like the mission cast.
+ */
+const CROWD_VOICES = {
+  officerM: { id: 'pNInz6obpgDQGcFmaJgB', name: 'Adam - Dominant, Firm' },
+  officerF: { id: 'XrExE9yKIg1WjnnlVkGX', name: 'Matilda - Knowledgable, Professional' },
+  dispatch: { id: 'onwK4e9ZLuTAKqWW03F9', name: 'Daniel - Steady Broadcaster' },
+  civicA: { id: 'CwhRBWXzGAHq8TQ4Fs17', name: 'Roger - Laid-Back, Casual, Resonant' },
+  civicB: { id: 'cgSgspJ2msm6clMCkdW9', name: 'Jessica - Playful, Bright, Warm' },
+  civicC: { id: 'iP95p4xoKVk53GoZ742B', name: 'Chris - Charming, Down-to-Earth' },
+  civicD: { id: 'FGY2WhTYpPnrIDTdsKH5', name: 'Laura - Enthusiast, Quirky Attitude' },
+  civicE: { id: 'bIHbv24MWmeRgasZH58o', name: 'Will - Relaxed Optimist' },
+  civicF: { id: 'pqHfZKP75CvOlQylNhV4', name: 'Bill - Wise, Mature, Balanced' },
+  civicG: { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Sarah - Mature, Reassuring, Confident' },
+} as const;
+
+export type CrowdSpeaker = keyof typeof CROWD_VOICES;
+
+interface CrowdVoiceSpec {
+  readonly id: CrowdVoiceAssetId;
+  readonly file: string;
+  readonly speaker: CrowdSpeaker;
+  readonly duration: number;
+  readonly bytes: number;
+  readonly trimDb: number;
+  readonly text: string;
+}
+
+/**
+ * Measured on the shipped files with `ffprobe` and `ffmpeg -af volumedetect`,
+ * exactly like every other generated asset here. `trimDb` peak-normalises each
+ * line towards -6 dBFS, which is where the rest of the one-shots sit, so a
+ * shout lands at the level a gunshot does rather than at whatever level the
+ * model happened to render.
+ */
+const CROWD_VOICE_SPECS: readonly CrowdVoiceSpec[] = [
+  { id: 'vox/pol-stop-1', file: 'pol-stop-1.mp3', speaker: 'officerM', duration: 2.09, bytes: 34316, trimDb: -4.5, text: 'Meridian Bay Police! Stop right there!' },
+  { id: 'vox/pol-stop-2', file: 'pol-stop-2.mp3', speaker: 'officerF', duration: 1.579, bytes: 26375, trimDb: -1.8, text: 'Police! Stop moving!' },
+  { id: 'vox/pol-stop-3', file: 'pol-stop-3.mp3', speaker: 'officerM', duration: 2.229, bytes: 36824, trimDb: -4.9, text: 'Stop! Hands where I can see them!' },
+  { id: 'vox/pol-halt-1', file: 'pol-halt-1.mp3', speaker: 'officerF', duration: 2.415, bytes: 39750, trimDb: -4.5, text: "That's far enough. Down on the ground." },
+  { id: 'vox/pol-halt-2', file: 'pol-halt-2.mp3', speaker: 'officerM', duration: 2.183, bytes: 35988, trimDb: -4.5, text: 'Last warning. On the ground, now!' },
+  { id: 'vox/pol-halt-3', file: 'pol-halt-3.mp3', speaker: 'officerF', duration: 2.554, bytes: 41839, trimDb: -2.7, text: "Don't make this worse. Stay where you are." },
+  { id: 'vox/pol-pullover-1', file: 'pol-pullover-1.mp3', speaker: 'officerM', duration: 1.858, bytes: 30973, trimDb: -4.6, text: 'Pull the vehicle over. Now.' },
+  { id: 'vox/pol-pullover-2', file: 'pol-pullover-2.mp3', speaker: 'officerF', duration: 1.997, bytes: 33062, trimDb: -1.5, text: 'Stop the car and step out of it.' },
+  { id: 'vox/pol-radio-1', file: 'pol-radio-1.mp3', speaker: 'dispatch', duration: 2.833, bytes: 46437, trimDb: 2.4, text: 'All units, suspect on foot, Harbourside.' },
+  { id: 'vox/pol-radio-2', file: 'pol-radio-2.mp3', speaker: 'dispatch', duration: 2.694, bytes: 44347, trimDb: -1.7, text: 'Converge on Dock Street. Move in.' },
+  { id: 'vox/pol-radio-3', file: 'pol-radio-3.mp3', speaker: 'dispatch', duration: 2.647, bytes: 43511, trimDb: 1.9, text: 'Be advised, the suspect is armed.' },
+  { id: 'vox/pol-lost-1', file: 'pol-lost-1.mp3', speaker: 'officerM', duration: 2.833, bytes: 46437, trimDb: -4.3, text: "We've lost visual. Sweep the block." },
+  { id: 'vox/pol-lost-2', file: 'pol-lost-2.mp3', speaker: 'officerF', duration: 2.415, bytes: 39750, trimDb: -3.6, text: 'Anyone got eyes on him? Check the alley.' },
+  { id: 'vox/chat-a-1', file: 'chat-a-1.mp3', speaker: 'civicA', duration: 3.483, bytes: 56886, trimDb: 0.6, text: "Have you seen what they're charging for a coffee down on Harbour Walk?" },
+  { id: 'vox/chat-a-2', file: 'chat-a-2.mp3', speaker: 'civicA', duration: 2.554, bytes: 41839, trimDb: 2.2, text: "It's the boats. It's always the boats with him." },
+  { id: 'vox/chat-b-1', file: 'chat-b-1.mp3', speaker: 'civicB', duration: 3.204, bytes: 52288, trimDb: -3.1, text: 'So then she says the rent is going up. Again.' },
+  { id: 'vox/chat-b-2', file: 'chat-b-2.mp3', speaker: 'civicB', duration: 3.019, bytes: 49363, trimDb: -3.1, text: "Tell him I'm not covering another night shift. I mean it." },
+  { id: 'vox/chat-c-1', file: 'chat-c-1.mp3', speaker: 'civicC', duration: 2.926, bytes: 47691, trimDb: -2.4, text: "I heard they're finally fixing the lights on Cannery Row." },
+  { id: 'vox/chat-c-2', file: 'chat-c-2.mp3', speaker: 'civicC', duration: 2.368, bytes: 38914, trimDb: -2.1, text: 'No, no, listen. You have to try the fish place.' },
+  { id: 'vox/chat-d-1', file: 'chat-d-1.mp3', speaker: 'civicD', duration: 2.183, bytes: 35988, trimDb: -2.8, text: 'My brother swears he saw the whole thing.' },
+  { id: 'vox/chat-d-2', file: 'chat-d-2.mp3', speaker: 'civicD', duration: 2.694, bytes: 44347, trimDb: -3.1, text: "That's what I said. That is exactly what I said." },
+  { id: 'vox/chat-e-1', file: 'chat-e-1.mp3', speaker: 'civicE', duration: 2.229, bytes: 36824, trimDb: -3.4, text: "Half the town's out at the airfield today." },
+  { id: 'vox/chat-e-2', file: 'chat-e-2.mp3', speaker: 'civicE', duration: 2.415, bytes: 39750, trimDb: -2.4, text: "Right, I'd better get back. See you Thursday." },
+  { id: 'vox/chat-f-1', file: 'chat-f-1.mp3', speaker: 'civicF', duration: 3.065, bytes: 50199, trimDb: 1.3, text: "Weather's turning. You can smell it off the water." },
+  { id: 'vox/chat-f-2', file: 'chat-f-2.mp3', speaker: 'civicF', duration: 3.065, bytes: 50199, trimDb: 0.2, text: 'Forty years I have walked this street. Forty.' },
+  { id: 'vox/chat-g-1', file: 'chat-g-1.mp3', speaker: 'civicG', duration: 2.415, bytes: 39750, trimDb: -2.3, text: 'You are joking. Tell me you are joking.' },
+  { id: 'vox/chat-g-2', file: 'chat-g-2.mp3', speaker: 'civicG', duration: 3.158, bytes: 51453, trimDb: -4.9, text: "Anyway, that's what I heard. Make of it what you will." },
+  { id: 'vox/react-shove-1', file: 'react-shove-1.mp3', speaker: 'civicA', duration: 1.858, bytes: 30973, trimDb: -2.4, text: 'Hey! Watch where you are going!' },
+  { id: 'vox/react-shove-2', file: 'react-shove-2.mp3', speaker: 'civicD', duration: 1.207, bytes: 20524, trimDb: -0.9, text: 'What is wrong with you?' },
+  { id: 'vox/react-gun-1', file: 'react-gun-1.mp3', speaker: 'civicB', duration: 1.579, bytes: 26375, trimDb: -1.2, text: 'Gun! He has got a gun!' },
+  { id: 'vox/react-gun-2', file: 'react-gun-2.mp3', speaker: 'civicC', duration: 1.3, bytes: 21777, trimDb: -2.9, text: 'Somebody call the police!' },
+  { id: 'vox/react-gun-3', file: 'react-gun-3.mp3', speaker: 'civicG', duration: 1.858, bytes: 30973, trimDb: -4.8, text: 'Get down! Everybody get down!' },
+];
+
+const CROWD_VOICE: readonly AudioAsset[] = CROWD_VOICE_SPECS.map((spec) => ({
+  id: spec.id,
+  path: `/audio/voice/${spec.file}`,
+  kind: 'dialogue' as const,
+  duration: spec.duration,
+  loop: false,
+  sampleRate: 44100,
+  channels: 1,
+  bytes: spec.bytes,
+  trimDb: spec.trimDb,
+  generation: {
+    provider: 'elevenlabs' as const,
+    modelId: DIALOGUE_MODEL,
+    prompt: spec.text,
+    date: CROWD_VOICE_GENERATED_ON,
+    // Text-to-speech is charged per character of the line, not per second.
+    credits: spec.text.length,
+    parameters: {
+      voice_id: CROWD_VOICES[spec.speaker].id,
+      voice_name: CROWD_VOICES[spec.speaker].name,
+      output_format: 'mp3_44100_128',
+    },
+  },
+}));
+
+/** Every crowd or police line, with its words and who says them. */
+export const CROWD_VOICE_LINES: Readonly<
+  Record<CrowdVoiceAssetId, { speaker: CrowdSpeaker; text: string; duration: number }>
+> = Object.fromEntries(
+  CROWD_VOICE_SPECS.map((spec) => [
+    spec.id,
+    { speaker: spec.speaker, text: spec.text, duration: spec.duration },
+  ]),
+) as Readonly<Record<CrowdVoiceAssetId, { speaker: CrowdSpeaker; text: string; duration: number }>>;
+
 export const MUSIC_ASSET_ID: MusicAssetId = 'music/meridian-theme';
 
 const MUSIC: AudioAsset = {
@@ -1783,6 +1951,7 @@ export const AUDIO_ASSETS: readonly AudioAsset[] = [
   ...AIRCRAFT,
   ...COMBAT,
   ...DIALOGUE,
+  ...CROWD_VOICE,
   STREET_LAYER,
   MUSIC,
   VOICE,
@@ -1840,6 +2009,14 @@ export const LAZY_ASSET_IDS: ReadonlySet<AudioAssetId> = new Set<AudioAssetId>([
   'veh/engine-truck-load',
   'veh/engine-v8-idle',
   'veh/engine-v8-load',
+  /*
+   * The crowd and police voices. Thirty-two lines and about 1.3 MB, requested
+   * in one go by `CrowdVoice.preload()` on the start gesture rather than paid
+   * for during the boot: nobody hears a police challenge in the first second
+   * of a session, and the chatter's own cooldown means the first conversation
+   * the player walks past is several seconds away in the best case.
+   */
+  ...AUDIO_ASSETS.filter((asset) => asset.id.startsWith('vox/')).map((asset) => asset.id),
   'veh/tyre-roll',
 ]);
 

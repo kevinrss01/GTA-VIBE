@@ -93,6 +93,9 @@ import {
   MAX_OFFICERS,
   MAX_UNITS,
   OFFICER_FIRE_RANGE,
+  OFFICER_VOICE_COOLDOWN,
+  OFFICER_VOICE_RANGE,
+  RADIO_COOLDOWN,
   OFFICER_RUN_SPEED,
   OFFICER_SHOT_DAMAGE,
   OFFICER_SHOT_INTERVAL,
@@ -218,6 +221,8 @@ interface Officer extends OfficerPose {
   detourSide: 1 | -1;
   /** Seconds the arrest conditions have held continuously. */
   held: number;
+  /** Seconds until this officer may shout at the player again. */
+  voiceTimer: number;
   seesPlayer: boolean;
   /** Where a thrown body is still sliding to. Zero for anybody on their feet. */
   vx: number;
@@ -319,6 +324,31 @@ export interface PoliceStats {
   readonly dispatchIn: number;
 }
 
+/**
+ * Something an officer says out loud, at a place in the world.
+ *
+ * WHY THE POLICE EMIT THIS AND THE AUDIO LAYER DOES NOT DERIVE IT. Whether a
+ * line should be said is a question about pursuit state - has this officer just
+ * closed on the player, has the pursuit only now started, has it just been
+ * lost - and all of that lives here. The audio layer's business is which
+ * recording, at what level, through which panner. Publishing EVENTS rather than
+ * state also means the "did the police shout at me" question has one answer per
+ * frame instead of a level the mixer has to edge-detect for itself.
+ *
+ * The list is rebuilt and drained every frame; nothing retains it.
+ */
+export interface PoliceVoiceCue {
+  /**
+   * `challenge` an officer on foot ordering the player to stop; `pullover` the
+   * same order to somebody in a car; `radio` unit-to-unit traffic as a pursuit
+   * opens; `lost` an officer who can no longer see the player.
+   */
+  readonly kind: 'challenge' | 'pullover' | 'radio' | 'lost';
+  readonly x: number;
+  readonly y: number;
+  readonly z: number;
+}
+
 export class PoliceSystem implements LawTargets {
   /** Add this to the scene. Officers and beacons; nothing else. */
   readonly group: Object3D;
@@ -348,6 +378,12 @@ export class PoliceSystem implements LawTargets {
    * the moment the stars reach zero, so the next offence is a new alarm.
    */
   private alarmAt = -1;
+  /** Rebuilt every frame; see `PoliceVoiceCue`. Never retained by a caller. */
+  private readonly cues: PoliceVoiceCue[] = [];
+  /** Edge detector for the pursuit itself, so `radio` and `lost` fire once. */
+  private wasPursued = false;
+  /** Seconds until any unit may key the radio again. */
+  private radioTimer = 0;
   /** The shared world clock, latched each update so damage can read it. */
   private now = 0;
   private nextUnitId = 1;
@@ -578,6 +614,9 @@ export class PoliceSystem implements LawTargets {
     this.now = ctx.time;
     const player = this.options.player;
     const stars = player.wanted;
+    // Drained by whoever read it last frame; see `PoliceVoiceCue`.
+    this.cues.length = 0;
+    this.radioTimer = Math.max(0, this.radioTimer - dt);
 
     // One search for the whole response, and only when the player has moved
     // far enough to change any unit's answer.
@@ -595,6 +634,7 @@ export class PoliceSystem implements LawTargets {
     for (const officer of this.officers) if (officer.seesPlayer) pursued = true;
     this.pursuedNow = pursued && stars > 0;
     player.coolOff(dt, this.pursuedNow);
+    this.updateVoice(dt, ctx);
 
     this.writeVisuals(ctx.time);
   }
@@ -707,6 +747,7 @@ export class PoliceSystem implements LawTargets {
         detour: 0,
         detourSide: i % 2 === 0 ? 1 : -1,
         held: 0,
+        voiceTimer: 0,
         seesPlayer: false,
         vx: 0,
         vz: 0,
@@ -1368,6 +1409,82 @@ export class PoliceSystem implements LawTargets {
    * on a live pursuit has both on; one that has been stood down or wrecked has
    * neither, and is voiced as an ordinary engine.
    */
+  /**
+   * What the police are saying this frame. See `PoliceVoiceCue`.
+   *
+   * Read once per frame by the audio layer and never retained: the array is
+   * the same one every time and is cleared at the top of `update`.
+   */
+  get voiceCues(): readonly PoliceVoiceCue[] {
+    return this.cues;
+  }
+
+  /**
+   * Turns pursuit state into things somebody says.
+   *
+   * Three rules, and the timers are what keep a chase from turning into a
+   * chant. An officer challenges the player when they get close enough to be
+   * heard and can actually see them, then holds their tongue for
+   * `OFFICER_VOICE_COOLDOWN`; the radio opens once when a pursuit starts and
+   * once more if the player breaks line of sight; and everything stops the
+   * moment the stars do.
+   */
+  private updateVoice(dt: number, ctx: PoliceContext): void {
+    const stars = this.options.player.wanted;
+    if (stars <= 0) {
+      this.wasPursued = false;
+      return;
+    }
+
+    if (this.pursuedNow && !this.wasPursued && this.radioTimer <= 0) {
+      const unit = this.nearestUnit(ctx);
+      if (unit) {
+        this.radioTimer = RADIO_COOLDOWN;
+        this.cues.push({ kind: 'radio', x: unit.x, y: unit.handle.view.y + 1, z: unit.z });
+      }
+    } else if (!this.pursuedNow && this.wasPursued && this.radioTimer <= 0) {
+      const unit = this.nearestUnit(ctx);
+      if (unit) {
+        this.radioTimer = RADIO_COOLDOWN;
+        this.cues.push({ kind: 'lost', x: unit.x, y: unit.handle.view.y + 1, z: unit.z });
+      }
+    }
+    this.wasPursued = this.pursuedNow;
+
+    for (const officer of this.officers) {
+      officer.voiceTimer = Math.max(0, officer.voiceTimer - dt);
+      if (officer.state !== 'chasing' || officer.down || !officer.seesPlayer) continue;
+      if (officer.voiceTimer > 0) continue;
+      const distance = Math.hypot(ctx.playerX - officer.x, ctx.playerZ - officer.z);
+      if (distance > OFFICER_VOICE_RANGE) continue;
+      officer.voiceTimer = OFFICER_VOICE_COOLDOWN;
+      this.cues.push({
+        kind: ctx.driving ? 'pullover' : 'challenge',
+        x: officer.x,
+        // Mouth height, not foot height: the line is spatialised on the person.
+        y: officer.y + 1.6,
+        z: officer.z,
+      });
+    }
+  }
+
+  /** The closest unit still in the pursuit, for a line that belongs to a car. */
+  private nearestUnit(ctx: PoliceContext): Unit | null {
+    let best: Unit | null = null;
+    let bestSq = Infinity;
+    for (const unit of this.units) {
+      if (unit.state === 'wrecked' || unit.state === 'standdown') continue;
+      const dx = unit.x - ctx.playerX;
+      const dz = unit.z - ctx.playerZ;
+      const d = dx * dx + dz * dz;
+      if (d < bestSq) {
+        bestSq = d;
+        best = unit;
+      }
+    }
+    return best;
+  }
+
   get pursuitAudio(): readonly PursuitAudioUnit[] {
     this.audioUnits.length = 0;
     for (const unit of this.units) {

@@ -20,6 +20,7 @@ import { describe, expect, it } from 'vitest';
 import {
   ENGINE_PROFILES,
   ambientCutoff,
+  ambientEngine,
   ambientLevel,
   ambientRate,
   engineProfileFor,
@@ -304,9 +305,21 @@ describe('engine state to engine note', () => {
   it('keeps a queueing ambient car audible and a moving one louder', () => {
     for (const voice of Object.keys(ENGINE_PROFILES) as EngineVoice[]) {
       const profile = ENGINE_PROFILES[voice];
-      expect(ambientLevel(0, profile)).toBeGreaterThan(0.1);
+      // The tyre layer is silent at a standstill and climbs with road speed.
+      expect(ambientLevel(0, profile)).toBe(0);
       expect(ambientLevel(14, profile)).toBeGreaterThan(ambientLevel(2, profile));
       expect(ambientRate(14, profile)).toBeGreaterThan(ambientRate(2, profile));
+      // The engine layer is what a car queueing at a red light is heard as,
+      // and it is louder still once the light goes green.
+      expect(ambientEngine(0, profile).level).toBeGreaterThan(0.1);
+      expect(ambientEngine(14, profile).level).toBeGreaterThan(
+        ambientEngine(0, profile).level,
+      );
+      expect(ambientEngine(14, profile).rate).toBeGreaterThan(
+        ambientEngine(0, profile).rate,
+      );
+      // And it brightens as the revs climb, so pulling away is not just louder.
+      expect(ambientCutoff(profile, 14)).toBeGreaterThan(ambientCutoff(profile, 0));
     }
   });
 });

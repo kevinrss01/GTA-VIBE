@@ -152,21 +152,28 @@ export const STATIC_SCALE = 3.2;
 /**
  * Ceiling on the offscreen static layer, in pixels.
  *
- * 3 megapixels is 12 MB of RGBA, which is a sane raster to hold for the whole
- * session. It matters because the map covers the plan, and the plan grew from
- * 427 by 362 m to 694 by 1,191 m when Meridian Bay Regional was added: at a
- * flat 3.2 px/m that is 2,221 by 3,811 px, 8.5 megapixels, 34 MB - allocated
+ * It matters because the map covers the plan, and the plan grew from 427 by
+ * 362 m to 694 by 1,191 m when Meridian Bay Regional was added: at a flat
+ * 3.2 px/m that is 2,221 by 3,811 px, 8.5 megapixels, 34 MB - allocated
  * eagerly in the constructor, on a device that may not have it.
+ *
+ * RAISED FROM 3 MP (1.94 px/m, 12 MB) when the expanded map was allowed to
+ * fill the viewport. The old ceiling was chosen against an expanded map that
+ * was at most 780 CSS px tall; a full-height map on a 1440p Retina display
+ * asks for about 2.05 device px/m, which 1.94 could only meet by upscaling a
+ * raster the player is now looking at closely. 4.5 MP is 2.33 px/m and 18 MB,
+ * which covers every viewport the sizing below can produce without upscaling
+ * and is still a fraction of what the city's textures already hold.
  */
-const STATIC_PIXEL_BUDGET = 3_000_000;
+const STATIC_PIXEL_BUDGET = 4_500_000;
 
 /**
  * Pixels per metre for a given map, capped by the budget above.
  *
- * At the enlarged bounds this returns 1.94 px/m. That is still more than
- * either view asks for: the dial shows about 120 m across ~190 CSS px, which
- * is 1.6 px/m, and the expanded map fits 1,191 m into at most 780 px, which is
- * 0.65. The cap costs nothing visible and saves 22 MB.
+ * At the enlarged bounds this returns 2.33 px/m, which is above what either
+ * view asks for: the dial shows about 120 m across ~190 CSS px, which is
+ * 1.6 px/m, and the expanded map's worst case is the ~2.05 px/m above. The cap
+ * costs nothing visible and saves 16 MB against a flat 3.2.
  */
 export function staticScaleFor(bounds: MapBounds): number {
   const area = bounds.width * bounds.depth;
@@ -320,12 +327,81 @@ export interface MinimapOptions {
 
 const DEFAULT_SIZE = 190;
 const DEFAULT_METRES_PER_PIXEL = 1.3;
-/** Fraction of the smaller viewport axis the expanded map takes up. */
-const EXPANDED_FRACTION = 0.62;
-const EXPANDED_MAX = 780;
+/**
+ * How much of the viewport the expanded map is allowed to take.
+ *
+ * MERIDIAN BAY IS A TALL, NARROW CITY: 694 m across against 1,191 m from the
+ * north shore to the far end of the airfield, an aspect of 0.58. Anything that
+ * sizes the map from the SMALLER viewport axis therefore throws away most of a
+ * landscape screen - the previous rule (0.62 of the short axis, capped at
+ * 780 px) put a 454 by 779 px strip in the middle of a 1,996 by 1,256 window
+ * and the street labels were genuinely unreadable.
+ *
+ * So the map is sized from the axis that actually binds. Height leads, because
+ * that is the long side of the city and the short side of a monitor; width is
+ * a second constraint for the rare tall window. There is no absolute pixel cap
+ * any more - a bigger screen should get a bigger map - only the device-pixel
+ * budget below, which is about the canvas allocation rather than the layout.
+ */
+const EXPANDED_HEIGHT_FRACTION = 0.88;
+const EXPANDED_WIDTH_FRACTION = 0.92;
+/** Room left under the map for the caption, in CSS pixels. */
+const EXPANDED_CAPTION_SPACE = 46;
+/**
+ * Ceiling on the expanded canvas's backing store, in device pixels.
+ *
+ * The canvas is reallocated on resize and repainted whole whenever the layout
+ * changes, so an unbounded one on a 5K display would be a 30 MP allocation for
+ * a map nobody can resolve that finely. 5 MP covers a full-height map at
+ * device pixel ratio 2 on a 1440p screen with room to spare.
+ */
+const EXPANDED_PIXEL_BUDGET = 5_000_000;
+
+/**
+ * Zoom steps for the expanded map, where 1 fits the whole plan.
+ *
+ * WHY THE WHOLE PLAN IS NOT A USABLE DEFAULT. The bounds run from the north
+ * shore to the far end of Meridian Bay Regional - 1,191 m, of which the built
+ * city is the top third and the rest is runway, apron and grass. Fitted to a
+ * screen, downtown gets about 200 px of height for six districts and every
+ * street label lands on top of its neighbour. That is the "I cannot see
+ * anything" the map was reported with, and no amount of extra canvas fixes it,
+ * because the problem is the SCALE, not the size.
+ *
+ * So the map opens at a scale a street name survives, centred on the player,
+ * and zooming out to the whole plan is a step rather than the only view.
+ */
+const EXPANDED_ZOOMS: readonly number[] = [1, 1.8, 3.2, 5.5];
+/** 3.2: about 215 by 370 m on screen, which is a district and its neighbours. */
+const DEFAULT_ZOOM_INDEX = 2;
+/**
+ * How far the player may drift, as a fraction of the visible window, before
+ * the cached raster is repainted around them.
+ *
+ * The cache holds the streets, the buildings and every label, so repainting it
+ * is not free; the player is also usually standing still while reading a map.
+ * An eighth of a window keeps the view centred without repainting on a walk
+ * pace, and at zoom 1 the window covers the plan and this never fires at all.
+ */
+const RECENTRE_FRACTION = 0.125;
 const MAX_DPR = 2;
+
+/** The world rectangle the expanded map is showing. */
+interface MapWindow {
+  readonly minX: number;
+  readonly minZ: number;
+  readonly width: number;
+  readonly depth: number;
+}
 /** Published on <body> while the map is open so other layers can stand back. */
 const BODY_MAP_OPEN = 'mb-map-open';
+
+function clampRange(value: number, low: number, high: number): number {
+  // `high` can fall below `low` if the window is wider than the plan, which is
+  // what zoom 1 does on the short axis. Low wins: the plan is fully shown.
+  if (high <= low) return low;
+  return value < low ? low : value > high ? high : value;
+}
 
 function context2d(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
   const ctx = canvas.getContext('2d');
@@ -365,6 +441,19 @@ export class Minimap {
   private expandedHeight = 0;
   private isExpanded = false;
   private disposed = false;
+  /**
+   * Where the city is being painted TO, in the units of whatever canvas is
+   * being filled. The static raster and the expanded map share every drawing
+   * routine below and differ only in this transform, so it is state on the
+   * object rather than an argument threaded through fifteen call sites.
+   */
+  private paintOriginX = 0;
+  private paintOriginZ = 0;
+  private paintScale = 1;
+  /** Which of `EXPANDED_ZOOMS` the expanded map is showing. */
+  private zoomIndex = DEFAULT_ZOOM_INDEX;
+  /** The window the cached raster was painted for, or null if it is stale. */
+  private cachedWindow: MapWindow | null = null;
 
   private playerX = 0;
   private playerZ = 0;
@@ -420,7 +509,7 @@ export class Minimap {
     this.overlayCtx = context2d(this.overlayCanvas);
     const caption = document.createElement('p');
     caption.className = 'mb-map__caption';
-    caption.textContent = 'Meridian Bay — press M to close';
+    caption.textContent = 'Meridian Bay — scroll to zoom, M to close';
     sheet.append(this.overlayCanvas, caption);
     this.overlay.append(sheet);
 
@@ -437,9 +526,34 @@ export class Minimap {
     return this.isExpanded;
   }
 
+  /**
+   * Steps the expanded map's zoom. Positive zooms in, negative zooms out.
+   *
+   * Returns whether anything moved, so a caller can decide whether the step
+   * was worth a click of feedback. A no-op at either end of the ladder.
+   */
+  zoomBy(steps: number): boolean {
+    if (!this.isExpanded || this.disposed || steps === 0) return false;
+    const next = clampRange(this.zoomIndex + Math.sign(steps), 0, EXPANDED_ZOOMS.length - 1);
+    if (next === this.zoomIndex) return false;
+    this.zoomIndex = next;
+    this.cachedWindow = null;
+    this.dirty = true;
+    this.render();
+    return true;
+  }
+
+  /** Metres per screen pixel the expanded map is currently showing. */
+  get zoom(): number {
+    return EXPANDED_ZOOMS[this.zoomIndex] ?? 1;
+  }
+
   setExpanded(expanded: boolean): void {
     if (this.isExpanded === expanded || this.disposed) return;
     this.isExpanded = expanded;
+    // Repaint around wherever the player is now, not wherever they were when
+    // the map was last closed.
+    if (expanded) this.cachedWindow = null;
     this.element.classList.toggle('is-expanded', expanded);
     this.overlay.setAttribute('aria-hidden', expanded ? 'false' : 'true');
     // The HUD is a separate layer with no reference to this one, so the state
@@ -495,14 +609,28 @@ export class Minimap {
     // it would then have to be told to rebuild.
     const viewWidth = Math.max(320, window.innerWidth || 0);
     const viewHeight = Math.max(240, window.innerHeight || 0);
-    const limit = Math.min(viewWidth, viewHeight) * EXPANDED_FRACTION;
-    let cssHeight = Math.min(limit, EXPANDED_MAX);
+
+    // Height first: the city is taller than it is wide, so on any landscape
+    // window this is the constraint that binds. The caption sits below the
+    // canvas inside the same column, so its space comes off the top.
+    let cssHeight = Math.max(240, viewHeight * EXPANDED_HEIGHT_FRACTION - EXPANDED_CAPTION_SPACE);
     let cssWidth = cssHeight * aspect;
-    const maxWidth = Math.min(viewWidth * 0.9, EXPANDED_MAX);
+    const maxWidth = viewWidth * EXPANDED_WIDTH_FRACTION;
     if (cssWidth > maxWidth) {
       cssWidth = maxWidth;
       cssHeight = cssWidth / aspect;
     }
+
+    // Keep the allocation bounded without changing the layout: shrinking the
+    // backing store below the CSS size would blur the map, so the CSS size is
+    // scaled down with it and both stay in proportion.
+    const budgetScale = Math.min(
+      1,
+      Math.sqrt(EXPANDED_PIXEL_BUDGET / Math.max(1, cssWidth * cssHeight * this.dpr * this.dpr)),
+    );
+    cssWidth *= budgetScale;
+    cssHeight *= budgetScale;
+
     const width = Math.max(1, Math.round(cssWidth * this.dpr));
     const height = Math.max(1, Math.round(cssHeight * this.dpr));
     this.overlayCanvas.style.width = `${Math.round(cssWidth)}px`;
@@ -514,7 +642,9 @@ export class Minimap {
     if (this.expandedWidth !== width || this.expandedHeight !== height) {
       this.expandedWidth = width;
       this.expandedHeight = height;
-      if (this.isExpanded) this.buildExpandedCache();
+      // Repainted on the next render, which is the only place that knows
+      // which window the player is looking at.
+      this.cachedWindow = null;
     }
   }
 
@@ -592,23 +722,37 @@ export class Minimap {
     if (width === 0 || height === 0) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-    if (this.expandedCache.width !== width || this.expandedCache.height !== height) {
+    /*
+     * The pause tab always shows the WHOLE plan, whatever zoom the `M` overlay
+     * is on: it is an orientation view inside a menu, not a map the player is
+     * navigating with, and a zoomed pane with no way to zoom it would only
+     * raise the question of where the rest of the city went.
+     */
+    const whole: MapWindow = {
+      minX: this.bounds.minX,
+      minZ: this.bounds.minZ,
+      width: this.bounds.width,
+      depth: this.bounds.depth,
+    };
+    if (
+      this.expandedCache.width !== width ||
+      this.expandedCache.height !== height ||
+      !this.cacheCoversWindow(whole)
+    ) {
       // `buildExpandedCache` reads the overlay canvas's own size, so the two
       // are kept in step by sizing the overlay to match before rebuilding.
+      this.expandedWidth = width;
+      this.expandedHeight = height;
       this.overlayCanvas.width = width;
       this.overlayCanvas.height = height;
-      this.buildExpandedCache();
+      this.buildExpandedCache(whole);
     }
     ctx.clearRect(0, 0, width, height);
     ctx.drawImage(this.expandedCache, 0, 0);
-    const scale = width / this.bounds.width;
-    const point = worldToMap(this.playerX, this.playerZ, this.bounds, scale);
+    const project = this.expandedProjector(whole);
+    const point = project(this.playerX, this.playerZ);
     this.drawPlayer(ctx, point.x, point.y, this.dpr * 1.35, 30);
-    this.drawMarkers(
-      ctx,
-      (wx: number, wz: number) => worldToMap(wx, wz, this.bounds, scale),
-      this.dpr,
-    );
+    this.drawMarkers(ctx, project, this.dpr);
   }
 
   /** Width over depth of the whole-city map, for sizing a canvas to hold it. */
@@ -620,13 +764,20 @@ export class Minimap {
     const ctx = this.overlayCtx;
     const { width, height } = this.overlayCanvas;
     if (width === 0 || height === 0) return;
-    if (this.expandedCache.width !== width || this.expandedCache.height !== height) {
-      this.buildExpandedCache();
+    const window = this.expandedWindow();
+    if (
+      this.expandedCache.width !== width ||
+      this.expandedCache.height !== height ||
+      !this.cacheCoversWindow(window)
+    ) {
+      this.buildExpandedCache(window);
     }
     ctx.clearRect(0, 0, width, height);
     ctx.drawImage(this.expandedCache, 0, 0);
-    const scale = width / this.bounds.width;
-    const point = worldToMap(this.playerX, this.playerZ, this.bounds, scale);
+    // The cache may be up to RECENTRE_FRACTION out of date, so the marker is
+    // placed against the window it was actually painted for. Anything else and
+    // the arrow drifts off the street it is standing on.
+    const point = this.expandedProjector(this.cachedWindow ?? window)(this.playerX, this.playerZ);
     // A shade larger than on the dial: the marker has a whole city around it
     // here and would otherwise be lost among the streets.
     this.drawPlayer(ctx, point.x, point.y, this.dpr * 1.35, 30);
@@ -681,7 +832,7 @@ export class Minimap {
   // -- static raster --------------------------------------------------------
 
   private toStatic(x: number, z: number): MapPoint {
-    return worldToMap(x, z, this.bounds, this.staticScale);
+    return { x: (x - this.paintOriginX) * this.paintScale, y: (z - this.paintOriginZ) * this.paintScale };
   }
 
   private fillRect(ctx: CanvasRenderingContext2D, rect: Rect, colour: string): void {
@@ -691,20 +842,69 @@ export class Minimap {
     ctx.fillRect(a.x, a.y, b.x - a.x, b.y - a.y);
   }
 
-  /**
-   * Rasterises the whole city once. Order is water, corridors, carriageways,
-   * block interiors, buildings, then markers - each layer only ever sits inside
-   * the gap the previous one left, so nothing is overpainted by accident.
-   */
+  /** Whether a world rectangle can contribute anything to the current paint. */
+  private visible(rect: Rect, window: MapWindow): boolean {
+    return (
+      rect.maxX >= window.minX &&
+      rect.minX <= window.minX + window.width &&
+      rect.maxZ >= window.minZ &&
+      rect.minZ <= window.minZ + window.depth
+    );
+  }
+
+  /** Rasterises the whole plan once, for the dial to crop out of. */
   private buildStaticLayer(ctx: CanvasRenderingContext2D): void {
     const { width, height } = this.staticLayer;
+    this.setPaint(this.bounds.minX, this.bounds.minZ, this.staticScale);
+    this.paintCity(ctx, width, height, {
+      minX: this.bounds.minX,
+      minZ: this.bounds.minZ,
+      width: this.bounds.width,
+      depth: this.bounds.depth,
+    });
+  }
+
+  /** Points the drawing routines below at a canvas. */
+  private setPaint(originX: number, originZ: number, scale: number): void {
+    this.paintOriginX = originX;
+    this.paintOriginZ = originZ;
+    this.paintScale = scale;
+  }
+
+  /**
+   * Draws the city into whatever the paint transform currently points at.
+   *
+   * Order is water, corridors, carriageways, block interiors, buildings - each
+   * layer only ever sits inside the gap the previous one left, so nothing is
+   * overpainted by accident.
+   *
+   * THIS IS DRAWN, NOT SCALED. The expanded map used to blow the static raster
+   * up with `drawImage`, which put a hard ceiling on how far it could be zoomed
+   * before the streets turned to mush. Painting the same vectors at the
+   * viewport's own scale has no such ceiling, and with the window cull below it
+   * is CHEAPER than the full-plan raster at every zoom above 1 - a zoomed view
+   * touches a fraction of the 1,900 parcels.
+   *
+   * NOTE: markers are deliberately NOT baked here. They are drawn per view at a
+   * fixed size in screen pixels, because a marker baked at world scale shrank
+   * with the zoom: the gun-store pin measured THREE pixels on the expanded map.
+   * See `drawMarkers`.
+   */
+  private paintCity(
+    ctx: CanvasRenderingContext2D,
+    width: number,
+    height: number,
+    window: MapWindow,
+  ): void {
     ctx.fillStyle = MINIMAP_PALETTE.land;
     ctx.fillRect(0, 0, width, height);
 
-    this.drawBay(ctx, height);
+    this.drawBay(ctx, width, window);
 
     for (const street of this.plan.streets) {
-      this.fillRect(ctx, streetExtent(street), MINIMAP_PALETTE.pavement);
+      const extent = streetExtent(street);
+      if (!this.visible(extent, window)) continue;
+      this.fillRect(ctx, extent, MINIMAP_PALETTE.pavement);
     }
     for (const street of this.plan.streets) {
       const half = street.roadHalf;
@@ -722,6 +922,7 @@ export class Minimap {
               minZ: street.position - half,
               maxZ: street.position + half,
             };
+      if (!this.visible(rect, window)) continue;
       this.fillRect(
         ctx,
         rect,
@@ -729,33 +930,36 @@ export class Minimap {
       );
     }
 
-    for (const block of this.plan.blocks) this.drawBlock(ctx, block);
-    this.drawAirside(ctx);
-    for (const parcel of this.plan.parcels) this.drawParcel(ctx, parcel);
-    // NOTE: markers are deliberately NOT baked here. The static layer is
-    // 3.2 px per metre and is then scaled to whichever view is drawing it, so
-    // a marker baked at world scale shrank with the zoom: the gun-store pin
-    // measured THREE pixels on the expanded map, with its own crosshair
-    // overdrawing what was left of the fill. They are drawn per-view instead,
-    // at a fixed size in screen pixels - see `drawMarkers`.
+    for (const block of this.plan.blocks) {
+      if (this.visible(block.rect, window)) this.drawBlock(ctx, block);
+    }
+    this.drawAirside(ctx, window);
+    for (const parcel of this.plan.parcels) {
+      if (this.visible(parcel.rect, window)) this.drawParcel(ctx, parcel);
+    }
   }
 
   /** The bay: everything west of the shoreline curve. */
-  private drawBay(ctx: CanvasRenderingContext2D, height: number): void {
+  private drawBay(ctx: CanvasRenderingContext2D, width: number, window: MapWindow): void {
+    // Sampled in WORLD metres so the shoreline keeps its shape at every zoom,
+    // and only across the window so a zoomed view does not walk a kilometre of
+    // coast it cannot show. The polygon is closed off the left edge of the
+    // canvas, which is west of the shore at every scale the map allows.
     const step = 3;
+    const from = window.minZ - step;
+    const to = window.minZ + window.depth + step;
     ctx.beginPath();
-    ctx.moveTo(0, 0);
-    for (let z = this.bounds.minZ; z <= this.bounds.maxZ + step; z += step) {
-      const clamped = Math.min(z, this.bounds.maxZ);
-      const point = this.toStatic(shorelineX(clamped), clamped);
+    ctx.moveTo(-width, this.toStatic(0, from).y);
+    for (let z = from; z <= to; z += step) {
+      const point = this.toStatic(shorelineX(z), z);
       ctx.lineTo(point.x, point.y);
     }
-    ctx.lineTo(0, height);
+    ctx.lineTo(-width, this.toStatic(0, to).y);
     ctx.closePath();
     ctx.fillStyle = MINIMAP_PALETTE.water;
     ctx.fill();
     ctx.strokeStyle = MINIMAP_PALETTE.shore;
-    ctx.lineWidth = 1.6;
+    ctx.lineWidth = Math.max(1, this.paintScale * 0.6);
     ctx.stroke();
   }
 
@@ -779,10 +983,11 @@ export class Minimap {
    * rectangle 200 m across and the player has no way to tell which end of it
    * the runway is.
    */
-  private drawAirside(ctx: CanvasRenderingContext2D): void {
+  private drawAirside(ctx: CanvasRenderingContext2D, window: MapWindow): void {
     ctx.fillStyle = MINIMAP_PALETTE.airside;
     for (const paved of pavedRects()) {
       if (paved.key !== 'concrete') continue;
+      if (!this.visible(paved.rect, window)) continue;
       const a = this.toStatic(paved.rect.minX, paved.rect.minZ);
       const b = this.toStatic(paved.rect.maxX, paved.rect.maxZ);
       ctx.fillRect(a.x, a.y, b.x - a.x, b.y - a.y);
@@ -791,8 +996,8 @@ export class Minimap {
     const a = this.toStatic(RUNWAY.centreX, RUNWAY.northZ);
     const b = this.toStatic(RUNWAY.centreX, RUNWAY.southZ);
     ctx.strokeStyle = MINIMAP_PALETTE.label;
-    ctx.lineWidth = Math.max(1, this.staticScale * 0.6);
-    ctx.setLineDash([this.staticScale * 8, this.staticScale * 6]);
+    ctx.lineWidth = Math.max(1, this.paintScale * 0.6);
+    ctx.setLineDash([this.paintScale * 8, this.paintScale * 6]);
     ctx.beginPath();
     ctx.moveTo(a.x, a.y);
     ctx.lineTo(b.x, b.y);
@@ -923,24 +1128,67 @@ export class Minimap {
    * names, arterial street names, landmark labels and a scale bar drawn on top
    * at device resolution. Rebuilt only when the viewport changes.
    */
-  private buildExpandedCache(): void {
+  /**
+   * The world rectangle the expanded map is showing at the current zoom.
+   *
+   * Centred on the player and then clamped inside the plan, so walking to the
+   * edge of the city slides the window up against the boundary instead of
+   * showing a screenful of nothing. At zoom 1 the clamp collapses to the whole
+   * plan, which is the view every earlier build had.
+   */
+  private expandedWindow(): MapWindow {
+    const zoom = EXPANDED_ZOOMS[this.zoomIndex] ?? 1;
+    const width = this.bounds.width / zoom;
+    const depth = this.bounds.depth / zoom;
+    const maxX = this.bounds.minX + this.bounds.width - width;
+    const maxZ = this.bounds.minZ + this.bounds.depth - depth;
+    return {
+      minX: clampRange(this.playerX - width * 0.5, this.bounds.minX, maxX),
+      minZ: clampRange(this.playerZ - depth * 0.5, this.bounds.minZ, maxZ),
+      width,
+      depth,
+    };
+  }
+
+  /** Whether the cached raster still covers where the player is looking. */
+  private cacheCoversWindow(want: MapWindow): boolean {
+    const have = this.cachedWindow;
+    if (!have) return false;
+    if (have.width !== want.width || have.depth !== want.depth) return false;
+    return (
+      Math.abs(have.minX - want.minX) < want.width * RECENTRE_FRACTION &&
+      Math.abs(have.minZ - want.minZ) < want.depth * RECENTRE_FRACTION
+    );
+  }
+
+  /** Projects world metres into the cached raster's pixels. */
+  private expandedProjector(window: MapWindow): (x: number, z: number) => MapPoint {
+    const scale = this.expandedWidth / window.width;
+    return (x: number, z: number): MapPoint => ({
+      x: (x - window.minX) * scale,
+      y: (z - window.minZ) * scale,
+    });
+  }
+
+  private buildExpandedCache(window: MapWindow): void {
     const width = this.expandedWidth;
     const height = this.expandedHeight;
     if (width <= 0 || height <= 0) return;
     this.expandedCache.width = width;
     this.expandedCache.height = height;
     const ctx = context2d(this.expandedCache);
-    const scale = width / this.bounds.width;
+    const scale = width / window.width;
     const unit = Math.max(1, this.dpr);
 
     ctx.clearRect(0, 0, width, height);
     ctx.fillStyle = MINIMAP_PALETTE.beyond;
     ctx.fillRect(0, 0, width, height);
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = 'high';
-    ctx.drawImage(this.staticLayer, 0, 0, width, height);
 
-    const project = (x: number, z: number): MapPoint => worldToMap(x, z, this.bounds, scale);
+    this.setPaint(window.minX, window.minZ, scale);
+    this.paintCity(ctx, width, height, window);
+    this.cachedWindow = window;
+
+    const project = this.expandedProjector(window);
     ctx.textBaseline = 'middle';
 
     // Painted smallest first so the district names, which carry the map, win

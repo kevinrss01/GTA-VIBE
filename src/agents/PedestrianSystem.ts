@@ -87,6 +87,7 @@ import {
   type CrowdContext,
   type CrowdVehicle,
   type PedestrianImpact,
+  type CrowdConversation,
 } from './crowd';
 import { ObstacleIndex } from './obstacles';
 import { buildPavementGraph, type PavementGraph } from './pavement';
@@ -347,23 +348,43 @@ export class PedestrianSystem {
    * none of four leaves the procedural one up. Nothing here can reject.
    */
   private async loadCharacters(): Promise<void> {
-    const loaded = await Promise.all(this.roster.map((id) => loadPedestrianVat(id)));
-    if (this.disposed) {
-      for (const character of loaded) character?.dispose();
-      return;
-    }
-    for (let i = 0; i < loaded.length; i += 1) {
-      const character = loaded[i];
-      const bundle = this.bundles[i];
-      if (!character || !bundle) continue;
-      bundle.install(character);
-      this.characters.push(character);
-      this.loadedBundles.push(bundle);
-    }
-    // Only stop drawing the placeholders once at least one real person exists.
-    if (this.characters.length > 0) {
-      this.fallback.mesh.visible = false;
-      this.fallback.mesh.count = 0;
+    /*
+     * A FEW AT A TIME, IN ROSTER ORDER, INSTALLED AS THEY LAND.
+     *
+     * This used to be one `Promise.all` over the whole roster, which was four
+     * characters and twelve requests. At eleven it is thirty-three, all issued
+     * during the world build, all competing with the geometry and the shader
+     * compilation the FIRST FRAME actually needs - and the cold-load work that
+     * took this build from 43 s to 21 s was mostly about not doing that.
+     *
+     * Two at a time keeps six requests in flight, which is one browser
+     * connection budget, and installing each as it arrives means the crowd
+     * gains faces progressively instead of all at once at the end. Nothing
+     * here can reject: whatever arrives is used, and none of it leaves the
+     * procedural crowd up once the first real character exists.
+     */
+    const CONCURRENCY = 2;
+    for (let start = 0; start < this.roster.length; start += CONCURRENCY) {
+      const batch = this.roster.slice(start, start + CONCURRENCY);
+      const loaded = await Promise.all(batch.map((id) => loadPedestrianVat(id)));
+      if (this.disposed) {
+        for (const character of loaded) character?.dispose();
+        return;
+      }
+      for (let i = 0; i < loaded.length; i += 1) {
+        const character = loaded[i];
+        const bundle = this.bundles[start + i];
+        if (!character || !bundle) continue;
+        bundle.install(character);
+        this.characters.push(character);
+        this.loadedBundles.push(bundle);
+      }
+      // Only stop drawing the placeholders once at least one real person
+      // exists, and then never again - later batches only add to the cast.
+      if (this.characters.length > 0 && this.fallback.mesh.visible) {
+        this.fallback.mesh.visible = false;
+        this.fallback.mesh.count = 0;
+      }
     }
   }
 
@@ -504,6 +525,17 @@ export class PedestrianSystem {
   /** Gunfire the crowd currently remembers. Bounded; diagnostics and tests. */
   get alarms(): readonly { readonly x: number; readonly z: number; readonly radius: number }[] {
     return this.crowd.recentAlarms;
+  }
+
+  /**
+   * People currently standing and talking to each other.
+   *
+   * Handed straight to `CrowdVoice`, which is the only reason it is published:
+   * where the conversations are and who has the floor is the crowd's decision,
+   * and what that sounds like is the mixer's.
+   */
+  get conversations(): readonly CrowdConversation[] {
+    return this.crowd.conversations;
   }
 
   /**

@@ -21,6 +21,7 @@ import { AudioDirector } from '../src/audio/AudioDirector';
 import {
   GEAR_TOPS,
   REV_IDLE,
+  ambientEngine,
   ambientLevel,
   ambientRate,
   engineTone,
@@ -133,8 +134,14 @@ describe('engine tone', () => {
   it('gives an ambient car pitch and level that both follow its speed', () => {
     expect(ambientRate(14)).toBeGreaterThan(ambientRate(2));
     expect(ambientLevel(14)).toBeGreaterThan(ambientLevel(0));
-    // A queueing car is idling, not switched off.
-    expect(ambientLevel(0)).toBeGreaterThan(0.1);
+    // A queueing car is idling, not switched off - but what is audible at a
+    // standstill is the ENGINE, not the tyres, which is why the two layers
+    // exist. A stopped car rolling on its tyres is a sound that does not
+    // happen; an idling one at a red light has to be heard.
+    expect(ambientLevel(0)).toBe(0);
+    expect(ambientEngine(0).level).toBeGreaterThan(0.1);
+    expect(ambientEngine(14).level).toBeGreaterThan(ambientEngine(0).level);
+    expect(ambientEngine(14).rate).toBeGreaterThan(ambientEngine(0).rate);
   });
 });
 
@@ -787,13 +794,15 @@ describe('ambient traffic voices', () => {
   const fleet = (n: number, spacing: number): VehicleAudioView[] =>
     Array.from({ length: n }, (_, i) => car({ id: i, x: (i + 1) * spacing, z: 0 }));
 
-  it('never allocates more than five looping voices, whatever the traffic is', async () => {
+  it('never allocates more than the pool of looping voices, whatever the traffic is', async () => {
     const { audio, street } = await makeStreet();
     for (let i = 0; i < 240; i += 1) {
       street.update(1 / 60, { ...BASE, vehicles: fleet(60, 0.8) });
     }
-    expect(sourcesFor('engine-far')).toHaveLength(5);
-    expect(street.stats.trafficVoices).toBe(5);
+    // TRAFFIC_VOICES, and one tyre source plus one engine source for each.
+    expect(sourcesFor('engine-far')).toHaveLength(7);
+    expect(sourcesFor('veh/engine-idle')).toHaveLength(7);
+    expect(street.stats.trafficVoices).toBe(7);
     audio.dispose();
     street.dispose();
   });
@@ -873,15 +882,46 @@ describe('ambient traffic classes', () => {
     street.dispose();
   });
 
+  it('voices a car standing at a red light as an engine, not as tyres', async () => {
+    // The defect this pins: an ambient car used to be ONE tyre-roll loop, so a
+    // queue at a junction was voiced as rubber on asphalt at a standstill -
+    // which is a sound that does not happen - and a car passing a pedestrian
+    // had no engine in it at all. See the note above `ambientRate`.
+    const { audio, street } = await makeStreet();
+    const level = (id: string): number => {
+      const source = sourcesFor(id)[0];
+      const gain = source?.target as { gain: FakeParam } | null;
+      return gain?.gain.value ?? -1;
+    };
+
+    const stopped = car({ id: 1, x: 9, z: 0, speed: 0 });
+    for (let i = 0; i < 60; i += 1) street.update(1 / 60, { ...BASE, vehicles: [stopped] });
+    expect(level(VEHICLE_SOUNDS.engineIdle)).toBeGreaterThan(0.05);
+    expect(level(VEHICLE_SOUNDS.engineFar)).toBe(0);
+
+    // Green light. The tyres arrive, the engine climbs with the revs, and both
+    // are driven from the same car rather than from a clock.
+    const moving = car({ id: 1, x: 9, z: 0, speed: 12 });
+    for (let i = 0; i < 60; i += 1) street.update(1 / 60, { ...BASE, vehicles: [moving] });
+    expect(level(VEHICLE_SOUNDS.engineFar)).toBeGreaterThan(0);
+    expect(sourcesFor(VEHICLE_SOUNDS.engineIdle)[0]?.playbackRate.value ?? 0).toBeGreaterThan(
+      ambientEngine(0).rate,
+    );
+
+    audio.dispose();
+    street.dispose();
+  });
+
   it('allocates one filter per voice and no more', async () => {
     const { audio, street } = await makeStreet();
     const vehicles = Array.from({ length: 30 }, (_, i) =>
       car({ id: i, kind: i % 2 === 0 ? 'boxTruck' : 'coupe', x: i, z: 0, speed: 9 }),
     );
     for (let i = 0; i < 200; i += 1) street.update(1 / 60, { ...BASE, vehicles });
-    // Five ambient voices; the engine's own filter is not built here because
-    // the player is on foot.
-    expect(h.filters).toBeLessThanOrEqual(5);
+    // One filter per ambient voice - the two layers of a car share it, because
+    // they are one car - and the player's own engine filter is not built here
+    // because the player is on foot.
+    expect(h.filters).toBeLessThanOrEqual(7);
     audio.dispose();
     street.dispose();
   });
@@ -1109,11 +1149,11 @@ describe('budgets and lifecycle', () => {
       peak = Math.max(peak, street.stats.liveNodes);
     }
 
-    // 8 engine (2 layers, tyres, 4 gains, filter) + 20 traffic (5 voices of
-    // source, gain, filter, panner) + 2 hum = 30 persistent, plus whatever
-    // one-shots are mid-flight: MAX_STEP_VOICES * 3 + MAX_OTHER_VOICES * 3.
-    // Measured peak over this run is 58; the ceiling is the arithmetic one.
-    expect(peak).toBeLessThanOrEqual(72);
+    // 8 engine (2 layers, tyres, 4 gains, filter) + 42 traffic (7 voices of
+    // tyre source, tyre gain, engine source, engine gain, filter, panner) +
+    // 2 hum = 52 persistent, plus whatever one-shots are mid-flight:
+    // MAX_STEP_VOICES * 3 + MAX_OTHER_VOICES * 3. The ceiling is that sum.
+    expect(peak).toBeLessThanOrEqual(94);
     expect(peak).toBeGreaterThan(30); // the persistent set really was built
     expect(street.stats.crowdTracks).toBeLessThanOrEqual(20);
     audio.dispose();
@@ -1144,8 +1184,9 @@ describe('budgets and lifecycle', () => {
     const stats = street.stats;
     expect(stats.stepVoices).toBeLessThanOrEqual(8);
     expect(stats.voices - stats.stepVoices).toBeLessThanOrEqual(6);
-    // 23 persistent, 8 footsteps and 6 others at three nodes each.
-    expect(stats.liveNodes).toBeLessThanOrEqual(65);
+    // 45 persistent (7 two-layer voices and the hum), 8 footsteps and 6
+    // others at three nodes each.
+    expect(stats.liveNodes).toBeLessThanOrEqual(87);
     audio.dispose();
     street.dispose();
   });
