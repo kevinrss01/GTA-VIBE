@@ -182,6 +182,28 @@ export interface ArrestConditions {
   readonly held: number;
 }
 
+/**
+ * How near an officer has to be before they bother shouting at the player.
+ *
+ * Further than a conversation, nearer than a rifle shot: an order yelled
+ * across a street is the point, and an officer who challenges the player from
+ * beyond `OFFICER_FIRE_RANGE` is shouting at somebody they are about to shoot
+ * at anyway, which reads as a bug rather than as procedure.
+ */
+export const OFFICER_VOICE_RANGE = 26;
+/**
+ * Seconds before the same officer may shout again.
+ *
+ * Long, deliberately. Every unit carries a crew, so four officers converging
+ * with a two-second cooldown each would produce an order roughly twice a
+ * second: not a police response, a chant. Eight seconds means a cordon of four
+ * says something about every two seconds between them, which is about the rate
+ * a real one does.
+ */
+export const OFFICER_VOICE_COOLDOWN = 8;
+/** Seconds before any unit may key the radio again. */
+export const RADIO_COOLDOWN = 12;
+
 /** Close enough to lay hands on. */
 export const ARREST_RANGE = 2.4;
 /** Above this the player is running and cannot be taken. */

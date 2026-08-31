@@ -387,6 +387,110 @@ const PLAYER_CAR_RADIUS = 1.6;
 
 export type PedState = 'walk' | 'wait' | 'cross' | 'pause' | 'down';
 
+/*
+ * ---------------------------------------------------------------------------
+ * Conversations
+ * ---------------------------------------------------------------------------
+ *
+ * A crowd of people who all walk past each other reads as traffic. What makes
+ * a street read as a PLACE is that some of it has stopped and is talking, and
+ * this is the smallest thing that produces that: two people who were already
+ * pausing near each other are paired, turned to face one another, and hold the
+ * spot for a while, handing a notional floor back and forth.
+ *
+ * It is built ON TOP of the pause that already existed rather than beside it,
+ * which is what keeps it out of the movement code entirely: a conversation is
+ * a pause with a partner and an owner for its timer. Nobody who is crossing, in
+ * the road, alarmed, down or already talking can be recruited into one.
+ */
+
+/**
+ * How near two people must be to start talking, by what the partner is doing.
+ *
+ * A partner who has ALREADY STOPPED may be a little further off: two people who
+ * both paused a few metres apart and then drifted together is a thing that
+ * happens. A partner who is still WALKING is recruited from closer, because
+ * being hailed by somebody at arm's length reads as two people who know each
+ * other, and being stopped mid-stride from four metres reads as a bug.
+ *
+ * Both matter, and the walker is what makes the feature happen at all:
+ * measured on the shipped crowd, requiring two already-paused people gave
+ * about one conversation alive at a time within the formation radius, because
+ * two independent pauses landing within a couple of metres of each other is a
+ * four-per-cent event.
+ */
+const CHAT_RADIUS = 3.2;
+const CHAT_RECRUIT_RADIUS = 2.4;
+/** Seconds a conversation lasts, before either party has to be somewhere. */
+const CHAT_SECONDS_MIN = 9;
+const CHAT_SECONDS_MAX = 22;
+/** Seconds one person holds the floor before the other answers. */
+const CHAT_TURN_MIN = 2.6;
+const CHAT_TURN_MAX = 4.6;
+/**
+ * How many conversations may exist at once, and how far from the listener one
+ * may be struck up.
+ *
+ * THE RADIUS IS THE LOAD-BEARING NUMBER, and it is not an optimisation. The
+ * crowd is 270 people spread over a 142 m radius - about 63,000 square metres -
+ * while a conversation can only be heard from `CHATTER_RADIUS`, which covers
+ * 900. Spending a global budget of conversations across the whole crowd puts
+ * essentially none of them where anybody can see or hear one: measured, twelve
+ * groups over the whole crowd gave an expected 0.07 groups inside earshot, and
+ * the feature simply never happened.
+ *
+ * Forming them near the listener instead concentrates the same budget where it
+ * is experienced - roughly one or two audible at a time - and costs nothing in
+ * plausibility, because a conversation 120 m away is four pixels tall and
+ * silent either way. Groups already formed are never broken up for walking out
+ * of it; people who are talking are free to be somewhere.
+ *
+ * The COUNT is an art decision rather than a performance one - a conversation
+ * is a handful of numbers. Ten groups is twenty people standing out of the
+ * ninety or so inside the radius, which is a busy pavement; past that it reads
+ * as a market.
+ */
+const MAX_CONVERSATIONS = 10;
+const CHAT_FORM_RADIUS = 45;
+/** Chance a pause that could become a conversation actually does. */
+const CHAT_TAKE_UP = 0.8;
+
+/**
+ * A group of people talking, as the outside world sees it.
+ *
+ * `speaker` is an index into whatever set of voices the caller has; it is
+ * drawn once per person when the group forms, so the same body keeps the same
+ * voice for the whole conversation. `line` increments on every hand-over, so a
+ * consumer can tell "still the same sentence" from "somebody just started a
+ * new one" without keeping a clock of its own.
+ */
+export interface CrowdConversation {
+  readonly id: number;
+  readonly x: number;
+  readonly y: number;
+  readonly z: number;
+  readonly speaker: number;
+  readonly line: number;
+}
+
+/** One live conversation. Internal: the two members are held by reference. */
+interface Conversation {
+  id: number;
+  a: Pedestrian;
+  b: Pedestrian;
+  /** Seconds left before both parties move on. */
+  left: number;
+  /** Seconds left of the current speaker's turn. */
+  turn: number;
+  /** 0 while `a` has the floor, 1 while `b` does. */
+  side: 0 | 1;
+  /** Increments on every hand-over. */
+  line: number;
+  /** Which voice each member speaks with. */
+  voiceA: number;
+  voiceB: number;
+}
+
 /**
  * What a vehicle did to somebody, reported to whoever owns the vehicle.
  *
@@ -494,6 +598,15 @@ export interface Pedestrian {
   state: PedState;
   /** Seconds left in the current wait or pause. */
   timer: number;
+  /**
+   * Id of the conversation this person is standing in, or 0.
+   *
+   * A conversation owns the `pause` it is built on: while `chat` is non-zero
+   * the pause timer is the group's business, not `decide`'s, which is what
+   * stops two people who are talking to each other wandering off at different
+   * moments in the middle of a sentence.
+   */
+  chat: number;
   /** Where along the current link a waiting pedestrian stands. */
   waitAlong: number;
   /** Walk cycle position in [0, 1). */
@@ -800,6 +913,10 @@ export class Crowd {
    */
   private readonly linkZone: Uint8Array;
   private readonly linkShare: Float32Array;
+  /** Live conversations, and the published view of them. See `CrowdConversation`. */
+  private readonly chats: Conversation[] = [];
+  private readonly chatViews: CrowdConversation[] = [];
+  private nextChatId = 1;
   /** People currently standing in each zone. Rebuilt every frame in `update`. */
   private readonly zoneCount = new Int32Array(PEDESTRIAN_ZONES.length);
   private readonly zoneCap = new Int32Array(PEDESTRIAN_ZONES.length);
@@ -1001,6 +1118,7 @@ export class Crowd {
       state: 'walk',
       timer: 0,
       waitAlong: 0,
+      chat: 0,
       phase: 0,
       gait: 0,
       cadenceNow: 1,
@@ -1517,6 +1635,171 @@ export class Crowd {
 
     this.strike(ctx);
     this.resolveOverlaps(2);
+    // After the overlap solve, so the two people facing each other are facing
+    // where they actually ended up standing.
+    this.updateConversations(step);
+  }
+
+  // -- conversations --------------------------------------------------------
+
+  /**
+   * Live conversations, for whoever is voicing them.
+   *
+   * Rebuilt into a reused array every time it is read, because it is read once
+   * per frame from the audio layer and allocating a dozen objects at 120 Hz is
+   * a garbage-collection pause nobody asked for.
+   */
+  get conversations(): readonly CrowdConversation[] {
+    this.chatViews.length = 0;
+    for (const chat of this.chats) {
+      const talker = chat.side === 0 ? chat.a : chat.b;
+      this.chatViews.push({
+        id: chat.id,
+        x: talker.x,
+        // Mouth height rather than foot height, so the line is spatialised on
+        // the person and not on the pavement in front of them.
+        y: talker.y + 1.5,
+        z: talker.z,
+        speaker: chat.side === 0 ? chat.voiceA : chat.voiceB,
+        line: chat.line,
+      });
+    }
+    return this.chatViews;
+  }
+
+  /**
+   * Pairs somebody who has just stopped with somebody standing next to them.
+   *
+   * The partner has to be ALREADY STOPPED. Recruiting a walker would mean
+   * arresting somebody mid-stride to listen to a stranger, which reads as a
+   * bug; two people who both happened to pause within a couple of metres reads
+   * as two people who know each other.
+   */
+  private formConversation(ped: Pedestrian, ctx: CrowdContext): void {
+    if (this.chats.length >= MAX_CONVERSATIONS || ped.chat !== 0) return;
+    if (ped.state !== 'pause' || ped.retire !== RETIRE_NONE) return;
+    // See CHAT_FORM_RADIUS: the budget is spent where it can be experienced.
+    const outX = ped.x - ctx.x;
+    const outZ = ped.z - ctx.z;
+    if (outX * outX + outZ * outZ > CHAT_FORM_RADIUS * CHAT_FORM_RADIUS) return;
+
+    let partner: Pedestrian | null = null;
+    let bestSq = Infinity;
+    for (const other of this.peds) {
+      if (other === ped || !other.active) continue;
+      if (other.chat !== 0 || other.retire !== RETIRE_NONE || other.alarm > 0) continue;
+      // Only somebody standing on a pavement with nowhere urgent to be. A
+      // walker may be hailed; a person waiting at a kerb, crossing a road or
+      // lying on the ground may not.
+      const paused = other.state === 'pause';
+      if (!paused && other.state !== 'walk') continue;
+      const reach = paused ? CHAT_RADIUS : CHAT_RECRUIT_RADIUS;
+      const dx = other.x - ped.x;
+      const dz = other.z - ped.z;
+      const d = dx * dx + dz * dz;
+      // Standing on top of each other is the overlap solver mid-correction,
+      // not two people in conversation.
+      if (d < 0.3 || d >= reach * reach || d >= bestSq) continue;
+      bestSq = d;
+      partner = other;
+    }
+    if (!partner) return;
+
+    // A recruited walker stops where they are, which is beside the person who
+    // hailed them; `waitAlong` is what holds them there.
+    if (partner.state !== 'pause') {
+      partner.state = 'pause';
+      partner.waitAlong = partner.along;
+    }
+
+    const id = this.nextChatId;
+    this.nextChatId += 1;
+    ped.chat = id;
+    partner.chat = id;
+    // The pause timers are no longer consulted, but leaving them running means
+    // a dissolved conversation hands back a person who leaves immediately.
+    ped.timer = 0;
+    partner.timer = 0;
+    const voiceA = Math.floor(this.rng.next() * 7);
+    let voiceB = Math.floor(this.rng.next() * 7);
+    // Two people in a conversation must not have the same voice; it reads as
+    // one person answering themselves.
+    if (voiceB === voiceA) voiceB = (voiceB + 1) % 7;
+    this.chats.push({
+      id,
+      a: ped,
+      b: partner,
+      left: this.rng.range(CHAT_SECONDS_MIN, CHAT_SECONDS_MAX),
+      turn: this.rng.range(CHAT_TURN_MIN, CHAT_TURN_MAX),
+      side: 0,
+      line: 0,
+      voiceA,
+      voiceB,
+    });
+  }
+
+  /**
+   * Runs every conversation: who has the floor, where they are looking, and
+   * when it is over.
+   *
+   * A group ends for one of three reasons and all of them are the same code
+   * path - somebody was knocked down, alarmed, recycled or otherwise stopped
+   * being a person standing still, or the clock ran out. Ending it always
+   * returns both members to `walk`, so nobody can be left standing on a
+   * pavement for ever because their partner was run over.
+   */
+  private updateConversations(dt: number): void {
+    for (let i = this.chats.length - 1; i >= 0; i -= 1) {
+      const chat = this.chats[i];
+      if (!chat) continue;
+      const { a, b } = chat;
+      const broken =
+        !a.active ||
+        !b.active ||
+        a.chat !== chat.id ||
+        b.chat !== chat.id ||
+        a.state !== 'pause' ||
+        b.state !== 'pause' ||
+        a.alarm > 0 ||
+        b.alarm > 0 ||
+        a.retire !== RETIRE_NONE ||
+        b.retire !== RETIRE_NONE;
+
+      chat.left -= dt;
+      if (broken || chat.left <= 0) {
+        this.endConversation(chat);
+        this.chats.splice(i, 1);
+        continue;
+      }
+
+      // Turn to each other. `heading` is the direction the model FACES, which
+      // is -(sin, cos), so this is the same form the walk uses.
+      const dx = b.x - a.x;
+      const dz = b.z - a.z;
+      if (dx * dx + dz * dz > 1e-4) {
+        a.heading = Math.atan2(-dx, -dz);
+        b.heading = Math.atan2(dx, dz);
+      }
+
+      chat.turn -= dt;
+      if (chat.turn <= 0) {
+        chat.turn = this.rng.range(CHAT_TURN_MIN, CHAT_TURN_MAX);
+        chat.side = chat.side === 0 ? 1 : 0;
+        chat.line += 1;
+      }
+    }
+  }
+
+  /** Releases both members of a conversation back into the crowd. */
+  private endConversation(chat: Conversation): void {
+    for (const member of [chat.a, chat.b]) {
+      if (member.chat !== chat.id) continue;
+      member.chat = 0;
+      if (member.state === 'pause') {
+        member.state = 'walk';
+        member.timer = 0;
+      }
+    }
   }
 
   /**
@@ -2478,6 +2761,8 @@ export class Crowd {
 
   private decide(ped: Pedestrian, link: PavementLink, dt: number, ctx: CrowdContext): void {
     if (ped.state === 'pause') {
+      // A conversation owns its members' pause; `updateConversations` ends it.
+      if (ped.chat !== 0) return;
       ped.timer -= dt;
       if (ped.timer <= 0) ped.state = 'walk';
       return;
@@ -2540,6 +2825,10 @@ export class Crowd {
         ped.state = 'pause';
         ped.timer = this.rng.range(1.6, 6.5);
         ped.waitAlong = ped.along;
+        // Somebody stopping next to somebody else who has also stopped is the
+        // whole recruitment rule. Not everybody who could talk does, or every
+        // pause on a busy pavement would turn into one.
+        if (this.rng.next() < CHAT_TAKE_UP) this.formConversation(ped, ctx);
       }
       return;
     }

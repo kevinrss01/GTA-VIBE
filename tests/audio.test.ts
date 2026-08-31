@@ -1191,17 +1191,20 @@ describe('manifest integrity', () => {
     expect(PRELOAD_ASSET_IDS).toContain(POLICE_SOUNDS.engine);
   });
 
-  it('defers the airfield set and the class engines, and nothing else', () => {
+  it('defers the airfield set, the class engines and the voices, and nothing else', () => {
     // Spelled out rather than derived, so adding an asset to the lazy set is a
     // deliberate act with a reason attached rather than something that happens
     // by accident. The class engine layers and the tyre bed are 1.07 MB that a
     // player who never gets into a box truck never needs; `StreetAudio` asks
-    // for them on the frame the player takes a car.
+    // for them on the frame the player takes a car. The crowd and police lines
+    // are another 1.3 MB that nobody can hear in the first second of a
+    // session; `CrowdVoice.preload` asks for them on the start gesture.
     const deferred = [...LAZY_ASSET_IDS].sort();
     const expected = [
       MUSIC_ASSET_ID,
       AIRPORT_BED,
       ...AUDIO_ASSETS.filter((a) => a.kind === 'aircraft').map((a) => a.id),
+      ...AUDIO_ASSETS.filter((a) => a.id.startsWith('vox/')).map((a) => a.id),
       'veh/engine-small-idle',
       'veh/engine-small-load',
       'veh/engine-sport-idle',

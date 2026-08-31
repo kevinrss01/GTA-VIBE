@@ -103,6 +103,7 @@
 import type { AudioBusHost } from './AudioDirector';
 import {
   ambientCutoff,
+  ambientEngine,
   ambientLevel,
   ambientRate,
   engineProfileFor,
@@ -254,7 +255,7 @@ const SHIFT_LEVEL = 0.5;
 const SHIFT_MIN_SPEED = 1.5;
 
 /** Ambient cars: how many voices, how far they carry, when they are released. */
-const TRAFFIC_VOICES = 5;
+const TRAFFIC_VOICES = 7;
 const TRAFFIC_RADIUS = 55;
 const TRAFFIC_RELEASE = 72;
 const TRAFFIC_REASSIGN = 0.25;
@@ -362,6 +363,32 @@ function moved(value: number, previous: number, epsilon: number): boolean {
 
 /** Hoisted so a per-frame mix never pays for a `Math.pow` or a map lookup. */
 const AMBIENT_TRIM = dbToGain(getAudioAsset(VEHICLE_SOUNDS.engineFar).trimDb);
+
+/**
+ * The recording every ambient car's engine layer plays.
+ *
+ * The saloon idle, deliberately: it is 70.8 per cent low rumble (see the band
+ * table in the manifest), which is the part of an engine that survives an HRTF
+ * panner and a lowpass, and one shared buffer is what lets the whole pool exist
+ * without a source per class. The CLASS still comes through, from the rate and
+ * the filter, exactly as it does for the tyre layer.
+ */
+const AMBIENT_ENGINE_SOUND: AudioAssetId = ENGINE_VOICE_LAYERS.saloon.idle;
+const AMBIENT_ENGINE_TRIM = dbToGain(getAudioAsset(AMBIENT_ENGINE_SOUND).trimDb);
+/**
+ * How loud somebody else's engine is against the player's own.
+ *
+ * The curve returns 0.52 at a standstill and 1.0 at the limiter, which is the
+ * right SHAPE but is scaled for a car the listener is sitting in. Multiplied
+ * out with `AMBIENT_ENGINE_TRIM` (0.98, the asset is already near its target
+ * level), an idling saloon inside the panner's reference distance reaches 0.25
+ * into the positional effects bus and one at the top of a gear 0.49 - measured
+ * on the shipped graph at 0.37 to 0.46 across six cars in ordinary traffic.
+ * That is present on a quiet street, under the tyre layer at speed, and
+ * comfortably below the player's own engine at `ENGINE_LEVEL` = 0.88, which
+ * does not go through a panner at all.
+ */
+const AMBIENT_ENGINE_LEVEL = 0.5;
 const TYRE_TRIM = dbToGain(getAudioAsset(VEHICLE_SOUNDS.tyreRoll).trimDb);
 /**
  * How near a player-controlled vehicle has to be to BE the player's car.
@@ -543,15 +570,24 @@ interface EngineGraph {
 }
 
 interface TrafficVoice {
+  /** Tyre and road noise. Level and rate follow ROAD SPEED, never revs. */
   readonly source: AudioBufferSourceNode;
   readonly gain: GainNode;
   /**
-   * The class colour.
+   * The engine under the tyres, and the reason a car at a red light is
+   * audible at all. Level and rate come off the gear model, so this one is
+   * loudest when the tyre layer is silent and the two diverge on every shift.
+   */
+  readonly engine: AudioBufferSourceNode;
+  readonly engineGain: GainNode;
+  /**
+   * The class colour, shared by both layers because they are one car.
    *
-   * The pool shares one recording, because five sources is the budget and a
-   * source cannot change its buffer - so what separates a box truck from a
-   * hatchback across a junction is this filter's corner and the playback rate,
-   * not a different file. One biquad per voice, allocated with the voice.
+   * Every voice in the pool plays the same two recordings, because a source
+   * cannot change its buffer and the pool is reassigned constantly - so what
+   * separates a box truck from a hatchback across a junction is this filter's
+   * corner and the two playback rates, not a different file. One biquad per
+   * voice, allocated with the voice.
    */
   readonly filter: BiquadFilterNode;
   readonly panner: PannerNode;
@@ -561,6 +597,8 @@ interface TrafficVoice {
   seen: boolean;
   rate: number;
   level: number;
+  engineRate: number;
+  engineLevel: number;
   cutoff: number;
   profile: EngineProfile;
 }
@@ -611,6 +649,7 @@ export class StreetAudio {
   private doorCloseIn = -1;
 
   private readonly voices: TrafficVoice[] = [];
+  /** Bitfield of ambient-voice assets already asked for: 1 tyres, 2 engine. */
   private voicesRequested = 0;
   private reassignIn = 0;
   private trafficScrubCooldown = 0;
@@ -1114,10 +1153,7 @@ export class StreetAudio {
     // A voice whose vehicle was recycled out of the fleet must not hold its
     // last level for the quarter second until the next reassignment.
     for (const voice of this.voices) {
-      if (voice.vehicleId !== null && !voice.seen) {
-        voice.vehicleId = null;
-        this.setVoiceLevel(voice, 0);
-      }
+      if (voice.vehicleId !== null && !voice.seen) this.releaseVoice(voice);
     }
 
     this.humWeight = humWeight;
@@ -1133,12 +1169,18 @@ export class StreetAudio {
       voice.rate = rate;
       this.ramp(voice.source.playbackRate, rate, RATE_RAMP);
     }
-    const cutoff = ambientCutoff(voice.profile);
+    const engine = ambientEngine(vehicle.speed, voice.profile);
+    if (moved(engine.rate, voice.engineRate, RATE_EPSILON)) {
+      voice.engineRate = engine.rate;
+      this.ramp(voice.engine.playbackRate, engine.rate, RATE_RAMP);
+    }
+    const cutoff = ambientCutoff(voice.profile, vehicle.speed);
     if (moved(cutoff, voice.cutoff, FILTER_EPSILON)) {
       voice.cutoff = cutoff;
       this.ramp(voice.filter.frequency, cutoff, FILTER_RAMP);
     }
     this.setVoiceLevel(voice, ambientLevel(vehicle.speed, voice.profile) * AMBIENT_TRIM);
+    this.setEngineVoiceLevel(voice, engine.level * AMBIENT_ENGINE_LEVEL * AMBIENT_ENGINE_TRIM);
 
     // Rising edge of a HARD stop, not of the brake lamp. See the constants.
     const hard = vehicle.accelLong <= -TRAFFIC_SCRUB_DECEL;
@@ -1165,6 +1207,19 @@ export class StreetAudio {
     if (Math.abs(level - voice.level) < GAIN_EPSILON) return;
     voice.level = level;
     this.ramp(voice.gain.gain, level, GAIN_RAMP);
+  }
+
+  private setEngineVoiceLevel(voice: TrafficVoice, level: number): void {
+    if (Math.abs(level - voice.engineLevel) < GAIN_EPSILON) return;
+    voice.engineLevel = level;
+    this.ramp(voice.engineGain.gain, level, GAIN_RAMP);
+  }
+
+  /** Silences both layers of a voice that has lost its car. */
+  private releaseVoice(voice: TrafficVoice): void {
+    voice.vehicleId = null;
+    this.setVoiceLevel(voice, 0);
+    this.setEngineVoiceLevel(voice, 0);
   }
 
   /**
@@ -1222,10 +1277,7 @@ export class StreetAudio {
       const stillWanted = this.wanted.includes(voice.vehicleId);
       const stillNear = this.withinRelease(ctx, voice.vehicleId);
       if (stillWanted || stillNear) held.add(voice.vehicleId);
-      else {
-        voice.vehicleId = null;
-        this.setVoiceLevel(voice, 0);
-      }
+      else this.releaseVoice(voice);
     }
 
     for (const id of this.wanted) {
@@ -1256,11 +1308,23 @@ export class StreetAudio {
     const ctx = this.host.context;
     const bus = this.host.positionalEffectsBus;
     if (!ctx || !bus) return null;
-    const buffer = this.host.bufferFor(VEHICLE_SOUNDS.engineFar);
-    if (!buffer) {
-      if (this.voicesRequested === 0) {
-        this.voicesRequested = 1;
+    const roll = this.host.bufferFor(VEHICLE_SOUNDS.engineFar);
+    const idle = this.host.bufferFor(AMBIENT_ENGINE_SOUND);
+    if (!roll || !idle) {
+      /*
+       * Ask once per missing asset, not once per attempt: this runs on the
+       * reassignment tick and the ask is idempotent, so an unlatched request
+       * would queue four loads a second for as long as the decode took. The
+       * counter is per-asset rather than a single flag because the two arrive
+       * independently and losing one would silence a layer for the session.
+       */
+      if (!roll && (this.voicesRequested & 1) === 0) {
+        this.voicesRequested |= 1;
         this.host.requestAsset(VEHICLE_SOUNDS.engineFar);
+      }
+      if (!idle && (this.voicesRequested & 2) === 0) {
+        this.voicesRequested |= 2;
+        this.host.requestAsset(AMBIENT_ENGINE_SOUND);
       }
       return null;
     }
@@ -1276,12 +1340,18 @@ export class StreetAudio {
     const gain = ctx.createGain();
     gain.gain.value = 0;
     gain.connect(filter);
-    const source = this.startLoop(buffer, gain, VEHICLE_SOUNDS.engineFar);
-    this.liveNodes += 4;
+    const source = this.startLoop(roll, gain, VEHICLE_SOUNDS.engineFar);
+    const engineGain = ctx.createGain();
+    engineGain.gain.value = 0;
+    engineGain.connect(filter);
+    const engine = this.startLoop(idle, engineGain, AMBIENT_ENGINE_SOUND);
+    this.liveNodes += 6;
 
     const voice: TrafficVoice = {
       source,
       gain,
+      engine,
+      engineGain,
       filter,
       panner,
       vehicleId: null,
@@ -1289,6 +1359,8 @@ export class StreetAudio {
       seen: false,
       rate: 1,
       level: 0,
+      engineRate: 1,
+      engineLevel: 0,
       cutoff: ambientCutoff(DEFAULT_PROFILE),
       profile: DEFAULT_PROFILE,
     };
@@ -1674,10 +1746,12 @@ export class StreetAudio {
 
     for (const voice of this.voices) {
       this.stop(voice.source);
+      this.stop(voice.engine);
       this.disconnect(voice.gain);
+      this.disconnect(voice.engineGain);
       this.disconnect(voice.filter);
       this.disconnect(voice.panner);
-      this.liveNodes -= 4;
+      this.liveNodes -= 6;
     }
     this.voices.length = 0;
 

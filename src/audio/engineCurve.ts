@@ -385,15 +385,42 @@ export function loadFromAcceleration(accel: number): number {
   return v < -1 ? -1 : v > 1 ? 1 : v;
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * Ambient traffic
+ * ---------------------------------------------------------------------------
+ *
+ * A CAR THE PLAYER WALKS PAST HAS AN ENGINE. That sounds obvious and it was
+ * the defect: the ambient voice was a single `veh/engine-far` loop, which is a
+ * recording of TYRE ROLL, chosen on the reasoning that traffic "is always heard
+ * through a panner at 15 m or more where the layering is inaudible". Standing
+ * on a pavement in Meridian Bay that premise does not hold - the panner's
+ * reference distance is 7 m and cars pass inside it constantly - and a broad
+ * rubber hiss under the district ambience and the traffic-hum bed is exactly
+ * what "the cars are not making any noise" describes. A queueing car was worse
+ * still: it was voiced as tyre noise at a standstill, which is a sound that
+ * does not exist.
+ *
+ * So an ambient car is now TWO layers on one panner, the same split the
+ * player's own car uses and for the same reason:
+ *
+ *   engine  `veh/engine-idle`, rate and level from the gear model, so a car
+ *           idling at a red light is audibly idling and one pulling away
+ *           audibly climbs and shifts;
+ *   tyres   `veh/engine-far`, level and rate from ROAD SPEED alone, so it is
+ *           silent at a standstill and dominant at 50 km/h.
+ *
+ * They diverge on every gearchange, which is the whole point - see the note on
+ * `tyre-roll` in the manifest. It costs two nodes per voice over the one-layer
+ * version; the voice count and the pool ceiling are unchanged in kind.
+ */
+
 /**
  * Rate an ambient car's tyre-roll loop is played back at.
  *
- * Ambient traffic gets one loop rather than the two-layer engine, because it is
- * always heard through a panner at 15 m or more where the layering is inaudible
- * and the voice budget is what matters. Pitch still tracks speed, so a car
- * pulling away from a light is audibly doing so, and the class shifts the whole
- * window - a box truck is a bigger, slower-turning thing than a hatchback and
- * has to sound like one from across the street too.
+ * ROAD SPEED, never revs. The class shifts the whole window - a box truck is a
+ * bigger, slower-turning thing than a hatchback and has to sound like one from
+ * across the street too.
  */
 export function ambientRate(speed: number, profile: EngineProfile = DEFAULT_PROFILE): number {
   const window = profile.idleRateBase / DEFAULT_PROFILE.idleRateBase;
@@ -401,27 +428,66 @@ export function ambientRate(speed: number, profile: EngineProfile = DEFAULT_PROF
 }
 
 /**
- * Level of an ambient car's loop from its speed.
+ * Speed, m/s, at which an ambient car's tyre layer is at full level.
  *
- * A queueing car is not silent - it is idling - but a moving one is much more
- * present, which is what makes a junction audibly release when the light goes
- * green. Scaled by the class weight so a truck is heard over a hatchback.
+ * Lower than the player's own `TYRE_FULL_SPEED` because ambient traffic in a
+ * 30 km/h city never reaches motorway pace: at 26 m/s the layer would still be
+ * at a fifth of its level everywhere the player actually hears it.
+ */
+const AMBIENT_TYRE_FULL_SPEED = 14;
+
+/**
+ * Level of an ambient car's TYRE layer from its speed.
+ *
+ * Zero below the onset speed: a stopped car makes no tyre noise, and the
+ * engine layer below is what keeps it audible at a red light. Squared for the
+ * same reason the player's own tyre layer is - tyre roar is close to a power
+ * law in road speed, and a linear ramp reads as a fade rather than as speed.
  */
 export function ambientLevel(speed: number, profile: EngineProfile = DEFAULT_PROFILE): number {
-  return (0.22 + 0.78 * clamp01(Math.abs(speed) / 12)) * profile.level;
+  const through = clamp01(
+    (Math.abs(speed) - TYRE_ONSET_SPEED) / (AMBIENT_TYRE_FULL_SPEED - TYRE_ONSET_SPEED),
+  );
+  return through * through * profile.level;
+}
+
+/**
+ * Rate and level of an ambient car's ENGINE layer.
+ *
+ * Both come off the same `gearFor` model the player's car uses, so ambient
+ * traffic shifts where the player's car shifts and a hatchback buzzing through
+ * four short gears still sounds nothing like a truck lugging through two. The
+ * level floor is well clear of zero on purpose: an idling engine at a junction
+ * is the sound this whole layer exists to restore.
+ */
+export function ambientEngine(
+  speed: number,
+  profile: EngineProfile = DEFAULT_PROFILE,
+): { readonly rate: number; readonly level: number; readonly rev: number } {
+  const { rev } = gearFor(speed, profile);
+  return {
+    rate: profile.idleRateBase + profile.idleRateSpan * rev,
+    level: (0.52 + 0.48 * rev) * profile.level,
+    rev,
+  };
 }
 
 /**
  * Lowpass corner, Hz, for an ambient car of this class.
  *
- * The pool shares ONE recording - five sources is the budget, and an
- * `AudioBufferSourceNode` cannot change its buffer - so the class has to come
- * from the filter and the rate rather than from a different file. A box truck
- * heard across a junction is almost entirely low rumble; a coupe going past is
- * mostly the top of its exhaust.
+ * ONE filter for both layers, because they are one car: the corner is the
+ * class's colour rather than the throttle's, and a truck heard across a
+ * junction is almost entirely low rumble where a coupe going past is mostly
+ * the top of its exhaust. It opens with the revs so an accelerating car
+ * brightens, which is what makes a car pulling away read as pulling away
+ * rather than as merely getting louder.
  */
-export function ambientCutoff(profile: EngineProfile = DEFAULT_PROFILE): number {
-  return profile.cutoffBase + profile.cutoffPerRev * 0.35;
+export function ambientCutoff(
+  profile: EngineProfile = DEFAULT_PROFILE,
+  speed = 0,
+): number {
+  const { rev } = gearFor(speed, profile);
+  return profile.cutoffBase + profile.cutoffPerRev * (0.3 + 0.5 * rev);
 }
 
 /**

@@ -58,12 +58,38 @@ export const PEDESTRIAN_VAT_BASE = 'models/pedestrians';
 /**
  * Characters the CITY crowd draws from.
  *
- * Four, unchanged, and deliberately so: this is the roster whose cost was
- * measured in `docs/pedestrian-characters.md` at +6 draw calls and +0.27 ms
- * over the procedural crowd, downtown, with 266 people in view. Adding to it
- * is a measured decision, not a free one.
+ * ELEVEN, up from four. The four originals were kept at four because the cost
+ * was measured - `docs/pedestrian-characters.md` records +6 draw calls and
+ * +0.27 ms over the procedural crowd, downtown, with 266 people in view - and
+ * because there was nothing else street-shaped to add: the other seven
+ * characters in the repository were generated as AIR TRAVELLERS and are drawn
+ * by the terminal.
+ *
+ * Seven more were generated for the street itself, and body shape now repeats
+ * every eleventh person rather than every fourth. The batch was chosen for
+ * silhouette rather than for faces, because silhouette is what reads at the
+ * distance a pedestrian is actually seen from: a dock worker in overalls, a
+ * cafe worker in an apron, a cyclist, a woman in a full-length summer dress, a
+ * construction worker in a hard hat, a man in a loose linen suit and a woman in
+ * a t-shirt and shorts.
+ *
+ * Order matters. `loadCharacters` walks this list a few at a time, so the first
+ * entries are the ones a player sees soonest on a cold connection; the four
+ * originals lead because they are already the smallest files.
  */
-export const CITY_VAT_IDS: readonly string[] = ['ped-a', 'ped-b', 'ped-c', 'ped-d'];
+export const CITY_VAT_IDS: readonly string[] = [
+  'ped-a',
+  'ped-b',
+  'ped-c',
+  'ped-d',
+  'ped-m',
+  'ped-t',
+  'ped-r',
+  'ped-o',
+  'ped-s',
+  'ped-p',
+  'ped-q',
+];
 
 /**
  * Characters generated for the airport, in preference order.
@@ -111,7 +137,7 @@ export const AIRPORT_VAT_IDS: readonly string[] = [
  *   - the terminal vantage was measured submitting about 330 calls, against
  *     which seven characters (fourteen with shadows) is under five per cent.
  */
-export const CITY_ROSTER_BUDGET = 4;
+export const CITY_ROSTER_BUDGET = 11;
 export const TERMINAL_ROSTER_BUDGET = 7;
 
 /**
@@ -136,6 +162,16 @@ export const VAT_STATURE: Readonly<Record<string, number>> = {
   'ped-i': 1.66,
   'ped-k': 1.88,
   'ped-l': 1.7,
+  // The street batch. Same reasoning: the generator drew a stocky docker and a
+  // slight young woman, and leaving both to the crowd's own 1.54-1.92 m draw
+  // throws that away every second person.
+  'ped-m': 1.78,
+  'ped-o': 1.66,
+  'ped-p': 1.76,
+  'ped-q': 1.68,
+  'ped-r': 1.75,
+  'ped-s': 1.82,
+  'ped-t': 1.63,
 };
 
 /**
@@ -149,6 +185,12 @@ export const VAT_STATURE: Readonly<Record<string, number>> = {
  */
 export const VAT_FOOTPRINT: Readonly<Record<string, number>> = {
   'ped-f': 1.3,
+  /*
+   * The floor-length summer dress. Measured 0.288 units front to back against
+   * the batch's 0.203-0.253, which is between the norm and `ped-f`'s coat at
+   * 0.322 - so it gets the same treatment, scaled: 1.3 x 0.288 / 0.322.
+   */
+  'ped-q': 1.15,
 };
 
 /**

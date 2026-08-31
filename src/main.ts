@@ -32,6 +32,7 @@ import { SignalHeads } from './city/SignalHeads';
 import { StreetAudio } from './audio/StreetAudio';
 import { CombatAudio, type FlightSound } from './audio/CombatAudio';
 import { PoliceAudio } from './audio/PoliceAudio';
+import { CrowdVoice } from './audio/CrowdVoice';
 import { HEAT, MAX_HEALTH, PlayerState, WEAPONS, type WeaponId } from './player/PlayerState';
 import { GunShop } from './shop/GunShop';
 import { Furnishings } from './world/furnishings/Furnishings';
@@ -426,6 +427,9 @@ async function boot(): Promise<void> {
   pedestrians.onImpact = (hit) => {
     driving.reportImpact(hit.speed, hit.dirX, hit.dirZ);
     player.addHeat(HEAT.vehicleImpact);
+    // Somebody standing near it says what anybody would. Placed on the person
+    // who was hit, which is where every head on the pavement has just turned.
+    crowdVoice.react('shove', hit.x, hit.y + 1.5, hit.z);
   };
 
   // Traffic brakes for people who are actually on a crossing. The array is
@@ -447,6 +451,15 @@ async function boot(): Promise<void> {
    * sound like the same physics rather than three unrelated systems.
    */
   traffic.onImpact = (info) => streetAudio.impact(info);
+
+  /*
+   * The city with its mouth open.
+   *
+   * Deliberately after `streetAudio` and before the police system exists: this
+   * layer only needs the bus host, and everything it says is handed to it per
+   * frame rather than wired to a system, so it has no dependency on either.
+   */
+  const crowdVoice = new CrowdVoice(audio);
 
   const interactions = new InteractionSystem(sink.interactions);
   const minimap = new Minimap(plan);
@@ -739,7 +752,13 @@ async function boot(): Promise<void> {
     // one person. Raised once per trigger pull and once per detonation, and
     // safe for a round that hit nothing at all.
     alarmAt: (x: number, z: number, radius?: number) => {
-      pedestrians.alarmAt(x, z, radius);
+      const heard = pedestrians.alarmAt(x, z, radius);
+      // Somebody who heard it says so. Only when there is actually a crowd to
+      // shout: gunfire in an empty street is loud enough on its own, and the
+      // voice layer's own cooldown keeps a burst to one shout rather than
+      // thirty. The line is placed on the gunshot rather than on a particular
+      // person because the crowd does not publish who reacted.
+      if (heard > 0) crowdVoice.react('gun', x, 1.6, z);
     },
   });
 
@@ -1047,6 +1066,15 @@ async function boot(): Promise<void> {
     if (event.code === 'KeyM') {
       minimap.setExpanded(!minimap.expanded);
       audio.playOneShot('ui-tick');
+    } else if (
+      minimap.expanded &&
+      (event.code === 'Equal' || event.code === 'NumpadAdd' ||
+        event.code === 'Minus' || event.code === 'NumpadSubtract')
+    ) {
+      // Keyboard zoom beside the wheel, because a trackpad's wheel is a
+      // coarse, accelerating thing and picking a step with it is a fight.
+      const inward = event.code === 'Equal' || event.code === 'NumpadAdd';
+      if (minimap.zoomBy(inward ? 1 : -1)) audio.playOneShot('ui-tick');
     } else if (event.code === 'F3' || event.code === 'Backquote') {
       // macOS binds F3 to Mission Control, so the key never reaches the page.
       // Backquote needs no Fn modifier and is free on every layout we target.
@@ -1061,6 +1089,26 @@ async function boot(): Promise<void> {
   });
 
   let statsVisible = false;
+
+  /*
+   * The wheel zooms the map while the map is open, and selects a weapon the
+   * rest of the time.
+   *
+   * CAPTURE, and `stopPropagation`. The weapon selector listens on the canvas
+   * and the map overlay is a click-through layer above it, so without this the
+   * same scroll would zoom the map AND cycle the player's weapon behind it.
+   * Capturing on the window runs before the canvas's own listener, which is
+   * the only place that can stop it.
+   */
+  window.addEventListener(
+    'wheel',
+    (event: WheelEvent) => {
+      if (!minimap.expanded || event.deltaY === 0) return;
+      event.stopPropagation();
+      if (minimap.zoomBy(event.deltaY < 0 ? 1 : -1)) audio.playOneShot('ui-tick');
+    },
+    { capture: true },
+  );
 
   // -- frame loop ------------------------------------------------------------
 
@@ -1244,6 +1292,17 @@ async function boot(): Promise<void> {
       units: police.pursuitAudio,
     });
 
+    // What anybody is actually SAYING. Both inputs are reused arrays rebuilt
+    // by their owners this frame and are never retained past this call.
+    crowdVoice.update(dt, {
+      x: state.x,
+      y: state.y,
+      z: state.z,
+      indoors: state.indoors,
+      police: police.voiceCues,
+      conversations: pedestrians.conversations,
+    });
+
     // Chunk visibility is cheap but pointless to recompute every frame.
     chunkTimer += dt;
     if (chunkTimer > 0.25) {
@@ -1306,6 +1365,25 @@ async function boot(): Promise<void> {
 
   // -- start -----------------------------------------------------------------
 
+  /*
+   * PUT THE CAMERA WHERE THE PLAYER WILL BE, BEFORE ANYTHING IS DRAWN.
+   *
+   * `PerspectiveCamera` starts at the world origin, and the controller only
+   * writes the camera inside `update`, which does not run until the frame loop
+   * starts. The warm-up renders below therefore drew the city from (0, 0, 0) -
+   * which on Harbour Walk is several metres UNDER the pavement - and that
+   * framebuffer is exactly what the loading screen fades away to reveal. The
+   * result was a second or more of the city seen from beneath the ground on
+   * every cold start, with the buildings apparently floating over a flat sky.
+   *
+   * `update(0)` runs no simulation: the accumulator cannot reach a fixed step
+   * with a zero delta, so this only writes the camera from the spawn pose the
+   * constructor already resolved against collision. It also means the warm-up
+   * frames compile the programs the FIRST REAL VANTAGE needs rather than the
+   * ones visible from under the map, which is what they are there for.
+   */
+  controller.update(0);
+
   // Compile every shader while the loading screen is still up.
   //
   // Three.js compiles a material's program the first time it actually renders,
@@ -1343,7 +1421,21 @@ async function boot(): Promise<void> {
   await loading.awaitStart();
   loading.hide();
 
-  // The queue above, released now that nothing is racing the first frame.
+  /*
+   * FRAMES FIRST.
+   *
+   * Everything below this point is an AudioContext or a download, and every
+   * `await` among them is time the screen spends showing the last frame drawn
+   * behind the loading screen rather than a live city. `unlock()` alone waits
+   * on `AudioContext.resume`, which on a cold profile is not instant. Starting
+   * the loop here costs nothing - the audio layer is inert until it is
+   * unlocked and every system already tolerates being asked for a frame before
+   * its assets land - and it is what makes the fade reveal a moving city.
+   */
+  engine.start();
+  controller.requestPointerLock();
+
+  // The queue above, released now that the first frame is scheduled.
   for (const start of afterStart) start();
 
   // The start click is the user gesture that lets us create the AudioContext.
@@ -1355,12 +1447,12 @@ async function boot(): Promise<void> {
   // A line of dialogue that arrives after the subtitle has gone is worse than
   // no line at all, so every recording is decoded before the first one plays.
   dialogue.preload();
+  // Same argument for a shout: an officer whose "stop right there" lands two
+  // seconds after they drew on you has said nothing at all.
+  crowdVoice.preload();
   for (const person of missionCast) void person.character.load(person.id);
   hud.setMusicEnabled(audio.musicEnabled);
   pause.setMusicEnabled(audio.musicEnabled);
-
-  engine.start();
-  controller.requestPointerLock();
 
   window.addEventListener('beforeunload', () => {
     engine.dispose();
@@ -1381,6 +1473,7 @@ async function boot(): Promise<void> {
     streetAudio.dispose();
     combatAudio.dispose();
     policeAudio.dispose();
+    crowdVoice.dispose();
     damageFeedback.dispose();
     dialogue.dispose();
     mapObserver.disconnect();
@@ -1723,6 +1816,22 @@ async function boot(): Promise<void> {
       /** Airport terminal population, for automated QA. */
       get travellers(): unknown {
         return terminal.stats;
+      },
+      /**
+       * Live mixer state, for automated QA.
+       *
+       * `street.trafficVoices` is the one that answers "can the player hear the
+       * cars": it counts the ambient voices actually holding a vehicle this
+       * tick, which is what a screenshot can never show.
+       */
+      get audio(): unknown {
+        return {
+          unlocked: audio.unlocked,
+          musicEnabled: audio.musicEnabled,
+          street: streetAudio.stats,
+          voices: crowdVoice.stats,
+          conversations: pedestrians.conversations.length,
+        };
       },
       /** Whether the world is currently frozen behind a menu. */
       get paused(): boolean {
