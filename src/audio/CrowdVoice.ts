@@ -395,13 +395,16 @@ export class CrowdVoice {
     const pool = CHATTER[best.speaker % CHATTER.length];
     if (!pool) return;
     const id = this.pick(pool, memory.last);
-    memory.line = best.line;
-    this.groups.set(best.id, memory);
     if (!id) return;
     if (!this.play(id, best.x, best.y, best.z, CHATTER_LEVEL, CHATTER_REF, CHATTER_RADIUS, false)) {
       return;
     }
+    // Consumed only once the line has actually started. Marking the hand-over
+    // before that would have a group silently skip a sentence whenever the
+    // voice budget happened to be full at the moment it changed speaker.
+    memory.line = best.line;
     memory.last = id;
+    this.groups.set(best.id, memory);
     this.chatterGap = CHATTER_GAP;
     this.counts.chatter += 1;
   }
