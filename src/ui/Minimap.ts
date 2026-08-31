@@ -585,11 +585,21 @@ export class Minimap {
     this.disposed = true;
     window.removeEventListener('resize', this.onResize);
     document.body.classList.remove(BODY_MAP_OPEN);
-    // Release the raster memory; a detached canvas of 0x0 frees its backing store.
+    /*
+     * Release the raster memory; a detached canvas of 0x0 frees its backing
+     * store. ALL FOUR of them: the static layer and the cache are the big two,
+     * but the overlay canvas is now allowed to reach the five-megapixel
+     * budget - 20 MB on its own - and zeroing only the offscreen pair left
+     * that and the dial allocated for as long as anything held the instance.
+     */
     this.staticLayer.width = 0;
     this.staticLayer.height = 0;
     this.expandedCache.width = 0;
     this.expandedCache.height = 0;
+    this.overlayCanvas.width = 0;
+    this.overlayCanvas.height = 0;
+    this.dial.width = 0;
+    this.dial.height = 0;
     this.element.remove();
   }
 

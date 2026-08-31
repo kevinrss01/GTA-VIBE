@@ -17,7 +17,6 @@
 import {
   BackSide,
   Color,
-  EquirectangularReflectionMapping,
   Mesh,
   PMREMGenerator,
   Scene,
@@ -26,6 +25,7 @@ import {
   Vector3,
   type Texture,
   type WebGLRenderer,
+  type WebGLRenderTarget,
 } from 'three';
 
 /**
@@ -204,6 +204,26 @@ const FRAGMENT_SHADER = /* glsl */ `
 
     colour += dither(dir.xz * 512.0) * (1.4 / 255.0);
     gl_FragColor = vec4(colour, 1.0);
+
+    /*
+     * THE SAME OUTPUT PATH EVERY OTHER MATERIAL TAKES.
+     *
+     * The stops above are authored in sRGB and converted to linear, which is
+     * correct - and this shader then wrote them straight to the framebuffer,
+     * skipping the ACES curve and the linear-to-sRGB conversion that
+     * MeshStandardMaterial gets for free. The result was a sky rendered
+     * about a stop and a half dark and noticeably more saturated than the
+     * values it was authored from, and - worse - a sky that could not match
+     * the scene fog at the horizon, which is the one thing the top of this
+     * file says must never happen: the fog colour goes through the standard
+     * path and the sky did not.
+     *
+     * ShaderMaterial gets toneMapping() and linearToOutputTexel() in its
+     * prefix from WebGLProgram; only the two call sites have to be written
+     * out, which is what these chunks are.
+     */
+    #include <tonemapping_fragment>
+    #include <colorspace_fragment>
   }
 `;
 
@@ -216,7 +236,8 @@ export class Sky {
   private readonly material: ShaderMaterial;
   private readonly geometry: SphereGeometry;
   private readonly radius: number;
-  private environment: Texture | null = null;
+  /** Held so `dispose` can release the framebuffer, not only its texture. */
+  private target: WebGLRenderTarget | null = null;
 
   /*
    * DEFAULT RADIUS: INSIDE THE CAMERA'S FAR PLANE, AND THAT IS THE WHOLE POINT.
@@ -248,15 +269,31 @@ export class Sky {
       depthWrite: false,
       fog: false,
       uniforms: {
-        // Clear summer sky: a deep blue zenith falling to a pale, slightly
-        // warm haze at the horizon. The warm stop is kept - a sky that goes
-        // grey at the horizon reads as overcast, not as a hot day.
-        uZenith: { value: linear(0x2f6ec2) },
-        uUpper: { value: linear(0x5192d6) },
-        uMid: { value: linear(0x87b6df) },
-        uLower: { value: linear(0xb9d3e6) },
-        uHorizonWarm: { value: linear(0xd8e3e8) },
-        uHorizon: { value: linear(0xe6edef) },
+        /*
+         * Clear summer sky: a deep blue zenith falling to a pale, slightly
+         * warm haze at the horizon. The warm stop is kept - a sky that goes
+         * grey at the horizon reads as overcast, not as a hot day.
+         *
+         * DEEPER THAN THE SAMPLED VALUES, ON PURPOSE. These now go through
+         * ACES and the 1.15 exposure like every other surface in the game -
+         * see the output chunks at the end of the fragment shader - and ACES
+         * lifts and desaturates a mid blue hard: the sampled 0x2f6ec2 zenith
+         * came out as a pale wash barely distinguishable from the haze below
+         * it. Each stop is pushed down and in so that what LANDS ON SCREEN is
+         * the colour the art brief sampled.
+         *
+         * uHorizon is the exception and stays exactly HORIZON_COLOR: the scene
+         * fog is built from the same constant and goes through the same curve,
+         * so equal inputs are what makes the two meet invisibly at the
+         * horizon. Deepening it here would break the one property the top of
+         * this file says must never break.
+         */
+        uZenith: { value: linear(0x11439c) },
+        uUpper: { value: linear(0x2f6ec2) },
+        uMid: { value: linear(0x5f9ad2) },
+        uLower: { value: linear(0x9cc2df) },
+        uHorizonWarm: { value: linear(0xc9dae2) },
+        uHorizon: { value: linear(HORIZON_COLOR) },
         uSunGlow: { value: linear(0xfff6e6) },
         uSunDirection: { value: SUN_DIRECTION.clone() },
         uHaze: { value: 1.0 },
@@ -269,7 +306,7 @@ export class Sky {
          * the city lit rather than overcast.
          */
         uCloudLit: { value: linear(0xfdfaf4) },
-        uCloudShade: { value: linear(0xb4c3d2) },
+        uCloudShade: { value: linear(0x93a8bd) },
         uCloudCover: { value: 0.46 },
         uTime: { value: 0 },
       },
@@ -321,8 +358,17 @@ export class Sky {
     // up lit by the sun and the hemisphere only, with a black environment -
     // which reads as a scene with crushed, lifeless shadows.
     const target = pmrem.fromScene(scene, 0.04, 1, this.radius * 2);
-    target.texture.mapping = EquirectangularReflectionMapping;
-    this.environment = target.texture;
+    /*
+     * THE MAPPING IS NOT OURS TO SET. `fromScene` returns a CubeUV ATLAS and
+     * has already tagged it `CubeUVReflectionMapping`; the renderer picks its
+     * sampling path from that tag. Overwriting it with
+     * `EquirectangularReflectionMapping` - which this used to do - told every
+     * PBR shader in the city to read a packed cube atlas as a latitude and
+     * longitude image, so every reflection in the game was sampling the wrong
+     * texels. It went unnoticed for as long as the sky dome itself was clipped
+     * away and there was nothing recognisable in the reflection to be wrong.
+     */
+    this.target = target;
 
     scene.remove(dome);
     pmrem.dispose();
@@ -332,7 +378,13 @@ export class Sky {
   dispose(): void {
     this.geometry.dispose();
     this.material.dispose();
-    this.environment?.dispose();
-    this.environment = null;
+    /*
+     * The RENDER TARGET, not just its texture. `WebGLRenderTarget.dispose`
+     * releases the framebuffer and its depth renderbuffer as well; disposing
+     * only `target.texture` left both allocated on the GPU for the life of the
+     * context, which a hot reload or a second `createEnvironment` accumulates.
+     */
+    this.target?.dispose();
+    this.target = null;
   }
 }

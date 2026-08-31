@@ -377,7 +377,7 @@ describe('crowd and police voices', () => {
       host.finish();
       const last = host.played[host.played.length - 1];
       if (last) said.push(last);
-      tick(voice, host, 2.5, {});
+      tick(voice, host, 3.5, {});
     }
     expect(said.length).toBeGreaterThan(4);
     for (let i = 1; i < said.length; i += 1) expect(said[i]).not.toBe(said[i - 1]);
@@ -448,7 +448,7 @@ describe('crowd and police voices', () => {
     voice.react('gun', 3, 1.6, 0);
     expect(host.played[0]?.startsWith('vox/react-gun')).toBe(true);
     host.finish();
-    tick(voice, host, 2, {});
+    tick(voice, host, 3, {});
     voice.react('shove', 3, 1.6, 0);
     expect(host.played[1]?.startsWith('vox/react-shove')).toBe(true);
     voice.dispose();
@@ -512,6 +512,77 @@ describe('crowd and police voices', () => {
     // that is shipped and never played is 40 KB of dead weight.
     const shipped = AUDIO_ASSETS.filter((a) => a.id.startsWith('vox/')).map((a) => a.id);
     expect([...host.requested].sort()).toEqual([...shipped].sort());
+    voice.dispose();
+  });
+
+  it('never lets two lines of the same kind overlap', () => {
+    /*
+     * "One line at a time per category" is only true if the gap is longer than
+     * the longest recording in the pool - the police pool reaches 2.833 s and
+     * the reactions 1.858 s, so a 2.2 s gap started a second shout over the
+     * first. Asserted against the manifest's own measured durations so a
+     * longer line cannot be added without the gap moving with it.
+     */
+    const longest = (prefix: string): number =>
+      AUDIO_ASSETS.filter((a) => a.id.startsWith(prefix)).reduce(
+        (worst, a) => Math.max(worst, a.duration),
+        0,
+      );
+    /*
+     * Measured off the behaviour rather than read off the constants: fire the
+     * category every frame for ten seconds and record the context time of
+     * every line that actually started. The smallest interval between two of
+     * them is the gap the mixer really enforces.
+     */
+    const smallestGap = (kind: 'police' | 'react'): number => {
+      const host = new FakeHost();
+      const voice = new CrowdVoice(host);
+      const police = kind === 'police' ? [challengeAt(5, 0)] : [];
+      const starts: number[] = [];
+      let seen = 0;
+      // EXACTLY ONE `update` per iteration: the gaps count down inside it, so
+      // a second call would halve every interval this is trying to measure.
+      for (let i = 0; i < 300; i += 1) {
+        host.currentTime += 1 / 30;
+        voice.update(1 / 30, { ...LISTENER, police, conversations: [] });
+        if (kind === 'react') voice.react('gun', 3, 1.6, 0);
+        if (host.played.length > seen) {
+          seen = host.played.length;
+          starts.push(host.currentTime);
+        }
+        // Every line ends the instant it is allowed to, so the voice budget
+        // can never be what is spacing them - only the category gap can be.
+        host.finish();
+      }
+      voice.dispose();
+      expect(starts.length).toBeGreaterThan(2);
+      let worst = Infinity;
+      for (let i = 1; i < starts.length; i += 1) {
+        worst = Math.min(worst, (starts[i] as number) - (starts[i - 1] as number));
+      }
+      return worst;
+    };
+
+    expect(smallestGap('police')).toBeGreaterThan(longest('vox/pol-'));
+    expect(smallestGap('react')).toBeGreaterThan(longest('vox/react-'));
+  });
+
+  it('does not shout a radio call across the district', () => {
+    /*
+     * `maxDistance` on an inverse panner CLAMPS the attenuation, it does not
+     * cut the source off - so a radio cue placed on a unit two hundred metres
+     * away was held at the floor and was perfectly audible. A radio call is
+     * placed on the nearest UNIT, which early in a pursuit can be exactly that
+     * far off.
+     */
+    const host = new FakeHost();
+    const voice = new CrowdVoice(host);
+    voice.update(1 / 30, {
+      ...LISTENER,
+      police: [{ kind: 'radio', x: 200, y: 1.6, z: 0 }],
+      conversations: [],
+    });
+    expect(host.played).toHaveLength(0);
     voice.dispose();
   });
 
