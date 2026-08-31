@@ -179,6 +179,11 @@ const SURFACE_IMPACT: Readonly<Record<MaterialKey, ImpactKind>> = {
   glass: 'glass',
   glassDark: 'glass',
   glassShop: 'glass',
+  // Behind the glass. A round that reaches a shop interior has already gone
+  // through a pane, and what it then hits is plaster and shelving.
+  shopWall: 'concrete',
+  shopFitting: 'timber',
+  shopGoods: 'timber',
   lampGlass: 'glass',
   signalLens: 'glass',
   signEmissive: 'glass',

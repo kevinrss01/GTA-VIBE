@@ -250,7 +250,11 @@ describe('building geometry', () => {
       const keys = new Set(sink.geometries.map((entry) => entry.key));
       // One geometry per material key, never one per window.
       expect(sink.geometries.length, `${parcel.id} did not merge`).toBe(keys.size);
-      expect(sink.geometries.length, `${parcel.id} uses too many materials`).toBeLessThanOrEqual(14);
+      // Raised from 14 when shopfronts gained an interior: a shop street
+      // building now also carries the three keys behind its glass. Still one
+      // draw call per key for the whole building, which is the property this
+      // is guarding.
+      expect(sink.geometries.length, `${parcel.id} uses too many materials`).toBeLessThanOrEqual(17);
     }
   });
 

@@ -421,9 +421,29 @@ export type PedState = 'walk' | 'wait' | 'cross' | 'pause' | 'down';
  */
 const CHAT_RADIUS = 3.2;
 const CHAT_RECRUIT_RADIUS = 2.4;
-/** Seconds a conversation lasts, before either party has to be somewhere. */
-const CHAT_SECONDS_MIN = 9;
-const CHAT_SECONDS_MAX = 22;
+/**
+ * Seconds a conversation lasts, before either party has to be somewhere.
+ *
+ * BOUNDED BY AN INVARIANT, not by taste. `watchStall` deliberately polices
+ * only `walk` and `cross` - standing still is a decision, not a failure - so
+ * nothing else in the crowd will ever move a person who is talking, and
+ * `tests/crowdCorners.test.ts` holds the whole crowd to nobody standing still
+ * for thirty seconds. A conversation can be entered by somebody who has
+ * already been paused for up to 6.5 s, so the ceiling here plus that has to
+ * stay clear of thirty: 17 + 6.5 leaves six seconds of margin.
+ */
+const CHAT_SECONDS_MIN = 8;
+const CHAT_SECONDS_MAX = 17;
+/**
+ * Seconds before somebody who has just finished a conversation may start
+ * another.
+ *
+ * Without it the same person can pause, talk for seventeen seconds, walk two
+ * steps, pause again and talk for another seventeen - which breaks the thirty
+ * second invariant by chaining rather than by any single conversation, and
+ * also reads as two people who cannot say goodbye.
+ */
+const CHAT_COOLDOWN = 30;
 /** Seconds one person holds the floor before the other answers. */
 const CHAT_TURN_MIN = 2.6;
 const CHAT_TURN_MAX = 4.6;
@@ -607,6 +627,8 @@ export interface Pedestrian {
    * moments in the middle of a sentence.
    */
   chat: number;
+  /** Seconds before this person may join another conversation. */
+  chatCooldown: number;
   /** Where along the current link a waiting pedestrian stands. */
   waitAlong: number;
   /** Walk cycle position in [0, 1). */
@@ -1119,6 +1141,7 @@ export class Crowd {
       timer: 0,
       waitAlong: 0,
       chat: 0,
+      chatCooldown: 0,
       phase: 0,
       gait: 0,
       cadenceNow: 1,
@@ -1677,7 +1700,7 @@ export class Crowd {
    */
   private formConversation(ped: Pedestrian, ctx: CrowdContext): void {
     if (this.chats.length >= MAX_CONVERSATIONS || ped.chat !== 0) return;
-    if (ped.state !== 'pause' || ped.retire !== RETIRE_NONE) return;
+    if (ped.state !== 'pause' || ped.retire !== RETIRE_NONE || ped.chatCooldown > 0) return;
     // See CHAT_FORM_RADIUS: the budget is spent where it can be experienced.
     const outX = ped.x - ctx.x;
     const outZ = ped.z - ctx.z;
@@ -1688,6 +1711,7 @@ export class Crowd {
     for (const other of this.peds) {
       if (other === ped || !other.active) continue;
       if (other.chat !== 0 || other.retire !== RETIRE_NONE || other.alarm > 0) continue;
+      if (other.chatCooldown > 0) continue;
       // Only somebody standing on a pavement with nowhere urgent to be. A
       // walker may be hailed; a person waiting at a kerb, crossing a road or
       // lying on the ground may not.
@@ -1795,6 +1819,7 @@ export class Crowd {
     for (const member of [chat.a, chat.b]) {
       if (member.chat !== chat.id) continue;
       member.chat = 0;
+      member.chatCooldown = CHAT_COOLDOWN;
       if (member.state === 'pause') {
         member.state = 'walk';
         member.timer = 0;
@@ -2360,6 +2385,7 @@ export class Crowd {
 
     ped.dodge = Math.max(0, ped.dodge - dt);
     ped.crossCooldown = Math.max(0, ped.crossCooldown - dt);
+    if (ped.chat === 0) ped.chatCooldown = Math.max(0, ped.chatCooldown - dt);
     ped.alarm = Math.max(0, ped.alarm - dt);
     const staggerBefore = ped.stagger;
     ped.stagger = Math.max(0, ped.stagger - dt);
