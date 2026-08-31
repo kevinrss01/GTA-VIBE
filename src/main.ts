@@ -36,7 +36,7 @@ import { CrowdVoice } from './audio/CrowdVoice';
 import { HEAT, MAX_HEALTH, PlayerState, WEAPONS, type WeaponId } from './player/PlayerState';
 import { GunShop } from './shop/GunShop';
 import { Furnishings } from './world/furnishings/Furnishings';
-import { loadStreetPropModels } from './world/furnishings/StreetProps';
+import { loadStreetPropModels, STREET_PROP_MODEL_COUNT } from './world/furnishings/StreetProps';
 import { CombatSystem } from './combat/CombatSystem';
 import { CrowdTargets } from './combat/CrowdTargets';
 import { WorldRayIndex } from './combat/rays';
@@ -55,11 +55,11 @@ import {
 import { RUNWAY, TERMINAL, TERMINAL_FLOOR } from './world/airport/layout';
 import { GATE_SEATS, TERMINAL_QUEUES } from './world/airport/plan';
 import { buildAirport } from './world/airport';
-import { loadAirportModels } from './world/airport/models';
+import { loadAirportModels, AIRPORT_MODEL_COUNT } from './world/airport/models';
 import { TerminalCrowd } from './agents/travellers';
 import { insetRect } from './core/mathx';
 import { AircraftAudio } from './audio/AircraftAudio';
-import { loadVehicleModels } from './traffic/VehicleModels';
+import { loadVehicleModels, VEHICLE_MODEL_COUNT } from './traffic/VehicleModels';
 import { CollisionWorld } from './player/Collision';
 import { FirstPersonController } from './player/FirstPersonController';
 import { Driving } from './player/Driving';
@@ -156,7 +156,7 @@ async function boot(): Promise<void> {
   const loading = new LoadingScreen(import.meta.env.BASE_URL);
   document.body.appendChild(loading.element);
 
-  loading.setProgress(0.04, 'Planning Meridian Bay');
+  loading.beginPhase('plan');
   await nextFrame();
 
   const plan = getCityPlan();
@@ -176,23 +176,23 @@ async function boot(): Promise<void> {
 
   const sink = new WorldSink();
 
-  loading.setProgress(0.14, 'Laying out the streets');
+  loading.beginPhase('streets');
   await nextFrame();
   for (const street of plan.streets) buildStreet(street, plan, sink);
   buildIntersections(plan, sink);
   for (const block of plan.blocks) buildBlockGround(block, plan, sink);
 
-  loading.setProgress(0.4, 'Raising the buildings');
+  loading.beginPhase('buildings');
   await nextFrame();
   for (const parcel of plan.parcels) buildBuilding(parcel, sink);
 
-  loading.setProgress(0.62, 'Fitting out the interiors');
+  loading.beginPhase('interiors');
   await nextFrame();
   for (const parcel of plan.parcels) {
     if (parcel.enterable) buildInterior(parcel, sink);
   }
 
-  loading.setProgress(0.70, 'Grading the airfield');
+  loading.beginPhase('airfield');
   await nextFrame();
   /*
    * Everything airside in one call: the platform, the runway and its markings,
@@ -210,12 +210,12 @@ async function boot(): Promise<void> {
    */
   buildAirport(plan, ground, sink);
 
-  loading.setProgress(0.76, 'Dressing the streets');
+  loading.beginPhase('dressing');
   await nextFrame();
   scatterStreetProps(plan, sink);
   buildEnvironment(sink, ground);
 
-  loading.setProgress(0.84, 'Loading generated assets');
+  loading.beginPhase('assets');
   await nextFrame();
 
   const models = new ModelLibrary();
@@ -236,30 +236,91 @@ async function boot(): Promise<void> {
    * and awaited below, after the geometry that does not depend on them is
    * built.
    */
-  const streetModelsPromise = loadStreetPropModels(import.meta.env.BASE_URL);
-  const airportModelsPromise = loadAirportModels(import.meta.env.BASE_URL);
+  /*
+   * THE ONE PHASE THAT IS COUNTED RATHER THAN PREDICTED.
+   *
+   * Every other phase is CPU work whose share of the boot is stable enough to
+   * predict from the measurements in `LoadingScreen`. This one is a download,
+   * and it is the phase that decides whether a load takes a second or forty:
+   * on this machine, warm, it is a fifth of a 1.3 s boot, and cold over the
+   * internet it is most of the wait. A prediction is worth nothing here, so
+   * the bar is driven by files that have actually arrived.
+   *
+   * `PerformanceObserver` rather than a callback threaded through three
+   * loaders: every one of these files is an ordinary GLB fetch, the browser
+   * already times all of them, and the totals come from the loaders' own
+   * manifests so adding a prop cannot silently make the bar lie. The
+   * pedestrian characters are excluded because they are downloaded by the
+   * crowd, which does not start until the phase after this one.
+   */
+  const assetFileTotal =
+    STREET_PROP_MODEL_COUNT + AIRPORT_MODEL_COUNT + VEHICLE_MODEL_COUNT + 2;
+  let assetFilesIn = 0;
+  let assetWatch: PerformanceObserver | null = null;
+  if (typeof PerformanceObserver === 'function') {
+    try {
+      assetWatch = new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) {
+          if (!entry.name.includes('/models/')) continue;
+          if (entry.name.includes('/models/pedestrians/')) continue;
+          assetFilesIn += 1;
+        }
+        loading.reportPhase(assetFilesIn, assetFileTotal);
+      });
+      assetWatch.observe({ type: 'resource', buffered: false });
+    } catch {
+      // No resource timing: the phase falls back to its predicted glide, which
+      // is what every other phase uses anyway.
+      assetWatch = null;
+    }
+  }
+  /*
+   * A floor under the count, so the bar cannot stall on a browser that
+   * withholds resource timing or on a file served from the memory cache
+   * without an entry: whatever the observer has seen, a whole group landing is
+   * worth at least its share of the phase.
+   */
+  const ASSET_GROUPS = 5;
+  let assetGroupsIn = 0;
+  const assetLanded = <T,>(promise: Promise<T>): Promise<T> =>
+    promise.then((value) => {
+      assetGroupsIn += 1;
+      loading.reportPhase(
+        Math.max(assetFilesIn, (assetGroupsIn / ASSET_GROUPS) * assetFileTotal),
+        assetFileTotal,
+      );
+      return value;
+    });
+
+  const streetModelsPromise = assetLanded(loadStreetPropModels(import.meta.env.BASE_URL));
+  const airportModelsPromise = assetLanded(loadAirportModels(import.meta.env.BASE_URL));
   // The generated street lamp is normalised to 1 unit tall with a centre pivot;
   // ModelLibrary rescales it to a real 4.2 m and moves the origin to its base.
   // Loaded together, not one after the other: they are independent, and
   // serialising them made the slower of the two set the whole loading time.
   const [lamp, fountain, vehicleModels] = await Promise.all([
-    models.load('streetLamp', {
-      url: `${import.meta.env.BASE_URL}models/street-lamp/model.glb`,
-      targetHeight: 4.2,
-      timeoutMs: 15000,
-    }),
-    models.load('fountain', {
-      url: `${import.meta.env.BASE_URL}models/fountain/model.glb`,
-      targetHeight: 2.1,
-      timeoutMs: 15000,
-    }),
+    assetLanded(
+      models.load('streetLamp', {
+        url: `${import.meta.env.BASE_URL}models/street-lamp/model.glb`,
+        targetHeight: 4.2,
+        timeoutMs: 15000,
+      }),
+    ),
+    assetLanded(
+      models.load('fountain', {
+        url: `${import.meta.env.BASE_URL}models/fountain/model.glb`,
+        targetHeight: 2.1,
+        timeoutMs: 15000,
+      }),
+    ),
     // The fleet: ten generated bodies and one generated wheel, fitted to the
     // simulation's own chassis sizes. Null falls the renderer back to the
     // authored shells rather than emptying the streets.
-    loadVehicleModels({ baseUrl: import.meta.env.BASE_URL, timeoutMs: 20000 }),
+    assetLanded(loadVehicleModels({ baseUrl: import.meta.env.BASE_URL, timeoutMs: 20000 })),
   ]);
 
   const [streetModels, airportModels] = await Promise.all([streetModelsPromise, airportModelsPromise]);
+  assetWatch?.disconnect();
 
   const propGeometry = new Map<PropKey, PropPart[]>();
   for (const key of ALL_PROP_KEYS) {
@@ -282,7 +343,7 @@ async function boot(): Promise<void> {
   for (const [key, parts] of streetModels.parts) propGeometry.set(key, parts as PropPart[]);
   for (const [key, parts] of airportModels.parts) propGeometry.set(key, parts as PropPart[]);
 
-  loading.setProgress(0.92, 'Baking the city');
+  loading.beginPhase('bake');
   await nextFrame();
 
   const { group, chunks } = sink.bake(materials, propGeometry);
@@ -316,7 +377,7 @@ async function boot(): Promise<void> {
   const collision = new CollisionWorld(sink.colliders);
   lighting.setLightRequests(sink.lights);
 
-  loading.setProgress(0.94, 'Waking the city');
+  loading.beginPhase('wake');
   await nextFrame();
 
   // The movement graph every moving thing shares: lanes for vehicles,
@@ -1395,18 +1456,42 @@ async function boot(): Promise<void> {
   //
   // Compiling here moves the stall behind the progress bar, where a pause is
   // expected. It changes nothing about what is drawn.
-  loading.setProgress(0.97, 'Compiling shaders');
+  loading.beginPhase('shaders');
   await nextFrame();
-  try {
-    // Guarded: `compileAsync` resolves via KHR_parallel_shader_compile, and a
-    // driver that never reports readiness would otherwise hang the boot.
-    await Promise.race([
-      engine.renderer.compileAsync(engine.scene, engine.camera),
-      new Promise((resolve) => setTimeout(resolve, 8000)),
-    ]);
-  } catch {
-    // A failed pre-compile costs a stutter, not a broken game: the programs
-    // are built lazily on first render exactly as they were before.
+  /*
+   * ONE OBJECT AT A TIME, not the whole scene in one call.
+   *
+   * Compiling the scene in a single `compileAsync` is one await that resolves
+   * when everything is done, and this is the longest phase of the boot - a
+   * quarter of it, measured - so a single await is a quarter of the wait with
+   * nothing to report. `compileAsync` takes the object to precompile as its
+   * FIRST argument and the scene to take the lighting context from as its
+   * third, so the same work can be done group by group and counted.
+   *
+   * The deadline is shared across the whole loop rather than given to each
+   * call: the guard exists because a driver that never reports readiness
+   * through `KHR_parallel_shader_compile` would otherwise hang the boot, and
+   * that budget is for the phase, not for each of a dozen objects.
+   */
+  const compileTargets = [...engine.scene.children];
+  // Plus the two warm-up frames below, which are part of the same phase.
+  const compileSteps = compileTargets.length + 2;
+  const compileDeadline = performance.now() + 8000;
+  let compiled = 0;
+  for (const target of compileTargets) {
+    if (performance.now() < compileDeadline) {
+      try {
+        await Promise.race([
+          engine.renderer.compileAsync(target, engine.camera, engine.scene),
+          new Promise((resolve) => setTimeout(resolve, compileDeadline - performance.now())),
+        ]);
+      } catch {
+        // A failed pre-compile costs a stutter, not a broken game: the
+        // programs are built lazily on first render exactly as they were.
+      }
+    }
+    compiled += 1;
+    loading.reportPhase(compiled, compileSteps);
   }
 
   // `compileAsync` walks the scene's own materials, which leaves the shadow
@@ -1415,10 +1500,11 @@ async function boot(): Promise<void> {
   // measured, this is the difference between 12 of 14 programs ready and all
   // of them. The frames land under the loading overlay, so nothing is seen.
   engine.renderer.render(engine.scene, engine.camera);
+  loading.reportPhase(compileSteps - 1, compileSteps);
   await nextFrame();
   engine.renderer.render(engine.scene, engine.camera);
 
-  loading.setProgress(1, 'Ready');
+  loading.finish();
   await loading.awaitStart();
   loading.hide();
 

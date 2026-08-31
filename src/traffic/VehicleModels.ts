@@ -143,6 +143,9 @@ const WHEEL_ASSET = {
   outerFaceTowardsMax: true,
 };
 
+/** How many files this loader will fetch. See `STREET_PROP_MODEL_COUNT`. */
+export const VEHICLE_MODEL_COUNT = Object.keys(VEHICLE_BODY_ASSETS).length + 1;
+
 /** Surface values used where the generated maps do not reach. */
 const GENERATED_BODY: SurfaceStyle = { albedo: 0xffffff, roughness: 0.35, metalness: 0.0 };
 /**

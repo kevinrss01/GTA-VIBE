@@ -69,6 +69,16 @@ const MODELS: Readonly<Partial<Record<PropKey, StreetPropModel>>> = {
 };
 
 /**
+ * How many files this loader will fetch.
+ *
+ * Exported so the boot can show REAL download progress: the loading screen
+ * counts arrivals against the total, and the total has to come from the
+ * manifest rather than from a number typed somewhere else that would rot the
+ * first time a prop is added.
+ */
+export const STREET_PROP_MODEL_COUNT = Object.keys(MODELS).length;
+
+/**
  * Rotation that turns a model's forward axis onto the props' own convention of
  * facing -Z. Solving `rotationY(t) * front == (0, 0, -1)` gives these four and
  * nothing else.

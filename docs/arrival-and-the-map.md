@@ -124,3 +124,109 @@ click-through layer above it, so without a capturing listener on the window the
 same scroll would zoom the map **and** cycle the player's weapon behind it.
 `main.ts` captures and stops propagation while the map is open, which is the
 only place that can.
+
+## "Make the percentage real, so the wait is less annoying"
+
+### What was happening
+
+The bar was **eleven hand-picked fractions**. `main.ts` called
+`setProgress(0.22, 'Raising the buildings')` and so on, and the numbers had been
+chosen by feel. Measured against the clock on a cold production load, they were
+not close:
+
+| Phase | Bar showed | Really took | Share of the wait |
+| --- | --- | --- | --- |
+| Planning Meridian Bay | 0 – 8 % | 1.11 s | 9 % |
+| Raising the buildings | 22 – 44 % | 1.08 s | 9 % |
+| Downloading assets | 74 – 86 % | 0.53 s | 4 % |
+| **Compiling shaders** | **97 – 100 %** | **3.90 s** | **33 %** |
+
+A third of the wait was spent watching a bar that said it had finished. That is
+the part a player feels: the number is not just wrong, it is wrong in the
+direction that makes the last third feel like a hang.
+
+### Why a fixed weighting does not fix it either
+
+The obvious repair - weight each phase by the seconds in that table - was
+tried, and it is wrong for a reason worth writing down. **The phases do not
+scale together.** The same production build, measured cold and then warm on the
+same machine:
+
+| | Cold | Warm | Ratio |
+| --- | --- | --- | --- |
+| Build loops (`plan` … `wake`) | 8.1 s | 0.27 s | **30x** |
+| Download (`assets`) | 0.53 s | 0.02 s | 26x |
+| Shader compile | 3.90 s | 1.70 s | **2.3x** |
+
+A weighting that is right cold gives the compile 33 per cent of the bar; warm,
+the compile is 85 per cent of a 2 s load and the bar races to 67 per cent in a
+quarter of a second and then sits there. Both are the same lie with different
+numbers. And a download is 0.02 s on localhost and can be most of a minute on a
+hotel connection, which no fixed weighting survives at all.
+
+### What it does now
+
+**Position is time, not phases.** `elapsed / (elapsed + remaining)`, rebuilt
+from scratch on every update. A machine five times slower reads the same
+percentage at the same point in its own boot, which is the only definition of
+"real progress" that survives leaving this laptop.
+
+**Remaining is learned, per kind of work.** Each phase is tagged `cpu`, `net`
+or `gpu`, and the estimator keeps a separate speed for each: seconds really
+taken over seconds the prior expected, clamped to 0.1x - 8x. This is the
+correction that mattered. A single factor learned from the build loops was
+applied to the shader compile too, and per the table above they do not share a
+bottleneck - the bar raced to two thirds and then sat there for the whole
+compile. `tests/loadingScreen.test.ts` pins it: run every CPU phase at a
+hundredth of its prior and the bar must still be reserving most of itself for
+the compile that has not happened.
+
+**The two phases that can count themselves do.** Neither is predicted:
+
+- *Downloading generated assets* counts files off a `PerformanceObserver` on
+  `resource` entries under `/models/`, against a total taken from the model
+  tables (`STREET_PROP_MODEL_COUNT`, `AIRPORT_MODEL_COUNT`,
+  `VEHICLE_MODEL_COUNT`). A cache hit fires the same entry, so a warm load
+  counts to the same total rather than stalling.
+- *Compiling shaders* compiles object by object instead of the whole scene in
+  one call, reporting after each, so the phase that used to be a single
+  multi-second `await` now moves the bar about twenty times.
+
+An overrun in a counted phase pushes the whole estimate along: once a phase is
+5 per cent in, its own observed rate (`elapsed / fraction`) becomes a lower
+bound on what it will cost, so a slow download drags the rest of the bar out in
+front of it rather than piling up at one boundary.
+
+### The bar is a `transform`, and it has to be
+
+Almost all of this load is **synchronous main-thread work**. Nothing JavaScript
+writes can be painted while a build loop is running, so a bar animated with
+`width` - a layout property - freezes for a second at a time and then jumps.
+
+`transform: scaleX()` is animated **off the main thread**. One paint at a phase
+boundary starts a glide the compositor runs alone, and it keeps moving smoothly
+for the whole blocking phase behind it. That is the entire reason the bar looks
+alive, and it costs nothing.
+
+The number cannot ride the same animation: the compositor will not tell the
+main thread where a transition has got to, and `getComputedStyle().transform`
+does not reliably report one in flight - it was tried, and it froze the number
+at 0 per cent. So `value()` runs the same linear interpolation by hand from the
+same start, target and duration. Two clocks, agreeing to within a frame.
+
+### Verified
+
+Production build, cold profile, screenshots taken through a load with the
+browser pane fronted: `GRADING THE AIRFIELD 5%` → `DOWNLOADING GENERATED ASSETS
+7%` → `8%` → `10%` → `COMPILING SHADERS 13%` → `16%`, the gold bar advancing
+alongside the label the whole way, and no phase where the number stands still
+for more than about a second. The old bar reached 97 per cent before the
+longest phase started.
+
+### What is NOT asserted in the tests
+
+How the bar looks moving. jsdom has no compositor and no layout, so the unit
+tests pin the properties of the number - never backwards, never finished early,
+a phase cannot spend the next phase's share, and one kind of work is never
+predicted at another kind's speed. The smoothness is a browser judgement and it
+was made in one.

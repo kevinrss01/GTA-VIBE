@@ -96,6 +96,10 @@ const INTERIOR_MODELS: Readonly<Record<TerminalModelAnchor['model'], AirportMode
   'garment-bag': { file: 'garment-bag', axis: 'y', metres: 0.9, front: '-z' },
 };
 
+/** How many files this loader will fetch. See `STREET_PROP_MODEL_COUNT`. */
+export const AIRPORT_MODEL_COUNT =
+  Object.keys(PROP_MODELS).length + Object.keys(INTERIOR_MODELS).length;
+
 /**
  * Rotation that turns a model's forward axis onto the props' convention of
  * facing -Z. Solving `rotationY(t) * front == (0, 0, -1)` gives these four.
