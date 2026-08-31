@@ -187,3 +187,35 @@ It is now 13 steps and **ordered so the checks that need no travel come first** 
 the abandoned-car check happens near the spawn point, before the long drive, so
 a run that exhausts its budget on the way south still returns signal on one of
 the headline repairs.
+
+## Run of 2026-08-31 — the detail, avatars and voice workstream
+
+`3c3c8951` run alone against a production preview on `http://localhost:4183`,
+headed Chrome. **Six steps passed, none failed, and the run then stopped on the
+runner's own repetition guard** — `Repeated "ui_press:" 6 times in a row` while
+the agent was walking towards a parked car. `issues: []`.
+
+| step | result |
+| --- | --- |
+| Open the game and click through the gate | passed |
+| Street in daylight, blue sky, cash top right, Music: Off | passed |
+| Capture the mouse and walk forward | passed |
+| The view moved / the street name changed | passed |
+| Walk out to the nearest wide road and face along it | passed |
+| At least one car is on the road | passed |
+| *(find a parked car and drive it)* | runner stopped |
+
+**That is an agent-budget failure, not a product defect**, and it is the same
+place this test has stopped before: the run recorded on 2026-08-28 managed 5 of
+23 steps for the same reason. The local runner spends its action budget walking
+the city, and Meridian Bay is a big place to walk across with arrow keys.
+
+Two things worth recording for the next person:
+
+- **Run the tests one at a time, not the group.** A `--group` run starts both
+  tests against one headed Chrome; the mission test got 19 seconds and one step
+  before the two interfered. Run alone, the smoke test got six.
+- The step that matters most for this workstream — *"the view is a street in
+  daylight with a blue sky"* — passed, which is the first time it has been
+  asserted against a sky that is actually drawn. See section 3 of
+  `docs/art-direction.md`.
