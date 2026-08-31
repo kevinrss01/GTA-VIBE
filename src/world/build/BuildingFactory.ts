@@ -777,6 +777,7 @@ function shopInterior(
   y0: number,
   y1: number,
   front: number,
+  fittings: 'shop' | 'lobby' = 'shop',
 ): void {
   const width = a1 - a0;
   const height = y1 - y0;
@@ -829,6 +830,10 @@ function shopInterior(
     back + 0.08,
     front - 0.25,
   );
+
+  // A lobby is a desk and a lit wall, not a stockroom: shelves of goods behind
+  // the glass of a curtain-wall tower read as a warehouse in a bank.
+  if (fittings === 'lobby') return;
 
   // Shelving on the back wall, and stock on it. Two bands, because one reads
   // as a ledge and three read as a warehouse.
@@ -1454,6 +1459,14 @@ function emitGlazedBase(b: Building, side: Side, floorY: number, height: number,
     sideQuad(b.w, 'windowFrame', side, a0, a1, hole.y0, hole.y0 + 0.1, -0.24);
     sideQuad(b.w, 'windowFrame', side, a0, a1, hole.y1 - 0.1, hole.y1, -0.24);
     sideQuad(b.w, 'windowFrame', side, hole.along - 0.06, hole.along + 0.06, hole.y0, hole.y1, -0.24);
+    /*
+     * A LOBBY BEHIND THE GLASS, for the same reason a shop has a shop behind
+     * it - and here it is not only about the dead black rectangle. The wall
+     * panel has a hole punched through it, so a transparent pane over an empty
+     * building shows the BACK of the far wall, which is back-face culled: the
+     * opening reads as a hole straight through the tower.
+     */
+    shopInterior(b, side, a0, a1, hole.y0 + 0.1, hole.y1 - 0.1, -0.3, 'lobby');
     sideQuad(b.w, 'glassShop', side, a0, a1, hole.y0 + 0.1, hole.y1 - 0.1, -0.28);
   }
   // Base band, so the podium meets the pavement with a shadow line.

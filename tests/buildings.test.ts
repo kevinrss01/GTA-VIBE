@@ -258,6 +258,27 @@ describe('building geometry', () => {
     }
   });
 
+  it('never leaves a pane of glass with nothing behind it', () => {
+    /*
+     * `glassShop` is TRANSPARENT, which is what lets a shopfront show a shop.
+     * Every wall it sits in has a hole punched through it, so a pane with no
+     * interior behind it does not read as a dark window - it reads as a hole
+     * straight through the building, because the back of the far wall is
+     * back-face culled. Both places that use it therefore have to emit the
+     * room as well: `emitShopfront` a shop, `emitGlazedBase` a lobby.
+     */
+    let glazed = 0;
+    let lined = 0;
+    for (const { sink } of built) {
+      const keys = new Set(sink.geometries.map((entry) => entry.key));
+      if (!keys.has('glassShop')) continue;
+      glazed += 1;
+      if (keys.has('shopWall')) lined += 1;
+    }
+    expect(glazed, 'no building in the city is glazed at all').toBeGreaterThan(4);
+    expect(lined).toBe(glazed);
+  });
+
   it('offers exactly one door to every enterable building', () => {
     for (const { parcel, sink } of built) {
       const doors = sink.interactions.filter((point) => point.kind === 'door');
