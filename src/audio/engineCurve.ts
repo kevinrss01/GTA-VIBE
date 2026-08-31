@@ -270,20 +270,36 @@ export interface GearPoint {
  * gear sounds like.
  */
 export function gearFor(speed: number, profile: EngineProfile = DEFAULT_PROFILE): GearPoint {
+  return { gear: gearIndex(speed, profile), rev: gearRev(speed, profile) };
+}
+
+/** Which gear a road speed is in. Allocation-free half of `gearFor`. */
+function gearIndex(speed: number, profile: EngineProfile): number {
   const tops = profile.gearTops;
   const v = Math.abs(speed);
-  let gear = tops.length - 1;
   for (let i = 0; i < tops.length; i += 1) {
-    if (v <= (tops[i] as number)) {
-      gear = i;
-      break;
-    }
+    if (v <= (tops[i] as number)) return i;
   }
+  return tops.length - 1;
+}
+
+/**
+ * How far through its rev range a road speed sits, without allocating.
+ *
+ * `gearFor` returns a `GearPoint` object, which is the readable form and the
+ * one the tests assert on. The ambient traffic mixer calls this for seven
+ * voices EVERY FRAME, twice each, and two object literals per voice per frame
+ * is 2,500 short-lived objects a second at 120 Hz - which is exactly the
+ * per-frame allocation the engineering rules forbid in a simulation loop.
+ */
+export function gearRev(speed: number, profile: EngineProfile = DEFAULT_PROFILE): number {
+  const tops = profile.gearTops;
+  const gear = gearIndex(speed, profile);
   const top = tops[gear] as number;
   const bottom = gear === 0 ? 0 : (tops[gear - 1] as number);
   const floor = gear === 0 ? profile.revIdle : profile.revAfterShift;
-  const through = clamp01((v - bottom) / Math.max(1e-6, top - bottom));
-  return { gear, rev: floor + (1 - floor) * through };
+  const through = clamp01((Math.abs(speed) - bottom) / Math.max(1e-6, top - bottom));
+  return floor + (1 - floor) * through;
 }
 
 export interface EngineTone {
@@ -460,16 +476,34 @@ export function ambientLevel(speed: number, profile: EngineProfile = DEFAULT_PRO
  * level floor is well clear of zero on purpose: an idling engine at a junction
  * is the sound this whole layer exists to restore.
  */
+export interface AmbientEngine {
+  rate: number;
+  level: number;
+  rev: number;
+}
+
+/**
+ * Writes into `out` rather than returning, for the reason `gearRev` exists:
+ * this is called per voice per frame. The convenience form below allocates and
+ * is for tests and for anything that is not in the frame loop.
+ */
+export function ambientEngineInto(
+  speed: number,
+  profile: EngineProfile,
+  out: AmbientEngine,
+): AmbientEngine {
+  const rev = gearRev(speed, profile);
+  out.rev = rev;
+  out.rate = profile.idleRateBase + profile.idleRateSpan * rev;
+  out.level = (0.52 + 0.48 * rev) * profile.level;
+  return out;
+}
+
 export function ambientEngine(
   speed: number,
   profile: EngineProfile = DEFAULT_PROFILE,
-): { readonly rate: number; readonly level: number; readonly rev: number } {
-  const { rev } = gearFor(speed, profile);
-  return {
-    rate: profile.idleRateBase + profile.idleRateSpan * rev,
-    level: (0.52 + 0.48 * rev) * profile.level,
-    rev,
-  };
+): AmbientEngine {
+  return ambientEngineInto(speed, profile, { rate: 1, level: 0, rev: 0 });
 }
 
 /**
@@ -482,11 +516,12 @@ export function ambientEngine(
  * brightens, which is what makes a car pulling away read as pulling away
  * rather than as merely getting louder.
  */
-export function ambientCutoff(
-  profile: EngineProfile = DEFAULT_PROFILE,
-  speed = 0,
-): number {
-  const { rev } = gearFor(speed, profile);
+export function ambientCutoff(profile: EngineProfile = DEFAULT_PROFILE, speed = 0): number {
+  return ambientCutoffAt(profile, gearRev(speed, profile));
+}
+
+/** The same corner from a rev the caller has already computed. */
+export function ambientCutoffAt(profile: EngineProfile, rev: number): number {
   return profile.cutoffBase + profile.cutoffPerRev * (0.3 + 0.5 * rev);
 }
 

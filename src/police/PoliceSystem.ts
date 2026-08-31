@@ -1440,20 +1440,28 @@ export class PoliceSystem implements LawTargets {
       return;
     }
 
-    if (this.pursuedNow && !this.wasPursued && this.radioTimer <= 0) {
+    /*
+     * THE EDGE IS ONLY CONSUMED ONCE IT HAS BEEN SPOKEN.
+     *
+     * `wasPursued` used to be assigned unconditionally, which meant an edge
+     * that arrived inside the radio cooldown was thrown away rather than
+     * deferred: break line of sight within twelve seconds of the opening call
+     * and the "we've lost visual" line could never be said, because by the
+     * time the cooldown expired there was no edge left to detect.
+     */
+    if (this.pursuedNow !== this.wasPursued && this.radioTimer <= 0) {
       const unit = this.nearestUnit(ctx);
       if (unit) {
         this.radioTimer = RADIO_COOLDOWN;
-        this.cues.push({ kind: 'radio', x: unit.x, y: unit.handle.view.y + 1, z: unit.z });
-      }
-    } else if (!this.pursuedNow && this.wasPursued && this.radioTimer <= 0) {
-      const unit = this.nearestUnit(ctx);
-      if (unit) {
-        this.radioTimer = RADIO_COOLDOWN;
-        this.cues.push({ kind: 'lost', x: unit.x, y: unit.handle.view.y + 1, z: unit.z });
+        this.cues.push({
+          kind: this.pursuedNow ? 'radio' : 'lost',
+          x: unit.x,
+          y: unit.handle.view.y + 1,
+          z: unit.z,
+        });
+        this.wasPursued = this.pursuedNow;
       }
     }
-    this.wasPursued = this.pursuedNow;
 
     /*
      * A CAR TELLS YOU TO PULL OVER; A MAN ON FOOT TELLS YOU TO GET DOWN.
@@ -1465,37 +1473,63 @@ export class PoliceSystem implements LawTargets {
      * the car's own PA, from further out - a loudhailer carries, and a driver
      * is inside a car with the windows up.
      */
+    /*
+     * ONE ORDER PER FRAME, AND ONLY THAT SPEAKER'S TIMER IS STARTED.
+     *
+     * The audio layer plays at most one police line per frame and drops the
+     * rest, so emitting a cue for every eligible officer meant four of them
+     * arriving together produced one line and then EIGHT SECONDS OF SILENCE,
+     * because all four had started their cooldown for a line only one of them
+     * got to say. Starting the clock on the officer who actually spoke lets
+     * the cordon alternate at the mixer's own two-second cadence, which is
+     * what `OFFICER_VOICE_COOLDOWN` was tuned against.
+     *
+     * The nearest eligible speaker wins, so the order comes from the officer
+     * the player can actually see.
+     */
     if (ctx.driving) {
+      let best: Unit | null = null;
+      let bestDistance = UNIT_VOICE_RANGE;
       for (const unit of this.units) {
         unit.voiceTimer = Math.max(0, unit.voiceTimer - dt);
         if (unit.state === 'wrecked' || unit.state === 'standdown') continue;
         if (!unit.seesPlayer || unit.voiceTimer > 0) continue;
         const distance = Math.hypot(ctx.playerX - unit.x, ctx.playerZ - unit.z);
-        if (distance > UNIT_VOICE_RANGE) continue;
-        unit.voiceTimer = OFFICER_VOICE_COOLDOWN;
+        if (distance > bestDistance) continue;
+        bestDistance = distance;
+        best = unit;
+      }
+      if (best) {
+        best.voiceTimer = OFFICER_VOICE_COOLDOWN;
         this.cues.push({
           kind: 'pullover',
-          x: unit.x,
-          y: unit.handle.view.y + 1.2,
-          z: unit.z,
+          x: best.x,
+          y: best.handle.view.y + 1.2,
+          z: best.z,
         });
       }
       return;
     }
 
+    let speaker: Officer | null = null;
+    let speakerDistance = OFFICER_VOICE_RANGE;
     for (const officer of this.officers) {
       officer.voiceTimer = Math.max(0, officer.voiceTimer - dt);
       if (officer.state !== 'chasing' || officer.down || !officer.seesPlayer) continue;
       if (officer.voiceTimer > 0) continue;
       const distance = Math.hypot(ctx.playerX - officer.x, ctx.playerZ - officer.z);
-      if (distance > OFFICER_VOICE_RANGE) continue;
-      officer.voiceTimer = OFFICER_VOICE_COOLDOWN;
+      if (distance > speakerDistance) continue;
+      speakerDistance = distance;
+      speaker = officer;
+    }
+    if (speaker) {
+      speaker.voiceTimer = OFFICER_VOICE_COOLDOWN;
       this.cues.push({
         kind: 'challenge',
-        x: officer.x,
+        x: speaker.x,
         // Mouth height, not foot height: the line is spatialised on the person.
-        y: officer.y + 1.6,
-        z: officer.z,
+        y: speaker.y + 1.6,
+        z: speaker.z,
       });
     }
   }

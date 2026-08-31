@@ -103,7 +103,8 @@
 import type { AudioBusHost } from './AudioDirector';
 import {
   ambientCutoff,
-  ambientEngine,
+  ambientCutoffAt,
+  ambientEngineInto,
   ambientLevel,
   ambientRate,
   engineProfileFor,
@@ -115,6 +116,7 @@ import {
   type EngineTone,
   type EngineVoice,
 } from './engineCurve';
+import type { AmbientEngine } from './engineCurve';
 import {
   ENGINE_VOICE_LAYERS,
   getAudioAsset,
@@ -649,8 +651,8 @@ export class StreetAudio {
   private doorCloseIn = -1;
 
   private readonly voices: TrafficVoice[] = [];
-  /** Bitfield of ambient-voice assets already asked for: 1 tyres, 2 engine. */
-  private voicesRequested = 0;
+  /** Scratch for `driveVoice`; see `ambientEngineInto`. Never retained. */
+  private readonly engineScratch: AmbientEngine = { rate: 1, level: 0, rev: 0 };
   private reassignIn = 0;
   private trafficScrubCooldown = 0;
   /** Vehicle ids the voices should hold, refreshed on the reassign tick. */
@@ -1169,12 +1171,14 @@ export class StreetAudio {
       voice.rate = rate;
       this.ramp(voice.source.playbackRate, rate, RATE_RAMP);
     }
-    const engine = ambientEngine(vehicle.speed, voice.profile);
+    // Reused scratch, consumed inside this call and never retained: this runs
+    // for every voice every frame. See `ambientEngineInto`.
+    const engine = ambientEngineInto(vehicle.speed, voice.profile, this.engineScratch);
     if (moved(engine.rate, voice.engineRate, RATE_EPSILON)) {
       voice.engineRate = engine.rate;
       this.ramp(voice.engine.playbackRate, engine.rate, RATE_RAMP);
     }
-    const cutoff = ambientCutoff(voice.profile, vehicle.speed);
+    const cutoff = ambientCutoffAt(voice.profile, engine.rev);
     if (moved(cutoff, voice.cutoff, FILTER_EPSILON)) {
       voice.cutoff = cutoff;
       this.ramp(voice.filter.frequency, cutoff, FILTER_RAMP);
@@ -1312,20 +1316,22 @@ export class StreetAudio {
     const idle = this.host.bufferFor(AMBIENT_ENGINE_SOUND);
     if (!roll || !idle) {
       /*
-       * Ask once per missing asset, not once per attempt: this runs on the
-       * reassignment tick and the ask is idempotent, so an unlatched request
-       * would queue four loads a second for as long as the decode took. The
-       * counter is per-asset rather than a single flag because the two arrive
-       * independently and losing one would silence a layer for the session.
+       * ASK AGAIN EVERY TIME ONE IS MISSING, AND NEVER LATCH.
+       *
+       * This used to set a flag the first time it asked, on the theory that
+       * the reassignment tick would otherwise queue four loads a second. It
+       * would not: `AudioDirector.requestAsset` returns immediately if the
+       * asset is resident and `load` hands back the in-flight promise if it is
+       * not, so a repeated ask is two map lookups.
+       *
+       * What the latch DID do was make a single transient failure permanent.
+       * A request issued before the context exists is a no-op; a fetch that
+       * 404s or a decode that throws leaves no buffer. Either way the flag was
+       * already set, nothing ever asked again, and the whole ambient traffic
+       * layer stayed silent for the rest of the session.
        */
-      if (!roll && (this.voicesRequested & 1) === 0) {
-        this.voicesRequested |= 1;
-        this.host.requestAsset(VEHICLE_SOUNDS.engineFar);
-      }
-      if (!idle && (this.voicesRequested & 2) === 0) {
-        this.voicesRequested |= 2;
-        this.host.requestAsset(AMBIENT_ENGINE_SOUND);
-      }
+      if (!roll) this.host.requestAsset(VEHICLE_SOUNDS.engineFar);
+      if (!idle) this.host.requestAsset(AMBIENT_ENGINE_SOUND);
       return null;
     }
 

@@ -838,9 +838,45 @@ describe('police voice cues', () => {
 
   it('drains the list every frame rather than growing it', () => {
     const { perFrame } = pursue(90);
-    // A cue is an EVENT. Four units of crew could legally all qualify on one
-    // frame; a list that was never cleared would run to hundreds.
-    expect(perFrame).toBeLessThan(12);
+    /*
+     * A cue is an EVENT, and at most one ORDER is emitted per frame however
+     * many officers qualify - the audio layer plays one police line per frame
+     * and drops the rest, so emitting four and starting four eight-second
+     * cooldowns produced one line and then eight seconds of silence. A radio
+     * call can land on the same frame, which is the only reason this is two.
+     */
+    expect(perFrame).toBeLessThanOrEqual(2);
+  });
+
+  it('still says it has lost you when sight breaks inside the radio cooldown', () => {
+    /*
+     * `wasPursued` used to be assigned whether or not the edge was spoken, so
+     * an acquisition and a loss inside one twelve-second `RADIO_COOLDOWN` left
+     * no edge to detect once the cooldown expired and the line could never be
+     * said. The edge is now consumed only by a cue that was actually emitted.
+     */
+    const player = new PlayerState();
+    const police = makeSystem({ player, fleet: new StubFleet(8) });
+    const at = onTheRoad();
+    const dt = 1 / 30;
+    const seen: string[] = [];
+    let time = 0;
+
+    const run = (x: number, z: number, seconds: number): void => {
+      for (let i = 0; i < Math.round(seconds / dt); i += 1) {
+        pinStars(player, 3);
+        police.update(dt, context(x, z, { time }));
+        for (const cue of police.voiceCues) seen.push(cue.kind);
+        time += dt;
+      }
+    };
+
+    run(at.x, at.z, 40);
+    expect(seen).toContain('radio');
+    // Still wanted, but far enough away that no unit can see them.
+    run(at.x + 400, at.z + 400, 40);
+    expect(seen).toContain('lost');
+    police.dispose();
   });
 });
 

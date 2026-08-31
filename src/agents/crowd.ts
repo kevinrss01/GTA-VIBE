@@ -484,6 +484,16 @@ const CHAT_TAKE_UP = 0.8;
  * consumer can tell "still the same sentence" from "somebody just started a
  * new one" without keeping a clock of its own.
  */
+/** The writable form of `CrowdConversation`, held in the publication pool. */
+interface MutableConversation {
+  id: number;
+  x: number;
+  y: number;
+  z: number;
+  speaker: number;
+  line: number;
+}
+
 export interface CrowdConversation {
   readonly id: number;
   readonly x: number;
@@ -937,7 +947,16 @@ export class Crowd {
   private readonly linkShare: Float32Array;
   /** Live conversations, and the published view of them. See `CrowdConversation`. */
   private readonly chats: Conversation[] = [];
-  private readonly chatViews: CrowdConversation[] = [];
+  /**
+   * The published list. Reused, and its entries come from `chatPool`.
+   *
+   * Both are reused rather than rebuilt: `conversations` is read once per
+   * frame by the audio layer, and ten object literals at 120 Hz is 1,200
+   * short-lived objects a second for a list nobody keeps.
+   */
+  private readonly chatViews: MutableConversation[] = [];
+  /** Grown to the high-water mark and never released; `chatViews` borrows it. */
+  private readonly chatPool: MutableConversation[] = [];
   private nextChatId = 1;
   /** People currently standing in each zone. Rebuilt every frame in `update`. */
   private readonly zoneCount = new Int32Array(PEDESTRIAN_ZONES.length);
@@ -1673,19 +1692,24 @@ export class Crowd {
    * a garbage-collection pause nobody asked for.
    */
   get conversations(): readonly CrowdConversation[] {
+    while (this.chatPool.length < this.chats.length) {
+      this.chatPool.push({ id: 0, x: 0, y: 0, z: 0, speaker: 0, line: 0 });
+    }
     this.chatViews.length = 0;
-    for (const chat of this.chats) {
+    for (let i = 0; i < this.chats.length; i += 1) {
+      const chat = this.chats[i];
+      const view = this.chatPool[i];
+      if (!chat || !view) continue;
       const talker = chat.side === 0 ? chat.a : chat.b;
-      this.chatViews.push({
-        id: chat.id,
-        x: talker.x,
-        // Mouth height rather than foot height, so the line is spatialised on
-        // the person and not on the pavement in front of them.
-        y: talker.y + 1.5,
-        z: talker.z,
-        speaker: chat.side === 0 ? chat.voiceA : chat.voiceB,
-        line: chat.line,
-      });
+      view.id = chat.id;
+      view.x = talker.x;
+      // Mouth height rather than foot height, so the line is spatialised on
+      // the person and not on the pavement in front of them.
+      view.y = talker.y + 1.5;
+      view.z = talker.z;
+      view.speaker = chat.side === 0 ? chat.voiceA : chat.voiceB;
+      view.line = chat.line;
+      this.chatViews.push(view);
     }
     return this.chatViews;
   }

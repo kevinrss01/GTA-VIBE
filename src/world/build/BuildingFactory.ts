@@ -1067,14 +1067,23 @@ function ghostSign(b: Building, side: Side, hole: Opening): void {
   const a1 = hole.along + hole.half;
   const height = hole.y1 - hole.y0;
   const border = Math.min(0.18, hole.half * 0.22);
+  /*
+   * OUT IS MEASURED OUTWARD, so a MORE NEGATIVE value is further INSIDE the
+   * building. The field sits at the back of the reveal and every painted
+   * detail has to come forward of it, not behind: putting the border at
+   * `out - 0.01` hid the entire sign behind its own background and left the
+   * flat panel this was meant to replace.
+   */
   const out = -0.1;
+  const paint = out + 0.012;
+  const overpaint = out + 0.024;
 
   // The painted field, then a border inset from it.
   sideQuad(b.w, b.palette.shutter, side, a0, a1, hole.y0, hole.y1, out);
-  sideQuad(b.w, b.palette.trim, side, a0, a1, hole.y1 - border, hole.y1, out - 0.01);
-  sideQuad(b.w, b.palette.trim, side, a0, a1, hole.y0, hole.y0 + border, out - 0.01);
-  sideQuad(b.w, b.palette.trim, side, a0, a0 + border, hole.y0, hole.y1, out - 0.01);
-  sideQuad(b.w, b.palette.trim, side, a1 - border, a1, hole.y0, hole.y1, out - 0.01);
+  sideQuad(b.w, b.palette.trim, side, a0, a1, hole.y1 - border, hole.y1, paint);
+  sideQuad(b.w, b.palette.trim, side, a0, a1, hole.y0, hole.y0 + border, paint);
+  sideQuad(b.w, b.palette.trim, side, a0, a0 + border, hole.y0, hole.y1, paint);
+  sideQuad(b.w, b.palette.trim, side, a1 - border, a1, hole.y0, hole.y1, paint);
 
   // Two bands where the lettering would be, at the proportions a painted sign
   // actually uses: a tall line high in the field and a shorter one under it.
@@ -1082,7 +1091,7 @@ function ghostSign(b: Building, side: Side, hole: Opening): void {
   const roll = hash2(a0, hole.y1, 97);
   const topY = hole.y0 + height * (0.58 + roll * 0.06);
   const lowY = hole.y0 + height * (0.3 + roll * 0.05);
-  sideQuad(b.w, b.palette.trim, side, a0 + inset, a1 - inset, topY, topY + height * 0.16, out - 0.02);
+  sideQuad(b.w, b.palette.trim, side, a0 + inset, a1 - inset, topY, topY + height * 0.16, overpaint);
   sideQuad(
     b.w,
     b.palette.trim,
@@ -1091,7 +1100,7 @@ function ghostSign(b: Building, side: Side, hole: Opening): void {
     a1 - inset - hole.half * 0.5,
     lowY,
     lowY + height * 0.1,
-    out - 0.02,
+    overpaint,
   );
 }
 

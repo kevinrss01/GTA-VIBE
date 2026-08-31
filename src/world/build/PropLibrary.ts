@@ -587,6 +587,50 @@ function lobeBlob(l: CanopyLobe): BufferGeometry {
   return g;
 }
 
+/**
+ * Flowers over a canopy.
+ *
+ * A city plants its street furniture, and the planters were foliage lumps with
+ * nothing in them. The blooms are the cheapest thing that reads as planting
+ * from a pavement: small icosahedra sitting ON the canopy hull rather than
+ * inside it, spread by the golden angle so they never land on a lattice, and
+ * biased to the sunward half of each lobe because that is where a real bedding
+ * plant flowers.
+ *
+ * Two colours, alternating, because one saturated colour repeated in every
+ * planter on every street reads as a decal. Deterministic in the prop's own
+ * coordinates, so every instance of a planter is the same planter - which is
+ * the whole point of instancing, and is why the variety has to come from the
+ * placement rather than from a per-instance roll.
+ *
+ * `count` blooms costs `count` icosahedra of 20 triangles each, merged into
+ * two geometries, on a prop whose ceiling is 400 triangles. Nine is 180.
+ */
+function addBlooms(set: PartSet, lobes: readonly CanopyLobe[], count: number, seed: number): void {
+  const cool: BufferGeometry[] = [];
+  const warm: BufferGeometry[] = [];
+  for (let i = 0; i < count; i += 1) {
+    const lobe = lobes[i % lobes.length];
+    if (!lobe) continue;
+    // A point on the unit sphere from the golden angle, kept to the upper half
+    // so nothing flowers out of the underside of the canopy.
+    const t = (i + 0.5) / count;
+    const y = 0.25 + t * 0.7;
+    const r = Math.sqrt(Math.max(0, 1 - y * y));
+    const a = i * GOLDEN_ANGLE + seed;
+    const size = 0.055 + ((i * 7 + seed) % 5) * 0.012;
+    const g = new IcosahedronGeometry(size, 0);
+    g.translate(
+      lobe.x + Math.cos(a) * r * lobe.rx * 0.92,
+      lobe.y + y * lobe.ry * 0.92,
+      lobe.z + Math.sin(a) * r * lobe.rz * 0.92,
+    );
+    (i % 2 === 0 ? cool : warm).push(g);
+  }
+  if (cool.length > 0) set.add('blossom', ...cool);
+  if (warm.length > 0) set.add('blossomWarm', ...warm);
+}
+
 /** Emits every lobe of a canopy under the right foliage key. */
 function addCanopyLobes(set: PartSet, lobes: readonly CanopyLobe[]): void {
   const light: BufferGeometry[] = [];
@@ -971,6 +1015,7 @@ function planter(set: PartSet): void {
   );
   set.add('gravel', boxOn(0.92, 0.05, 0.92, 0, 0.6, 0));
   addCanopyLobes(set, CANOPY_LOBES.planter);
+  addBlooms(set, CANOPY_LOBES.planter, 9, 17);
 }
 
 function acUnit(set: PartSet): void {

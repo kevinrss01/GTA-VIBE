@@ -85,7 +85,9 @@ export type MaterialKey =
   | 'foliageDark'
   | 'palmFrond'
   | 'barkPalm'
-  | 'barkTree';
+  | 'barkTree'
+  | 'blossom'
+  | 'blossomWarm';
 
 interface Spec {
   color: number;
@@ -270,12 +272,38 @@ const SPECS: Readonly<Record<MaterialKey, Spec>> = {
   palmFrond: { color: 0x5f7a3d, roughness: 0.9, side: DoubleSide },
   barkPalm: { color: 0x8a7a5e, roughness: 0.94 },
   barkTree: { color: 0x5b4a3a, roughness: 0.95 },
+  /*
+   * Bedding flowers, in two colours.
+   *
+   * TWO KEYS, WHICH IS TWO DRAW CALLS FOR THE WHOLE CITY, and worth it: one
+   * saturated colour repeated in every planter on every street reads as a
+   * decal rather than as planting. Warm against cool is also the pair that
+   * survives the tone map - a single mid-pink goes to mud in shadow and to
+   * white in the sun.
+   *
+   * Bright, and deliberately so. These are the only fully saturated albedos in
+   * the palette outside the signage, they cover a fraction of a square metre
+   * each, and a flower bed that is not brighter than the leaf behind it is
+   * just more leaf.
+   */
+  blossom: { color: 0xd4577f, roughness: 0.86 },
+  blossomWarm: { color: 0xe8a93c, roughness: 0.86 },
 };
 
-/** Keys whose geometry must be rendered after the opaque pass. */
+/**
+ * Keys whose geometry must be rendered after the opaque pass.
+ *
+ * ALSO THE SHADOW LIST. `WorldBuilder` clears `castShadow` for everything in
+ * here, because Three's shadow depth pass ignores material opacity: a
+ * transparent mesh that casts still lays down a SOLID silhouette. Leaving
+ * `glassShop` out when it became transparent put a hard black rectangle on the
+ * pavement in front of every shopfront in the city, and paid a shadow draw for
+ * it. Anything added to `SPECS` with `transparent: true` belongs here.
+ */
 export const TRANSPARENT_KEYS: ReadonlySet<MaterialKey> = new Set<MaterialKey>([
   'glass',
   'glassDark',
+  'glassShop',
   'foliage',
   'foliageDark',
   'palmFrond',

@@ -1004,6 +1004,14 @@ two come from different places for a structural reason: a unit only sets
 `holding` and lets its crew out when the player is NOT driving, so during a
 chase there is nobody on foot to shout anything.
 
+**One order per frame, from the nearest eligible speaker, and only that
+speaker's cooldown starts.** The mixer plays at most one police line per frame
+and drops the rest, so emitting a cue for every officer who qualified - and
+starting all four eight-second timers for a line only one of them got to say -
+produced one order and then eight seconds of silence. Starting the clock on the
+officer who actually spoke lets a cordon alternate at the mixer's own two-second
+cadence, which is what `OFFICER_VOICE_COOLDOWN` was tuned against.
+
 **What keeps it from becoming noise**, because a talking city is very easy to
 overdo: at most two lines in the air at once and never two from the same
 category; a global cooldown per category (2.2 s police, 5.5 s chatter, 1.6 s

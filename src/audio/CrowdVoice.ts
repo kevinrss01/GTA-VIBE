@@ -499,7 +499,17 @@ export class CrowdVoice {
     try {
       source.start();
     } catch {
+      /*
+       * A source that never started will never end, so `onended` will never
+       * run and `dispose` can no longer find it - which means the three nodes
+       * it is connected to would stay wired to the bus until the context
+       * closed. Everything is torn down here instead.
+       */
       this.shots.delete(shot);
+      source.onended = null;
+      this.disconnect(source);
+      this.disconnect(gain);
+      this.disconnect(panner);
       return false;
     }
     return true;
