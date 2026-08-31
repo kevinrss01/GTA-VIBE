@@ -179,8 +179,14 @@ const SURFACE_IMPACT: Readonly<Record<MaterialKey, ImpactKind>> = {
   glass: 'glass',
   glassDark: 'glass',
   glassShop: 'glass',
-  // Behind the glass. A round that reaches a shop interior has already gone
-  // through a pane, and what it then hits is plaster and shelving.
+  /*
+   * Behind the glass. NOT CURRENTLY REACHABLE, and the mapping is here because
+   * this table has to cover every `MaterialKey` rather than because a round
+   * lands on one: a shop interior is render geometry with no collider of its
+   * own, so `WorldRayIndex` resolves a shot through a shopfront against the
+   * building's outer box. If the interiors ever gain surfaces, plaster and
+   * shelving is what they should sound and spark like.
+   */
   shopWall: 'concrete',
   shopFitting: 'timber',
   shopGoods: 'timber',
@@ -209,6 +215,8 @@ const SURFACE_IMPACT: Readonly<Record<MaterialKey, ImpactKind>> = {
   palmFrond: 'foliage',
   barkPalm: 'timber',
   barkTree: 'timber',
+  blossom: 'foliage',
+  blossomWarm: 'foliage',
 };
 
 /** The impact a collider's declared surface produces, or the old default. */

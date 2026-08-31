@@ -240,7 +240,15 @@ export class WorldSink implements GeometrySink {
         // camera. Excluded for the same reason the sea is.
         const background = key === 'skyline';
         if (background) hasBackground = true;
-        mesh.castShadow = !TRANSPARENT_KEYS.has(key) && key !== 'water' && !background;
+        const casts = !TRANSPARENT_KEYS.has(key) && key !== 'water' && !background;
+        mesh.castShadow = casts;
+        // Remembered, because `setShadowsEnabled` turns shadows back on for a
+        // whole chunk and has no idea which of its meshes were never meant to
+        // cast one. Without this, walking away from a chunk and back put the
+        // sea, the skyline, the foliage and every pane of glass into the
+        // shadow pass - and a transparent mesh that casts lays down a SOLID
+        // silhouette, because the depth pass ignores opacity.
+        mesh.userData['casts'] = casts;
         // The sea must not receive shadows. It is one plane spanning far beyond
         // the shadow camera, so any sampling at its edge stains the whole bay.
         mesh.receiveShadow = key !== 'water';
@@ -362,7 +370,10 @@ export class WorldChunk {
     this.shadowsEnabled = enabled;
     this.group.traverse((child: Object3D) => {
       const mesh = child as Mesh;
-      if (mesh.isMesh) mesh.castShadow = enabled;
+      // `casts` is what this mesh may EVER do; `enabled` is whether the chunk
+      // is close enough to bother. A mesh with no flag has never been through
+      // the builder and is left alone.
+      if (mesh.isMesh) mesh.castShadow = enabled && mesh.userData['casts'] !== false;
     });
   }
 
