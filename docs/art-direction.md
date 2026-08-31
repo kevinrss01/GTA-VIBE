@@ -439,3 +439,95 @@ Effort: S = texture/decal/param, M = small mesh plus placement rule, L = system.
 5. Something overlaps the frame edge in the foreground.
 6. At least three depth layers with haze between them.
 7. A random one-second crop reads as a specific place, not a demo.
+
+---
+
+## 3. The sky, 2026-08-31
+
+### 3.1 The defect: it had never been drawn
+
+`Sky` builds a five-stop dithered gradient, a broad sun glow and a tighter
+core, on a dome of radius **4000 m**. `Engine`'s camera has a far plane of
+**1200 m**. The dome was outside it, was clipped in its entirety on every frame
+the game has ever rendered, and every sky pixel came from `scene.background` -
+a single flat `HORIZON_COLOR`.
+
+That is item one on the "what to avoid" list in section 2.9, and it was in the
+build the whole time. Nothing about it was visible in a screenshot review,
+because a flat pale sky under a hazy summer brief looks like a deliberate hazy
+summer sky.
+
+**The fix is the radius, and only the radius.** The dome follows the camera and
+is drawn first with `depthWrite: false` and `renderOrder: -1000`, so how far
+away it is has nothing to do with what it can occlude: everything in the world
+draws over it regardless of distance. It only has to be INSIDE the far plane.
+1000 m leaves 200 m of margin at the frustum corners.
+
+The image-based lighting was never affected: `createEnvironment` renders the
+same dome in its own scene with an explicit far plane of `radius * 2`, which is
+why the city's PBR surfaces have always been lit by a sky nobody could see.
+
+### 3.2 Clouds
+
+A cloudless gradient is the second tell in 2.9 and the sky is about a third of
+an outdoor frame, so the dome now carries broken cumulus:
+
+- **Projection.** A view direction is pierced through a horizontal plane above
+  the camera - `dir.xz / dir.y` - so cells compress towards the horizon the way
+  real ones do. The layer is faded out below 9 deg, where that compression turns
+  into aliasing AND where the fog has to match the sky exactly, and again above
+  72 deg where the projection stretches.
+- **Shape.** Three octaves of value noise, domain-warped by a fourth sample, so
+  the cells have torn edges rather than the smooth blobs a raw fbm gives.
+- **Light.** The same field sampled 0.35 units towards the sun stands in for
+  self-shadowing: where the sunward sample is thinner this is an edge and takes
+  the light, where it is thicker it is in shade. That one extra sample is the
+  whole difference between cumulus with volume and grey paint. A `cos^6` term
+  on the sun direction adds the silver lining.
+- **Motion.** A few metres per second at the notional altitude, from the same
+  `elapsed` clock everything else animates on. Item 20 on the ranked list is
+  "far-field motion... its absence is what makes worlds feel dead".
+
+Three octaves rather than four is a measured choice: the fourth contributes an
+amplitude of 0.0625 to a value that is then put through a `smoothstep` with a
+0.15 window, so it is worth about a third of a shade of grey and a quarter of
+the layer's cost.
+
+**Measured**, Harbourside promenade looking north-west over the bay, 1206 x 1968
+drawing buffer, 90 frames: mean 3.43 ms, median 3.30, p95 4.10, worst 4.60;
+323 draw calls; 172 MB. The sky is one draw call and the clouds are a fragment
+cost on it.
+
+### 3.3 Shopfronts
+
+Item 12 on the ranked list - "storefront interior parallax cards behind glass,
+removes dead black windows" - implemented as geometry rather than as a texture,
+because the city has no texture pipeline and a 0.85 m diorama is nine quads.
+
+Every shopfront bay now holds a closed box behind its glazing: back wall,
+floor, ceiling, two returns, a counter across the front third, two shelves of
+stock in alternating tones, and a warm strip light against the ceiling. The
+glass went from opaque near-black to a tinted transparent pane with a raised
+`envMapIntensity`, so it picks up the sky as well as showing the shop.
+
+The box is closed on every side on purpose: an open one shows the inside of the
+building's own shell at any angle off the perpendicular. At 0.85 m it is inside
+the wall and threshold zone of every archetype and can never meet an enterable
+building's real interior.
+
+The strip light matters more than it sounds. No light in this scene reaches
+through a 1 m opening in a facade, so without an emissive INSIDE the box every
+shop is a black room whatever colour its wall is.
+
+### 3.4 Ghost signs
+
+A party wall's blind bay - "the panel a real party wall carries a ghost sign
+on" - was filled edge to edge in the building's trim colour. On a four-storey
+flank that is a two-by-six-metre rectangle of flat grey in the middle of a
+coloured facade, and it reads as a texture that failed to load: the single
+largest untextured surface anywhere in the city.
+
+It is now a painted field with a border and two bands at the proportions a real
+painted sign uses, in colours the building already carries - six quads and no
+new material key. **No text is drawn**, here or anywhere else in the city, so
+nothing has to be invented, translated or licensed.

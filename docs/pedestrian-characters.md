@@ -444,24 +444,110 @@ An earlier three-character build measured the same way at 4.30 MP with 266
 people in view: 347/349/353 draw calls and 7.42/7.41/7.72 ms, so the cost is
 about 0.07 ms per additional character at this population.
 
+## The street batch
+
+A third batch, generated for the CITY rather than for the airport, because a
+player who asked for "more avatars, more different avatars" was looking at a
+crowd of four. The recipe is unchanged from the eleven above - same model, same
+`face_limit`, same `texture_quality`, same prompt shape, same flags, same slide
+gate - so only what differs is recorded here.
+
+The cast was chosen for SILHOUETTE, not for faces. Silhouette is what reads at
+the distance a pedestrian is actually seen from, and the four originals are
+four people in ordinary clothes with the same outline. These are a docker in
+overalls, a cafe worker in an apron, a cyclist in a jersey, a woman in a
+full-length summer dress, a construction worker in a hard hat, a man in a loose
+linen suit and a woman in a t-shirt and shorts.
+
+| id | who | seed | generation | prerigcheck | rig | walk retarget | idle retarget |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `ped-m` | stocky dock worker, orange overalls | 20260951 | `07e24c32-9982-4cc1-9e60-d6400c65530d` | `b1c79bcc-d928-4d6c-aec2-1b86740acb79` | `b715c56b-27db-4643-825f-c33f38c9c162` | `10a7a450-35c7-48f9-8639-65e8a0010f69` | `8610e891-c666-4fe1-8c49-c17221526ed6` |
+| `ped-o` | cafe worker, chef jacket and green apron | 20260953 | `25285a29-075c-4ba7-8a4d-c3110cd6b5c2` | `b3ff964a-9c03-40c5-b9e4-2680c0f16e10` | `6ab10ee1-104b-4739-a806-f1db581bf7e2` | `3bbb0681-14c8-422c-9bbd-fcf58889690f` | `39d4291a-e804-439b-abf0-79f33fc2660f` |
+| `ped-p` | cycle courier, red and black jersey | 20260954 | `bb64c1aa-bfd6-45d2-b78e-8c7b01db8984` | `76762188-7988-4c6a-8ea6-554e28dfb00f` | `c25cda93-0171-4182-89f2-54c590fcb187` | `d4b1343a-1b53-4fa9-901c-6779ca318fd2` | `72b1d070-c87d-4958-88b5-34bef2f5d745` |
+| `ped-q` | woman, floor-length floral dress, sun hat | 20260955 | `164a2102-2912-4e9b-aaaf-b523fecd6e0a` | `20d9f2fd-df07-4a15-941e-37c664c33080` | `6c8f37a8-8dea-4afd-9930-e6bf03309337` | `7c91b860-4eb5-47df-8eef-bf2cae139d33` | `4b272bdf-7764-49d2-a8c4-1b9a932f47c3` |
+| `ped-r` | construction worker, hi-vis and hard hat | 20260956 | `a19da3d8-8e2a-4e06-84a9-522e4eeee297` | `7277703d-3100-4eb0-be25-4b0c2becff30` | `8262e38b-2d02-45ac-8584-efd7e3183728` | `8190bd5f-65c1-49d7-9503-6b781cc07a43` | `f603a931-99cf-459c-9c6a-306d59cb230c` |
+| `ped-s` | man, pale linen suit, close-cropped hair | 20260957 | `cf1d5516-3be7-409b-813a-8d01fadce3b2` | `484639b7-9b41-4f74-b9d6-24cf39efcf70` | `49ef99aa-ffc9-496a-80b7-cc2a0655002f` | `074af5b3-247b-459a-9383-996c7bb79a86` | `ca7dc441-b1a1-4605-8f21-0508cd8a2341` |
+| `ped-t` | young woman, striped tee, denim shorts | 20260958 | `899a4718-b5df-4da4-92eb-494a5eda5c2c` | `0e0a93bc-4abb-494d-aea4-d74dbf83086e` | `c09b2e4c-1203-4256-8a66-84ef4cf270d9` | `60acbb9a-1767-440c-a227-6a46c8f197a5` | `1370d860-f6e1-4f64-9991-ef8ca1925746` |
+
+Every prerigcheck returned `riggable: true, rig_type: biped`, and all eight rigs
+in the batch passed `validate-rig` first try - "legacy anatomical skeleton, 16
+paired L/R bones" - including the woman in the floor-length dress, whose legs
+are not separated anywhere below the knee in the source mesh.
+
+### The one that was dropped, again
+
+**There is no `ped-n`.** An older man in a flat cap and a corduroy jacket was
+generated, rigged and retargeted, and his walk measured a worst-case sole
+excursion of **448 mm** on a 1.75 m person against the 420 mm `MAX_WALK_SLIP`
+gate. Following the `ped-j` precedent - a re-rig is pointless, because the
+retarget is deterministic given a model - he was REGENERATED on a different
+seed (20260962) with the coat shortened so the preset's leg sweep had less
+cloth to drag. That attempt measured **926 mm**, twice as bad, and was dropped.
+
+| attempt | generation | rig | walk | idle | worst slide |
+| --- | --- | --- | --- | --- | --- |
+| first | `c71beba9-a35f-4951-a3b9-5013c084f88c` | `efd55071-59f6-4d5f-9119-a55cfdf6e989` | `ba0eb85b-9b48-4f4f-ab50-3c925264b753` | `aeea90a6-5a77-4d3d-9a35-2165b328e93a` | 448 mm |
+| re-roll | `4dc3c1c7-4a57-4c44-b7e6-f3df11bceb50` | `58102f84-a31a-4f27-8087-bd1bf802810f` | `44b5e88e-71d5-4128-9122-172b2b4143f9` | `cc895955-aaf2-4301-a849-4ffa8f65aaf7` | 926 mm |
+
+That is **110 credits of negative result**, recorded so the next person does not
+spend them again. The gap in the letters is the record, not an oversight.
+
+### Runtime files
+
+| id | welded verts | triangles | VAT texture | `.bin` | `.jpg` | worst walk slide |
+| --- | --- | --- | --- | --- | --- | --- |
+| `ped-m` | 2003 | 2856 | 70 x 2003 | 1.64 MB | 49 KB | 167 mm |
+| `ped-o` | 2096 | 2796 | 70 x 2096 | 1.71 MB | 45 KB | 155 mm |
+| `ped-p` | 2037 | 2884 | 70 x 2037 | 1.66 MB | 51 KB | 89 mm |
+| `ped-q` | 2470 | 2922 | 70 x 2470 | 2.01 MB | 112 KB | **26 mm** |
+| `ped-r` | 2066 | 2936 | 70 x 2066 | 1.69 MB | 62 KB | 209 mm |
+| `ped-s` | 2132 | 2962 | 70 x 2132 | 1.74 MB | 43 KB | 161 mm |
+| `ped-t` | 3117 | 2878 | 70 x 3117 | 2.54 MB | 62 KB | 144 mm |
+
+**13.0 MB across seven characters.** Triangle counts run 2796-2962 against the
+shipped 2796-2990, so each costs exactly what an existing person does.
+
+`ped-q` is the best walk in the repository by a wide margin - 26 mm worst
+against a shipped range of 89 to 343 - which is not what anybody would have
+predicted from a floor-length dress. The skirt is one volume that swings as a
+unit, so there is no sole vertex to slide; the slide gate measures cloth here
+rather than feet. `ped-t` is the heaviest bake at 2.54 MB because her hair is
+modelled rather than implied, which costs 3,117 welded vertices against the
+batch's 2,003-2,470.
+
+### Spend
+
+| task | count | credits each | total |
+| --- | --- | --- | --- |
+| `text_to_model` | 9 | 20 | 180 |
+| `animate_prerigcheck` | 9 | 0 | 0 |
+| `animate_rig` | 9 | 25 | 225 |
+| `animate_retarget` | 18 | 10 | 180 |
+
+**585 credits.** Balance 650 before, **65** after, and the two agree exactly.
+Of that, 110 is the `ped-n` retry budget above; the seven shipped characters
+account for the other 475.
+
 ## Limitations
 
-- The characters ship as 7.2 MB across four `.bin` files, and the seven
-  travellers add **13.4 MB more**. They download in
-  the background while the world builds and the procedural crowd covers the gap,
-  so nothing waits on them, but it is real bandwidth, and eleven characters is
-  three times the first batch's. Whether all eleven belong in the city as well as
-  the airport is a budget decision for whoever wires them in, not a property of
-  the files.
+- The characters ship as 7.2 MB across four `.bin` files, the seven travellers
+  add **13.4 MB more** and the street batch **13.0 MB** on top of that. They
+  download in the background while the world builds and the procedural crowd
+  covers the gap, so nothing waits on them, but it is real bandwidth. The CITY
+  roster is now eleven of the eighteen, and `PedestrianSystem.loadCharacters`
+  fetches them **two at a time** rather than all at once: eleven characters is
+  thirty-three requests, and issuing them during the world build is exactly the
+  contention the cold-load work removed.
 - Only the base colour is used. The rig GLBs also carry normal and
   metallic-roughness maps; sampling them would need tangents and two more
   fetches per fragment, and this frame is already pixel-bound.
 - `ped-c`'s walk slides more than the other two. The preset's leg sweep does
   not fit his proportions; a second rig produced identical output, so fixing it
   means a different character rather than a different roll.
-- Four characters plus a per-instance tint is not three hundred different
-  people. Body shape repeats every fourth person. With the travellers there are
-  eleven, which repeats every eleventh person instead - better, still finite.
+- Eleven characters plus a per-instance tint is not three hundred different
+  people. Body shape repeats every eleventh person on the street rather than
+  every fourth - better, still finite, and two people in the same summer dress
+  standing near each other is a thing a player will occasionally see.
 - `ped-d`'s generated texture is mottled - the hoodie reads as tie-dyed rather
   than plain mustard. It was kept because it is plausible street clothing and a
   re-roll costs another generation. `ped-l`'s running top came back the same
@@ -469,8 +555,12 @@ about 0.07 ms per additional character at this population.
   same reason: gradient sportswear is a real thing, and the alternative is
   20 credits for a colour preference.
 - **No heavy-set body type in the traveller batch.** `ped-j` was meant to be it
-  and was dropped; see "The one that was dropped". `ped-c` remains the only
-  heavier person in the crowd, and he is the one that slides.
+  and was dropped; see "The one that was dropped". `ped-m`, the docker, is the
+  street batch's answer and is broad rather than heavy; `ped-c` remains the only
+  genuinely heavy person in the crowd, and he is the one that slides.
+- **Nobody older than middle-aged walks the street.** `ped-n` was to be the
+  elderly man and failed the slide gate twice; `ped-f`, the elderly woman, is on
+  the airport roster. The city's own cast runs young.
 - The travellers' silhouettes vary but their HEIGHT does not: the bake
   normalises every character to 1.0 unit tall, so a teenager and a tall man are
   the same size until the runtime scales them. Height variety is the crowd's job,
