@@ -519,7 +519,27 @@ The strip light matters more than it sounds. No light in this scene reaches
 through a 1 m opening in a facade, so without an emissive INSIDE the box every
 shop is a black room whatever colour its wall is.
 
-### 3.4 Ghost signs
+### 3.4 Planting
+
+The street planters were a concrete trough, a gravel bed and two foliage lumps
+with nothing in them, which is a shrub in a box rather than planting. They now
+carry blooms: small icosahedra sitting ON the canopy hull rather than inside
+it, spread by the golden angle so they never land on a lattice, biased to the
+upper half of each lobe because that is where a bedding plant flowers.
+
+**Two colours, alternating.** One saturated colour repeated in every planter on
+every street reads as a decal; warm against cool is also the pair that survives
+the tone map, since a single mid-pink goes to mud in shadow and to white in the
+sun. `blossom` and `blossomWarm` are the only fully saturated albedos in the
+palette outside the signage, and that is deliberate: a flower bed that is not
+brighter than the leaf behind it is just more leaf.
+
+Nine blooms is 180 triangles against the props' 400-triangle ceiling, and two
+draw calls for every planter in the city. The placement is deterministic in the
+prop's own coordinates, because the variety in an instanced prop has to come
+from the arrangement rather than from a per-instance roll.
+
+### 3.5 Ghost signs
 
 A party wall's blind bay - "the panel a real party wall carries a ghost sign
 on" - was filled edge to edge in the building's trim colour. On a four-storey
