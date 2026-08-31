@@ -142,13 +142,22 @@ const REACT_LEVEL = 0.85;
 /**
  * Seconds between lines, per category.
  *
- * The police number is deliberately shorter than `OFFICER_VOICE_COOLDOWN`: the
- * police system already spaces one OFFICER's orders, and this only stops four
- * of them from all shouting in the same half second.
+ * EACH IS LONGER THAN THE LONGEST CLIP IN ITS POOL, which is what makes "one
+ * line at a time per category" true rather than merely intended. The police
+ * pool reaches 2.833 s and the reactions 1.858 s, so gaps of 2.2 and 1.6 let a
+ * second line of the same kind start over the first by up to two thirds of a
+ * second - two overlapping shouts, which is exactly the mush this budget
+ * exists to prevent. `tests/crowdVoice.test.ts` pins the relationship against
+ * the manifest's own durations so a longer line cannot be added without the
+ * gap moving with it.
+ *
+ * The police number stays well under `OFFICER_VOICE_COOLDOWN`: the police
+ * system already spaces one OFFICER's orders, and this only stops a cordon
+ * from stacking two of them.
  */
-const POLICE_GAP = 2.2;
+const POLICE_GAP = 3.2;
 const CHATTER_GAP = 5.5;
-const REACT_GAP = 1.6;
+const REACT_GAP = 2.4;
 
 /**
  * Speech in flight at once.
@@ -250,7 +259,6 @@ export class CrowdVoice {
   private lastPolice: CrowdVoiceAssetId | null = null;
   private lastReact: CrowdVoiceAssetId | null = null;
   private counts = { police: 0, chatter: 0, reactions: 0 };
-  private requested = false;
   private disposed = false;
 
   constructor(host: AudioBusHost) {
@@ -277,12 +285,19 @@ export class CrowdVoice {
    *
    * A line that arrives after the moment it belonged to is worse than no line
    * at all - the same reason `CombatAudio.preload` exists - and the whole set
-   * is about 1.2 MB, so it is asked for once on the start gesture rather than
-   * being paid for during the boot.
+   * is about 1.3 MB, so it is asked for on the start gesture rather than being
+   * paid for during the boot.
+   *
+   * NOT LATCHED, deliberately. `pick` calls this when a pool has nothing
+   * resident, and the frame loop now starts BEFORE the AudioContext is
+   * unlocked - so a conversation that formed in the first second would reach
+   * here while `requestAsset` is still a no-op. A flag set on that first
+   * useless ask would make the explicit call after the unlock return early and
+   * the layer would never load a single line. `requestAsset` is already
+   * idempotent and costs a map lookup, so asking again is free.
    */
   preload(): void {
-    if (this.disposed || this.requested) return;
-    this.requested = true;
+    if (this.disposed) return;
     for (const id of ALL_LINES) this.host.requestAsset(id);
   }
 
@@ -350,6 +365,20 @@ export class CrowdVoice {
     // cordon has its own cooldown and will get its turn.
     const cue = ctx.police[0];
     if (!cue) return;
+    /*
+     * A DISTANCE GATE, because `maxDistance` is not one.
+     *
+     * The inverse distance model CLAMPS attenuation at `maxDistance` rather
+     * than cutting the source off, so a source beyond it is not silent - it is
+     * held at the floor, which for these numbers is about an eighth of full
+     * level. A radio call is placed on the nearest UNIT, which early in a
+     * pursuit can be a couple of hundred metres away, and without this it
+     * would be perfectly audible from there and would spend a voice slot doing
+     * it.
+     */
+    const dx = cue.x - ctx.x;
+    const dz = cue.z - ctx.z;
+    if (dx * dx + dz * dz > POLICE_MAX * POLICE_MAX) return;
     const pool =
       cue.kind === 'pullover'
         ? POLICE_PULLOVER

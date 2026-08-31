@@ -467,7 +467,39 @@ The image-based lighting was never affected: `createEnvironment` renders the
 same dome in its own scene with an explicit far plane of `radius * 2`, which is
 why the city's PBR surfaces have always been lit by a sky nobody could see.
 
-### 3.2 Clouds
+### 3.2 And it was never tone-mapped either
+
+Two more things about the sky turned out to be wrong the moment it became
+visible, and both are in the same category: the sky was not going through the
+pipeline every other surface goes through.
+
+**The shader wrote raw linear values.** The gradient stops are authored in sRGB
+and converted to linear, which is right - and then the fragment shader assigned
+them straight to `gl_FragColor`, skipping the ACES curve and the
+linear-to-sRGB conversion that `MeshStandardMaterial` gets for free. The sky
+therefore rendered about a stop and a half dark and noticeably more saturated
+than the values it was sampled from, and - the part that matters - it could not
+match the scene fog at the horizon, because the fog colour DOES go through the
+standard path. `#include <tonemapping_fragment>` and
+`#include <colorspace_fragment>` at the end of `main` fix it; `ShaderMaterial`
+already gets `toneMapping()` and `linearToOutputTexel()` in its prefix.
+
+The stops were then re-tuned deeper and more saturated, because ACES lifts and
+desaturates a mid blue hard: the sampled `0x2f6ec2` zenith came out as a pale
+wash. `uHorizon` is the one that must NOT move - it is `HORIZON_COLOR`, the
+same constant the fog is built from, and equal inputs through equal curves is
+what makes the two meet invisibly.
+
+**The environment map was tagged with the wrong mapping.**
+`PMREMGenerator.fromScene` returns a CubeUV atlas and has already set
+`CubeUVReflectionMapping` on it; `createEnvironment` overwrote that with
+`EquirectangularReflectionMapping`, which told every PBR shader in the city to
+read a packed cube atlas as a latitude-and-longitude image. Every reflection in
+the game was sampling the wrong texels, and it went unnoticed for exactly as
+long as the sky dome was clipped away and there was nothing recognisable in the
+reflection to be wrong.
+
+### 3.3 Clouds
 
 A cloudless gradient is the second tell in 2.9 and the sky is about a third of
 an outdoor frame, so the dome now carries broken cumulus:
@@ -498,7 +530,7 @@ drawing buffer, 90 frames: mean 3.43 ms, median 3.30, p95 4.10, worst 4.60;
 323 draw calls; 172 MB. The sky is one draw call and the clouds are a fragment
 cost on it.
 
-### 3.3 Shopfronts
+### 3.4 Shopfronts
 
 Item 12 on the ranked list - "storefront interior parallax cards behind glass,
 removes dead black windows" - implemented as geometry rather than as a texture,
@@ -519,7 +551,7 @@ The strip light matters more than it sounds. No light in this scene reaches
 through a 1 m opening in a facade, so without an emissive INSIDE the box every
 shop is a black room whatever colour its wall is.
 
-### 3.4 Planting
+### 3.5 Planting
 
 The street planters were a concrete trough, a gravel bed and two foliage lumps
 with nothing in them, which is a shrub in a box rather than planting. They now
@@ -539,7 +571,7 @@ draw calls for every planter in the city. The placement is deterministic in the
 prop's own coordinates, because the variety in an instanced prop has to come
 from the arrangement rather than from a per-instance roll.
 
-### 3.5 Ghost signs
+### 3.6 Ghost signs
 
 A party wall's blind bay - "the panel a real party wall carries a ghost sign
 on" - was filled edge to edge in the building's trim colour. On a four-storey
