@@ -181,6 +181,11 @@ export function staticScaleFor(bounds: MapBounds): number {
   return Math.min(STATIC_SCALE, Math.sqrt(STATIC_PIXEL_BUDGET / area));
 }
 
+/** Round distances the expanded map's scale bar may show, in metres. */
+const SCALE_BAR_STEPS: readonly number[] = [25, 50, 100, 200, 500, 1000];
+/** Pixels the bar aims for, before the device pixel ratio. */
+const SCALE_BAR_TARGET = 90;
+
 /** Field of view of the wedge drawn from the player marker. */
 export const FOV_DEGREES = 70;
 
@@ -1401,7 +1406,19 @@ export class Minimap {
     scale: number,
     unit: number,
   ): void {
-    const metres = 100;
+    /*
+     * A round distance that lands near `SCALE_BAR_TARGET` pixels.
+     *
+     * It used to be a flat 100 m, which was right for the one scale the map
+     * had. With a zoom ladder that is a bar spanning half the map at 5.5x and
+     * a stub at 1x - and a scale bar whose length nobody can read against is
+     * worse than none.
+     */
+    const target = SCALE_BAR_TARGET * unit;
+    let metres = SCALE_BAR_STEPS[0] as number;
+    for (const step of SCALE_BAR_STEPS) {
+      if (Math.abs(step * scale - target) < Math.abs(metres * scale - target)) metres = step;
+    }
     const length = metres * scale;
     const x = 16 * unit;
     const y = height - 20 * unit;
